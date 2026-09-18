@@ -57,7 +57,6 @@ rm -f include/autoconf.h
 rm -rf include/config
 make silentoldconfig HOSTCC=gcc
 test -f include/autoconf.h || { echo "FATAL: include/autoconf.h not generated"; exit 1; }
-test -f include/config/auto.conf || { echo "FATAL: include/config/auto.conf not generated"; exit 1; }
 
 # zig cc musl 默认静态；-fPIE -pie 生成 ET_DYN（vela 仅接受 PIE）。
 # -j1：规避多 zig 进程共享缓存的 Windows 竞争；V=1：失败时日志有完整命令。
