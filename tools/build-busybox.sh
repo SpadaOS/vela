@@ -48,10 +48,17 @@ test -f include/autoconf.h || { echo "FATAL: include/autoconf.h not generated"; 
 # Makefile.host 单独定义，但宿主工具已构建完成，同样禁用无害）。
 sed -i 's/-Wp,-MD,\$(depfile) //' scripts/Makefile.lib
 sed -i 's|scripts/basic/fixdep|: fixdep-disabled|' scripts/Makefile.build scripts/Kbuild.include
+# zig 用 lld：GNU ld 专属链接参数（--sort-section/--sort-common/--warn-common/
+# --verbose）不被支持，trylink 的 check_cc 探测在纯编译阶段无法发现，直接在
+# 源头中和；CI 无 binutils，跳过 strip（未 strip 静态二进制对 vela 无影响）
+sed -i 's|^SORT_SECTION=.*|SORT_SECTION=""|' scripts/trylink
+sed -i 's|^SORT_COMMON=.*|SORT_COMMON=""|' scripts/trylink
+sed -i 's|echo "-Wl,--warn-common -Wl,-Map,\$EXE.map -Wl,--verbose"|echo "-Wl,-Map,\$EXE.map"|' scripts/trylink
+sed -i '/-Wl,--warn-common/d' scripts/trylink
 
 # zig cc musl 默认静态；-fPIE -pie 生成 ET_DYN（vela 仅接受 PIE）。
 # -j1：规避多 zig 进程共享缓存的 Windows 竞争；V=1：失败时日志有完整命令。
-make V=1 -j1 \
+make V=1 -j1 SKIP_STRIP=y \
   CC="zig cc -target x86_64-linux-musl -fPIE -pie" \
   HOSTCC=gcc
 
