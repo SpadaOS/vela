@@ -59,7 +59,8 @@ pub enum HostFileKind {
     StdIn,
     StdOut,
     StdErr,
-    Disk(std::fs::File),
+    /// 打开时记录宿主路径：fstat 需要稳定的 ino（路径哈希），std::fs::File 不携带路径。
+    Disk { file: std::fs::File, path: PathBuf },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -80,6 +81,35 @@ pub struct HostStat {
     pub is_dir: bool,
     pub is_readonly: bool,
     pub mtime_ns: i64,
+    // ---- 0.0.2：完整文件元数据（Linux stat 语义所需）----
+    /// Linux st_mode：含 S_IF* 文件类型位与权限位（值与 Linux 一致）。
+    pub mode: u32,
+    pub nlink: u64,
+    /// inode 号。约定：同进程内稳定，且 stat 与目录遍历结果一致即可
+    /// （musl 不要求真实 inode），Windows 用 file_index/句柄哈希满足。
+    pub ino: u64,
+    /// 设备号。约定：同进程内稳定，同卷相同。
+    pub dev: u64,
+    pub atime_ns: i64,
+    pub ctime_ns: i64,
+}
+
+impl HostStat {
+    /// 字符设备元数据（/dev/null、/dev/zero、stdio）。
+    pub fn char_device() -> HostStat {
+        HostStat {
+            size: 0,
+            is_dir: false,
+            is_readonly: false,
+            mtime_ns: 0,
+            mode: 0o0020000 | 0o666, // S_IFCHR | 0666
+            nlink: 1,
+            ino: 1,
+            dev: 1,
+            atime_ns: 0,
+            ctime_ns: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +152,8 @@ pub trait Host: Send + Sync + 'static {
     fn write(&self, f: &HostFile, buf: &[u8]) -> Result<usize, HostError>;
     fn seek(&self, f: &HostFile, off: i64, whence: i32) -> Result<u64, HostError>;
     fn stat_path(&self, path: &HostPath) -> Result<HostStat, HostError>;
+    /// 对已打开句柄取元数据（fstat 语义）；stdio 为字符设备。
+    fn stat_file(&self, f: &HostFile) -> Result<HostStat, HostError>;
     fn close(&self, f: HostFile) -> Result<(), HostError>;
 
     fn stdio(&self) -> StdioHandles;

@@ -9,6 +9,7 @@ pub const SYS_OPEN: u64 = 2;
 pub const SYS_CLOSE: u64 = 3;
 pub const SYS_STAT: u64 = 4;
 pub const SYS_FSTAT: u64 = 5;
+pub const SYS_LSTAT: u64 = 6;
 pub const SYS_LSEEK: u64 = 8;
 pub const SYS_MMAP: u64 = 9;
 pub const SYS_MPROTECT: u64 = 10;
@@ -74,6 +75,16 @@ pub const O_APPEND: u64 = 0x400;
 pub const O_CLOEXEC: u64 = 0x80000;
 
 pub const AT_FDCWD: i32 = -100;
+pub const AT_EMPTY_PATH: u64 = 0x1000;
+pub const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+
+// ---------------------------------------------------------------- file type (st_mode)
+
+pub const S_IFMT: u32 = 0o170000;
+pub const S_IFCHR: u32 = 0o0020000;
+pub const S_IFDIR: u32 = 0o0040000;
+pub const S_IFREG: u32 = 0o0100000;
+pub const S_IFLNK: u32 = 0o0120000;
 
 // ---------------------------------------------------------------- auxv
 
@@ -164,6 +175,7 @@ pub fn syscall_name(nr: u64) -> &'static str {
         SYS_CLOSE => "close",
         SYS_STAT => "stat",
         SYS_FSTAT => "fstat",
+        SYS_LSTAT => "lstat",
         SYS_LSEEK => "lseek",
         SYS_MMAP => "mmap",
         SYS_MPROTECT => "mprotect",

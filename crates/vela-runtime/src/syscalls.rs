@@ -2,7 +2,7 @@
 //! 未实现的 syscall 一律返回 `-ENOSYS`（规格 0 成功标准 5）。
 
 use vela_abi as abi;
-use vela_sys::{Host, HostFile, HostFileKind, HostOpen, HostPath, HostProt};
+use vela_sys::{Host, HostError, HostFile, HostFileKind, HostOpen, HostPath, HostProt, HostStat};
 
 use crate::{read_cstr, read_guest, read_guest_mut, write_guest, GuestFd, GuestProcess, host_err_to_errno};
 
@@ -17,6 +17,9 @@ pub fn dispatch(proc: &mut GuestProcess, host: &dyn Host, nr: u64, a: [u64; 6]) 
         abi::SYS_OPENAT => sys_openat(proc, host, a),
         abi::SYS_CLOSE => sys_close(proc, host, a[0]),
         abi::SYS_LSEEK => sys_lseek(proc, host, a[0], a[1], a[2]),
+        abi::SYS_STAT | abi::SYS_LSTAT => sys_stat(proc, host, a[0], a[1]),
+        abi::SYS_FSTAT => sys_fstat(proc, host, a[0], a[1]),
+        abi::SYS_NEWFSTATAT => sys_newfstatat(proc, host, a),
         abi::SYS_MMAP => sys_mmap(proc, host, a),
         abi::SYS_MPROTECT => sys_mprotect(proc, host, a[0], a[1], a[2]),
         abi::SYS_MUNMAP => sys_munmap(proc, host, a[0], a[1]),
@@ -151,12 +154,7 @@ fn open_common(proc: &mut GuestProcess, host: &dyn Host, path_ptr: u64, flags: u
         Ok(p) => p,
         Err(e) => return -(e as i64),
     };
-    // 相对路径先拼 cwd，再走 vela-fs 翻译（路径在进入 Host 前已是宿主原生路径，规格 2.4）
-    let linux_path = if path.starts_with('/') {
-        path
-    } else {
-        format!("{}/{}", proc.cwd.trim_end_matches('/'), path)
-    };
+    let linux_path = resolve_rel(proc, &path);
     let Some(host_path) = vela_fs::translate(&linux_path) else {
         return -(abi::ENOENT as i64);
     };
@@ -171,6 +169,102 @@ fn open_common(proc: &mut GuestProcess, host: &dyn Host, path_ptr: u64, flags: u
     match host.open(&HostPath(host_path), opt) {
         Ok(f) => proc.fds.alloc_fd(GuestFd::Host(f)) as i64,
         Err(e) => -(host_err_to_errno(&e) as i64),
+    }
+}
+
+/// 相对路径拼 cwd；绝对路径原样（vela-fs 只接受 Linux 风格路径）。
+fn resolve_rel(proc: &GuestProcess, path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("{}/{}", proc.cwd.trim_end_matches('/'), path)
+    }
+}
+
+// ---------------------------------------------------------------- stat 家族
+
+fn sys_stat(proc: &mut GuestProcess, host: &dyn Host, path_ptr: u64, statbuf: u64) -> i64 {
+    let path = match read_cstr(proc, path_ptr) {
+        Ok(p) => p,
+        Err(e) => return -(e as i64),
+    };
+    // v0 无 symlink 语义，lstat ≡ stat（NONGOALS：不做真实 symlink）
+    let Some(host_path) = vela_fs::translate(&resolve_rel(proc, &path)) else {
+        return -(abi::ENOENT as i64);
+    };
+    fill_stat(proc, host.stat_path(&HostPath(host_path)), statbuf)
+}
+
+fn sys_fstat(proc: &GuestProcess, host: &dyn Host, fd_raw: u64, statbuf: u64) -> i64 {
+    let fd = fd_raw as u32 as i32;
+    let r = match proc.fds.get(fd) {
+        None | Some(GuestFd::Reserved) => return -(abi::EBADF as i64),
+        Some(GuestFd::Null) | Some(GuestFd::Zero) => Ok(HostStat::char_device()),
+        Some(GuestFd::Host(f)) => host.stat_file(f),
+    };
+    fill_stat(proc, r, statbuf)
+}
+
+fn sys_newfstatat(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 {
+    let (dirfd, path_ptr, statbuf, flags) = (a[0] as u32 as i32, a[1], a[2], a[3]);
+    let path = match read_cstr(proc, path_ptr) {
+        Ok(p) => p,
+        Err(e) => return -(e as i64),
+    };
+    if path.is_empty() {
+        // AT_EMPTY_PATH：对 dirfd 本身做 fstat（CLOEXEC 之外唯一常用形态）
+        if flags & abi::AT_EMPTY_PATH == 0 {
+            return -(abi::EINVAL as i64);
+        }
+        return sys_fstat(proc, host, dirfd as u64, statbuf);
+    }
+    if dirfd != abi::AT_FDCWD {
+        return -(abi::EBADF as i64); // 目录 fd 相对路径 v0.2 仍不支持（规格 5.5）
+    }
+    // AT_SYMLINK_NOFOLLOW 与否等价（无 symlink 语义）
+    let Some(host_path) = vela_fs::translate(&resolve_rel(proc, &path)) else {
+        return -(abi::ENOENT as i64);
+    };
+    fill_stat(proc, host.stat_path(&HostPath(host_path)), statbuf)
+}
+
+/// HostStat → Linux `struct stat` 并写入客户缓冲区。
+fn fill_stat(proc: &GuestProcess, r: Result<HostStat, HostError>, buf: u64) -> i64 {
+    match r {
+        Ok(hs) => {
+            let st = host_stat_to_linux(&hs, proc.uid, proc.gid);
+            // SAFETY: Stat 为 repr(C) 纯数值 POD，144 字节（vela-abi const 断言锁死）
+            let bytes =
+                unsafe { std::slice::from_raw_parts((&st as *const abi::Stat) as *const u8, std::mem::size_of::<abi::Stat>()) };
+            match write_guest(proc, buf, bytes) {
+                Ok(()) => 0,
+                Err(e) => -(e as i64),
+            }
+        }
+        Err(e) => -(host_err_to_errno(&e) as i64),
+    }
+}
+
+fn host_stat_to_linux(hs: &HostStat, uid: u32, gid: u32) -> abi::Stat {
+    abi::Stat {
+        st_dev: hs.dev,
+        st_ino: hs.ino,
+        st_nlink: hs.nlink,
+        st_mode: hs.mode,
+        st_uid: uid,
+        st_gid: gid,
+        __pad0: 0,
+        st_rdev: 0,
+        st_size: hs.size,
+        st_blksize: 4096,
+        st_blocks: (hs.size + 511) / 512,
+        st_atime: hs.atime_ns / 1_000_000_000,
+        st_atime_nsec: hs.atime_ns % 1_000_000_000,
+        st_mtime: hs.mtime_ns / 1_000_000_000,
+        st_mtime_nsec: hs.mtime_ns % 1_000_000_000,
+        st_ctime: hs.ctime_ns / 1_000_000_000,
+        st_ctime_nsec: hs.ctime_ns % 1_000_000_000,
+        __unused: [0; 3],
     }
 }
 
@@ -392,7 +486,7 @@ fn sys_gettimeofday(proc: &GuestProcess, host: &dyn Host, tv: u64) -> i64 {
 // HostFileKind 仅为 mock 测试保留引用，避免未使用告警的干净写法
 #[allow(dead_code)]
 fn _kind_is_disk(k: &HostFileKind) -> bool {
-    matches!(k, HostFileKind::Disk(_))
+    matches!(k, HostFileKind::Disk { .. })
 }
 #[allow(dead_code)]
 fn _file_is_host(f: &HostFile) -> bool {

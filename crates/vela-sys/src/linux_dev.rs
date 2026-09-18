@@ -71,6 +71,9 @@ impl Host for LinuxDevHost {
     fn stat_path(&self, path: &HostPath) -> Result<HostStat, HostError> {
         file_ops::stat_path(path)
     }
+    fn stat_file(&self, f: &HostFile) -> Result<HostStat, HostError> {
+        file_ops::stat_file(f)
+    }
     fn close(&self, f: HostFile) -> Result<(), HostError> {
         file_ops::close(f)
     }

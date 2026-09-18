@@ -44,6 +44,9 @@ impl Host for SpadaOsHost {
     fn stat_path(&self, _path: &HostPath) -> Result<HostStat, HostError> {
         Err(HostError::Unimplemented)
     }
+    fn stat_file(&self, _f: &HostFile) -> Result<HostStat, HostError> {
+        Err(HostError::Unimplemented)
+    }
     fn close(&self, _f: HostFile) -> Result<(), HostError> {
         Err(HostError::Unimplemented)
     }

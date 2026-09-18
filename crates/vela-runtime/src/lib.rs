@@ -67,6 +67,7 @@ impl FdTable {
 pub struct GuestProcess {
     pub pid: u32,
     pub uid: u32,
+    pub gid: u32,
     pub fs_base: u64,
     pub gs_base: u64,
     /// 待应用的 FS 基址：宿主支持时由 SET_FS 记录，CLI 在异常返回后
@@ -90,6 +91,7 @@ impl GuestProcess {
         GuestProcess {
             pid,
             uid: 1000,
+            gid: 1000,
             fs_base: 0,
             gs_base: 0,
             fs_apply_pending: None,

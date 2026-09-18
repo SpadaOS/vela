@@ -70,6 +70,20 @@ impl Host for MockHost {
     fn stat_path(&self, _p: &HostPath) -> Result<HostStat, HostError> {
         Err(HostError::Unimplemented)
     }
+    fn stat_file(&self, _f: &HostFile) -> Result<HostStat, HostError> {
+        Ok(HostStat {
+            size: 123,
+            is_dir: false,
+            is_readonly: false,
+            mtime_ns: 1_700_000_000_000_000_000,
+            mode: abi::S_IFREG | 0o644,
+            nlink: 2,
+            ino: 42,
+            dev: 7,
+            atime_ns: 1_700_000_000_000_000_000,
+            ctime_ns: 1_700_000_000_000_000_000,
+        })
+    }
     fn close(&self, _f: HostFile) -> Result<(), HostError> {
         Ok(())
     }
@@ -237,8 +251,101 @@ fn unimplemented_returns_enosys() {
     let (host, mut proc, _addr) = setup(4096);
     let r = dispatch(&mut proc, &host, 9999, [0, 0, 0, 0, 0, 0]);
     assert_eq!(r, -(abi::ENOSYS as i64));
-    let r = dispatch(&mut proc, &host, abi::SYS_FSTAT, [1, 0, 0, 0, 0, 0]);
+    let r = dispatch(&mut proc, &host, abi::SYS_IOCTL, [1, 0x5413, 0, 0, 0, 0]);
+    assert_eq!(r, -(abi::ENOTTY as i64));
+}
+
+// ---------------------------------------------------------------- stat 家族
+
+#[test]
+fn fstat_fills_linux_stat_layout() {
+    let (host, mut proc, addr) = setup(4096);
+    let buf = (addr + 0x100) as u64;
+    let r = dispatch(&mut proc, &host, abi::SYS_FSTAT, [1, buf, 0, 0, 0, 0]);
+    assert_eq!(r, 0);
+    // SAFETY: buf 为 mock 分配的可写内存，write_guest 已登记校验
+    let st = unsafe { std::ptr::read_unaligned(buf as *const abi::Stat) };
+    assert_eq!(st.st_size, 123);
+    assert_eq!(st.st_ino, 42);
+    assert_eq!(st.st_dev, 7);
+    assert_eq!(st.st_nlink, 2);
+    assert_eq!(st.st_mode, abi::S_IFREG | 0o644);
+    assert_eq!(st.st_uid, 1000);
+    assert_eq!(st.st_gid, 1000);
+    assert_eq!(st.st_mtime, 1_700_000_000);
+    assert_eq!(st.st_mtime_nsec, 0);
+    assert_eq!(st.st_blksize, 4096);
+    assert_eq!(st.st_blocks, 1); // ceil(123/512)
+}
+
+#[test]
+fn fstat_bad_fd_is_ebadf() {
+    let (host, mut proc, addr) = setup(4096);
+    let r = dispatch(&mut proc, &host, abi::SYS_FSTAT, [99, (addr + 0x100) as u64, 0, 0, 0, 0]);
+    assert_eq!(r, -(abi::EBADF as i64));
+}
+
+#[test]
+fn fstat_null_fd_is_char_device() {
+    let (host, mut proc, addr) = setup(4096);
+    let fd = proc.fds.alloc_fd(GuestFd::Null);
+    let buf = (addr + 0x100) as u64;
+    let r = dispatch(&mut proc, &host, abi::SYS_FSTAT, [fd as u64, buf, 0, 0, 0, 0]);
+    assert_eq!(r, 0);
+    // SAFETY: buf 为 mock 分配的可写内存
+    let st = unsafe { std::ptr::read_unaligned(buf as *const abi::Stat) };
+    assert_eq!(st.st_mode & abi::S_IFMT, abi::S_IFCHR);
+    assert_eq!(st.st_size, 0);
+}
+
+#[test]
+fn newfstatat_empty_path_with_at_empty_path_falls_back_to_fstat() {
+    let (host, mut proc, addr) = setup(4096);
+    // 把一段路径字符串写进客户内存
+    let p = (addr + 0x200) as u64;
+    // SAFETY: p 为 mock 分配的可写内存
+    unsafe {
+        std::ptr::copy_nonoverlapping(b"\0".as_ptr(), p as *mut u8, 1);
+    }
+    let buf = (addr + 0x100) as u64;
+    let r = dispatch(&mut proc, &host, abi::SYS_NEWFSTATAT, [1, p, buf, abi::AT_EMPTY_PATH, 0, 0]);
+    assert_eq!(r, 0);
+    // SAFETY: buf 为 mock 分配的可写内存
+    let st = unsafe { std::ptr::read_unaligned(buf as *const abi::Stat) };
+    assert_eq!(st.st_size, 123);
+    // 缺 AT_EMPTY_PATH 时空路径必须 EINVAL
+    let bad = dispatch(&mut proc, &host, abi::SYS_NEWFSTATAT, [1, p, buf, 0, 0, 0]);
+    assert_eq!(bad, -(abi::EINVAL as i64));
+}
+
+#[test]
+fn stat_unknown_path_is_enoent() {
+    let (host, mut proc, addr) = setup(4096);
+    let p = (addr + 0x200) as u64;
+    // SAFETY: p 为 mock 分配的可写内存
+    unsafe {
+        let s = b"/mnt/c/definitely-missing-file-xyz\0";
+        std::ptr::copy_nonoverlapping(s.as_ptr(), p as *mut u8, s.len());
+    }
+    let r = dispatch(&mut proc, &host, abi::SYS_STAT, [p, (addr + 0x100) as u64, 0, 0, 0, 0]);
+    // MockHost.stat_path 恒 Unimplemented → ENOSYS；路径不可翻译 → ENOENT。
+    // /mnt/c 前缀可翻译，走到 stat_path：mock 返回 ENOSYS
     assert_eq!(r, -(abi::ENOSYS as i64));
+    let r = dispatch(&mut proc, &host, abi::SYS_LSTAT, [p, (addr + 0x100) as u64, 0, 0, 0, 0]);
+    assert_eq!(r, -(abi::ENOSYS as i64));
+}
+
+#[test]
+fn stat_untranslatable_path_is_enoent() {
+    let (host, mut proc, addr) = setup(4096);
+    let p = (addr + 0x200) as u64;
+    // SAFETY: p 为 mock 分配的可写内存
+    unsafe {
+        let s = b"/nonexistent-prefix/file\0";
+        std::ptr::copy_nonoverlapping(s.as_ptr(), p as *mut u8, s.len());
+    }
+    let r = dispatch(&mut proc, &host, abi::SYS_STAT, [p, (addr + 0x100) as u64, 0, 0, 0, 0]);
+    assert_eq!(r, -(abi::ENOENT as i64));
 }
 
 #[test]
