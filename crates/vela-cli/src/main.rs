@@ -66,23 +66,78 @@ fn real_main() -> i32 {
 }
 
 fn print_usage() {
-    eprintln!("usage: vela run <linux-elf> [guest-args...]");
+    eprintln!("usage: vela run [options] <linux-elf> [guest-args...]");
     eprintln!("       vela --version");
     eprintln!("       vela --help");
+    eprintln!("options:");
+    eprintln!("  --root <dir>       把宿主目录挂为客户根（guest / = <dir>）");
+    eprintln!("  --map <g>=<host>   追加前缀映射（可多次；默认 /mnt/c -> C:\\）");
+    eprintln!("  --env K=V          传递/覆盖环境变量；K= 表示删除（默认继承宿主全部）");
+    eprintln!("  --uid <n> --gid <n>  客户 uid/gid（默认 1000）");
+    eprintln!("  -v                 syscall 日志到 stderr（或 VELA_LOG=1）");
     eprintln!("env:   VELA_LOG=1 或 -v 打印 syscall 日志到 stderr");
 }
 
+/// run 子命令的选项（解析自 elf 路径之前）。
+struct RunOpts {
+    verbose: bool,
+    root: Option<String>,
+    maps: Vec<String>,
+    envs: Vec<String>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+}
+
 fn cmd_run(rest: &[String]) -> i32 {
-    let mut verbose = false;
+    let mut opts = RunOpts { verbose: false, root: None, maps: Vec::new(), envs: Vec::new(), uid: None, gid: None };
     let mut pos: Vec<String> = Vec::new();
-    for a in rest {
-        if a == "-v" {
-            verbose = true;
-        } else {
-            pos.push(a.clone());
+    let mut i = 0;
+    // 选项只在 elf 路径之前；elf 之后的参数全部透传给客户
+    while i < rest.len() {
+        let a = rest[i].as_str();
+        match a {
+            "-v" => opts.verbose = true,
+            "--root" => {
+                let Some(v) = rest.get(i + 1) else { return usage_err("--root 需要参数") };
+                opts.root = Some(v.clone());
+                i += 1;
+            }
+            "--map" => {
+                let Some(v) = rest.get(i + 1) else { return usage_err("--map 需要参数") };
+                opts.maps.push(v.clone());
+                i += 1;
+            }
+            "--env" => {
+                let Some(v) = rest.get(i + 1) else { return usage_err("--env 需要参数") };
+                opts.envs.push(v.clone());
+                i += 1;
+            }
+            "--uid" | "--gid" => {
+                let Some(v) = rest.get(i + 1) else { return usage_err(&format!("{a} 需要参数")) };
+                let n: u32 = match v.parse() {
+                    Ok(n) => n,
+                    Err(_) => return usage_err(&format!("{a} 需要非负整数")),
+                };
+                if a == "--uid" { opts.uid = Some(n) } else { opts.gid = Some(n) }
+                i += 1;
+            }
+            s if s.starts_with('-') && s != "-" => {
+                eprintln!("vela: unknown option '{s}'");
+                print_usage();
+                return 2;
+            }
+            _ => {
+                // elf 路径：从这里开始全部是位置参数
+                while i < rest.len() {
+                    pos.push(rest[i].clone());
+                    i += 1;
+                }
+                break;
+            }
         }
+        i += 1;
     }
-    if verbose {
+    if opts.verbose {
         logx::enable();
     }
     let Some(elf) = pos.first() else {
@@ -91,13 +146,40 @@ fn cmd_run(rest: &[String]) -> i32 {
     };
     // 客户 argv[0] = 传入的 ELF 路径，其余为附加参数（规格 4）
     let guest_argv: Vec<String> = pos.clone();
-    match run_elf(elf, &guest_argv) {
+    match run_elf(elf, &guest_argv, &opts) {
         Ok(never) => match never {},
         Err(code) => code,
     }
 }
 
-fn run_elf(elf_path: &str, guest_argv: &[String]) -> Result<std::convert::Infallible, i32> {
+fn usage_err(msg: &str) -> i32 {
+    eprintln!("vela: {msg}");
+    print_usage();
+    2
+}
+
+/// 组装客户环境块：默认继承宿主全部环境变量，再应用 --env（K=V 覆盖/追加，K= 删除）。
+fn build_envp(envs: &[String]) -> Vec<String> {
+    let mut list: Vec<(String, String)> = std::env::vars().collect();
+    for e in envs {
+        match e.split_once('=') {
+            Some((k, v)) => {
+                if let Some(slot) = list.iter_mut().find(|(ek, _)| ek == k) {
+                    slot.1 = v.to_string();
+                } else {
+                    list.push((k.to_string(), v.to_string()));
+                }
+            }
+            None => {
+                // --env K（无 =）：删除
+                list.retain(|(ek, _)| ek != e);
+            }
+        }
+    }
+    list.into_iter().map(|(k, v)| format!("{k}={v}")).collect()
+}
+
+fn run_elf(elf_path: &str, guest_argv: &[String], opts: &RunOpts) -> Result<std::convert::Infallible, i32> {
     let bytes = match std::fs::read(elf_path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -134,11 +216,35 @@ fn run_elf(elf_path: &str, guest_argv: &[String]) -> Result<std::convert::Infall
 
     let mut proc = GuestProcess::new(1000, img);
     proc.attach_stdio(&host);
+    // T2.1/T2.5：路径映射与身份
+    if let Some(root) = &opts.root {
+        if let Err(e) = proc.fs.add("/", std::path::Path::new(root)) {
+            eprintln!("vela: --root: {e}");
+            return Err(2);
+        }
+    }
+    for m in &opts.maps {
+        let Some((g, h)) = m.split_once('=') else {
+            eprintln!("vela: --map 需要 <guest>=<host> 形式，得到 '{m}'");
+            return Err(2);
+        };
+        if let Err(e) = proc.fs.add(g, std::path::Path::new(h)) {
+            eprintln!("vela: --map: {e}");
+            return Err(2);
+        }
+    }
+    if let Some(u) = opts.uid {
+        proc.uid = u;
+    }
+    if let Some(g) = opts.gid {
+        proc.gid = g;
+    }
     if let Err(e) = proc.init_heap(&host, 0, HEAP_SIZE) {
         eprintln!("[vela] warn: heap init failed: {e}");
     }
 
-    let (rsp, stack_range) = match guest_start::build_stack(&host, &proc.load, guest_argv) {
+    let envp = build_envp(&opts.envs);
+    let (rsp, stack_range) = match guest_start::build_stack(&host, &proc.load, guest_argv, &envp) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("vela: stack setup failed: {e}");

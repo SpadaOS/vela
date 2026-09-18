@@ -23,6 +23,10 @@ pub const SYS_FCNTL: u64 = 72;
 pub const SYS_GETCWD: u64 = 79;
 pub const SYS_CHDIR: u64 = 80;
 pub const SYS_GETPID: u64 = 39;
+pub const SYS_GETUID: u64 = 102;
+pub const SYS_GETGID: u64 = 104;
+pub const SYS_GETEUID: u64 = 107;
+pub const SYS_GETEGID: u64 = 108;
 pub const SYS_GETTIMEOFDAY: u64 = 96;
 pub const SYS_ARCH_PRCTL: u64 = 158;
 pub const SYS_EXIT_GROUP: u64 = 231;
@@ -49,6 +53,7 @@ pub const ENOTTY: i32 = 25;
 pub const ESPIPE: i32 = 29;
 pub const ENAMETOOLONG: i32 = 36;
 pub const ENOSYS: i32 = 38;
+pub const ERANGE: i32 = 34;
 
 pub fn errno_result(e: i32) -> i64 {
     -(e as i64)
@@ -212,6 +217,10 @@ pub fn syscall_name(nr: u64) -> &'static str {
         SYS_GETCWD => "getcwd",
         SYS_CHDIR => "chdir",
         SYS_GETPID => "getpid",
+        SYS_GETUID => "getuid",
+        SYS_GETGID => "getgid",
+        SYS_GETEUID => "geteuid",
+        SYS_GETEGID => "getegid",
         SYS_GETTIMEOFDAY => "gettimeofday",
         SYS_ARCH_PRCTL => "arch_prctl",
         SYS_EXIT_GROUP => "exit_group",

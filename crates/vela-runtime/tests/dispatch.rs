@@ -73,7 +73,19 @@ impl Host for MockHost {
         Err(HostError::Invalid)
     }
     fn stat_path(&self, _p: &HostPath) -> Result<HostStat, HostError> {
-        Err(HostError::Unimplemented)
+        // 目录元数据（chdir 校验与 stat 路径测试用）
+        Ok(HostStat {
+            size: 0,
+            is_dir: true,
+            is_readonly: false,
+            mtime_ns: 0,
+            mode: abi::S_IFDIR | 0o755,
+            nlink: 1,
+            ino: 11,
+            dev: 7,
+            atime_ns: 0,
+            ctime_ns: 0,
+        })
     }
     fn stat_file(&self, _f: &HostFile) -> Result<HostStat, HostError> {
         Ok(HostStat {
@@ -324,20 +336,21 @@ fn newfstatat_empty_path_with_at_empty_path_falls_back_to_fstat() {
 }
 
 #[test]
-fn stat_unknown_path_is_enoent() {
+fn stat_on_translatable_path_fills_dir_stat() {
     let (host, mut proc, addr) = setup(4096);
     let p = (addr + 0x200) as u64;
     // SAFETY: p 为 mock 分配的可写内存
     unsafe {
-        let s = b"/mnt/c/definitely-missing-file-xyz\0";
+        let s = b"/mnt/c/Windows\0";
         std::ptr::copy_nonoverlapping(s.as_ptr(), p as *mut u8, s.len());
     }
     let r = dispatch(&mut proc, &host, abi::SYS_STAT, [p, (addr + 0x100) as u64, 0, 0, 0, 0]);
-    // MockHost.stat_path 恒 Unimplemented → ENOSYS；路径不可翻译 → ENOENT。
-    // /mnt/c 前缀可翻译，走到 stat_path：mock 返回 ENOSYS
-    assert_eq!(r, -(abi::ENOSYS as i64));
+    assert_eq!(r, 0);
+    // SAFETY: buf 为 mock 分配的可写内存
+    let st = unsafe { std::ptr::read_unaligned((addr + 0x100) as *const abi::Stat) };
+    assert_eq!(st.st_mode & abi::S_IFMT, abi::S_IFDIR);
     let r = dispatch(&mut proc, &host, abi::SYS_LSTAT, [p, (addr + 0x100) as u64, 0, 0, 0, 0]);
-    assert_eq!(r, -(abi::ENOSYS as i64));
+    assert_eq!(r, 0);
 }
 
 #[test]
@@ -351,6 +364,76 @@ fn stat_untranslatable_path_is_enoent() {
     }
     let r = dispatch(&mut proc, &host, abi::SYS_STAT, [p, (addr + 0x100) as u64, 0, 0, 0, 0]);
     assert_eq!(r, -(abi::ENOENT as i64));
+}
+
+// ---------------------------------------------------------------- 工作目录 / 身份
+
+#[test]
+fn getcwd_returns_current_directory() {
+    let (host, mut proc, addr) = setup(4096);
+    let buf = (addr + 0x100) as u64;
+    let r = dispatch(&mut proc, &host, abi::SYS_GETCWD, [buf, 256, 0, 0, 0, 0]);
+    assert_eq!(r, buf as i64);
+    // SAFETY: buf 为 mock 分配的可写内存
+    let s = unsafe { std::slice::from_raw_parts(buf as *const u8, 7) };
+    assert_eq!(s, b"/mnt/c\0");
+    // 缓冲不足 → ERANGE
+    let r = dispatch(&mut proc, &host, abi::SYS_GETCWD, [buf, 2, 0, 0, 0, 0]);
+    assert_eq!(r, -(abi::ERANGE as i64));
+}
+
+#[test]
+fn chdir_updates_cwd_accounting() {
+    let (host, mut proc, addr) = setup(4096);
+    let p = (addr + 0x200) as u64;
+    // SAFETY: p 为 mock 分配的可写内存
+    unsafe {
+        let s = b"/mnt/c/Windows\0";
+        std::ptr::copy_nonoverlapping(s.as_ptr(), p as *mut u8, s.len());
+    }
+    let r = dispatch(&mut proc, &host, abi::SYS_CHDIR, [p, 0, 0, 0, 0, 0]);
+    assert_eq!(r, 0);
+    assert_eq!(proc.cwd, "/mnt/c/Windows");
+    // 相对路径 chdir 基于 cwd 拼接
+    // SAFETY: p 为 mock 分配的可写内存
+    unsafe {
+        let s = b"Temp\0";
+        std::ptr::copy_nonoverlapping(s.as_ptr(), p as *mut u8, s.len());
+    }
+    let r = dispatch(&mut proc, &host, abi::SYS_CHDIR, [p, 0, 0, 0, 0, 0]);
+    assert_eq!(r, 0);
+    assert_eq!(proc.cwd, "/mnt/c/Windows/Temp");
+    // getcwd 读回
+    let buf = (addr + 0x100) as u64;
+    let r = dispatch(&mut proc, &host, abi::SYS_GETCWD, [buf, 256, 0, 0, 0, 0]);
+    assert_eq!(r, buf as i64);
+    // SAFETY: buf 为 mock 分配的可写内存
+    let s = unsafe { std::slice::from_raw_parts(buf as *const u8, 20) };
+    assert_eq!(&s[..20], b"/mnt/c/Windows/Temp\0");
+    // 不可翻译路径 → ENOENT
+    // SAFETY: p 为 mock 分配的可写内存
+    unsafe {
+        let s = b"/etc\0";
+        std::ptr::copy_nonoverlapping(s.as_ptr(), p as *mut u8, s.len());
+    }
+    let r = dispatch(&mut proc, &host, abi::SYS_CHDIR, [p, 0, 0, 0, 0, 0]);
+    assert_eq!(r, -(abi::ENOENT as i64));
+    assert_eq!(proc.cwd, "/mnt/c/Windows/Temp"); // 失败不改变 cwd
+}
+
+#[test]
+fn getuid_getgid_use_process_identity() {
+    let (host, mut proc, _addr) = setup(4096);
+    proc.uid = 4242;
+    proc.gid = 4343;
+    let r = dispatch(&mut proc, &host, abi::SYS_GETUID, [0, 0, 0, 0, 0, 0]);
+    assert_eq!(r, 4242);
+    let r = dispatch(&mut proc, &host, abi::SYS_GETEUID, [0, 0, 0, 0, 0, 0]);
+    assert_eq!(r, 4242);
+    let r = dispatch(&mut proc, &host, abi::SYS_GETGID, [0, 0, 0, 0, 0, 0]);
+    assert_eq!(r, 4343);
+    let r = dispatch(&mut proc, &host, abi::SYS_GETEGID, [0, 0, 0, 0, 0, 0]);
+    assert_eq!(r, 4343);
 }
 
 // ---------------------------------------------------------------- getdents64

@@ -39,12 +39,13 @@ extern "C" {
     fn vela_enter_guest(entry: u64, rsp: u64) -> !;
 }
 
-/// 按 Linux ELF 启动约定建栈：rsp 指向 argc，之后 argv[]/NULL/envp/NULL/auxv。
+/// 按 Linux ELF 启动约定建栈：rsp 指向 argc，之后 argv[]/NULL/envp[]/NULL/auxv。
 /// ELF `_start` 时 rsp % 16 == 0（规格 4.2，注意不是 Win64 约定）。
 pub fn build_stack(
     host: &dyn Host,
     img: &LoadedImage,
     argv: &[String],
+    envp: &[String],
 ) -> Result<(u64, MemRange), String> {
     const STACK_SIZE: u64 = 8 * 1024 * 1024;
     if argv.is_empty() {
@@ -57,20 +58,26 @@ pub fn build_stack(
     let top = base + STACK_SIZE; // 8MiB 尺寸 + 64K 对齐基址 ⇒ top 16 字节对齐
 
     // —— 自顶向下布局：
-    //   [rsp(16对齐): argc|argv[]|NULL|envp NULL|auxv]
+    //   [rsp(16对齐): argc|argv[]|NULL|envp[]|NULL|auxv]
     //   [对齐垫片]
     //   [argv/env 字符串]
     //   [AT_RANDOM 16 字节 @ top-16]
 
     let random_addr = top - 16;
-    let mut string_bytes: Vec<(u64, Vec<u8>)> = Vec::with_capacity(argv.len());
+    let mut string_bytes: Vec<(u64, Vec<u8>)> = Vec::with_capacity(argv.len() + envp.len());
     let mut str_ptrs: Vec<u64> = Vec::with_capacity(argv.len());
+    let mut env_ptrs: Vec<u64> = Vec::with_capacity(envp.len());
     let mut cursor = random_addr;
-    for s in argv {
+    for s in argv.iter().chain(envp.iter()) {
         let mut b = s.as_bytes().to_vec();
         b.push(0);
         cursor -= b.len() as u64;
-        str_ptrs.push(cursor);
+        // 先 argv 后 env：str_ptrs 收 argv，env_ptrs 收 env
+        if str_ptrs.len() < argv.len() {
+            str_ptrs.push(cursor);
+        } else {
+            env_ptrs.push(cursor);
+        }
         string_bytes.push((cursor, b));
     }
     let strings_lo = cursor;
@@ -99,7 +106,8 @@ pub fn build_stack(
     words.push(argv.len() as u64); // argc
     words.extend(str_ptrs.iter().copied()); // argv[0..n]
     words.push(0); // argv 终止 NULL
-    words.push(0); // envp：空环境 → NULL
+    words.extend(env_ptrs.iter().copied()); // envp[0..m]
+    words.push(0); // envp 终止 NULL
     for (t, v) in &auxv {
         words.push(*t);
         words.push(*v);

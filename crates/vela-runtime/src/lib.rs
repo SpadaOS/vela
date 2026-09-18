@@ -108,6 +108,8 @@ pub struct GuestProcess {
     pub mem: MemRegistry,
     /// Linux 风格路径（规格 5.4）。
     pub cwd: String,
+    /// 客户→宿主路径映射表（vela-fs）。默认 legacy：`/mnt/c → C:\`。
+    pub fs: vela_fs::FsMap,
 }
 
 impl GuestProcess {
@@ -128,6 +130,7 @@ impl GuestProcess {
             load,
             mem: memreg,
             cwd: "/mnt/c".to_string(),
+            fs: vela_fs::FsMap::legacy(),
         }
     }
 

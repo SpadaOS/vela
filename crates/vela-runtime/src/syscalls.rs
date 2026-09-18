@@ -29,6 +29,10 @@ pub fn dispatch(proc: &mut GuestProcess, host: &dyn Host, nr: u64, a: [u64; 6]) 
         abi::SYS_ARCH_PRCTL => sys_arch_prctl(proc, host, a[0], a[1]),
         abi::SYS_GETRANDOM => sys_getrandom(proc, host, a[0], a[1]),
         abi::SYS_GETPID => proc.pid as i64,
+        abi::SYS_GETUID | abi::SYS_GETEUID => proc.uid as i64,
+        abi::SYS_GETGID | abi::SYS_GETEGID => proc.gid as i64,
+        abi::SYS_GETCWD => sys_getcwd(proc, a[0], a[1]),
+        abi::SYS_CHDIR => sys_chdir(proc, host, a[0]),
         abi::SYS_SET_TID_ADDRESS => proc.pid as i64, // v0 单线程：返回假 pid 即可
         abi::SYS_SET_ROBUST_LIST => 0,               // musl 启动路径调用，忽略
         abi::SYS_CLOCK_GETTIME => sys_clock_gettime(proc, host, a[0], a[1]),
@@ -158,12 +162,12 @@ fn open_common(proc: &mut GuestProcess, host: &dyn Host, dirfd: i32, path_ptr: u
     // 解析为宿主路径：绝对路径走 vela-fs 翻译；相对路径按 dirfd（AT_FDCWD→cwd，
     // 目录 fd→其宿主目录）拼接。规格 2.4：进入 Host 的必须是宿主原生路径。
     let host_path = if path.starts_with('/') {
-        match vela_fs::translate(&path) {
+        match proc.fs.translate(&path) {
             Some(p) => p,
             None => return -(abi::ENOENT as i64),
         }
     } else if dirfd == abi::AT_FDCWD {
-        match vela_fs::translate(&resolve_rel(proc, &path)) {
+        match proc.fs.translate(&resolve_rel(proc, &path)) {
             Some(p) => p,
             None => return -(abi::ENOENT as i64),
         }
@@ -239,6 +243,47 @@ fn resolve_rel(proc: &GuestProcess, path: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------- 工作目录
+
+/// getcwd(buf, size)：写入 cwd（含 NUL）。缓冲不足返回 -ERANGE。
+fn sys_getcwd(proc: &GuestProcess, buf: u64, size: u64) -> i64 {
+    if size == 0 {
+        return -(abi::EINVAL as i64);
+    }
+    let need = proc.cwd.len() + 1;
+    if (size as usize) < need {
+        return -(abi::ERANGE as i64);
+    }
+    let mut out = proc.cwd.clone().into_bytes();
+    out.push(0);
+    match write_guest(proc, buf, &out) {
+        Ok(()) => buf as i64, // Linux getcwd 成功返回 buf 地址
+        Err(e) => -(e as i64),
+    }
+}
+
+/// chdir(path)：翻译并校验目标为存在目录后更新记账 cwd（不改宿主进程目录）。
+/// `..` 由 vela-fs 统一拒绝（0.0.2 简化，见 PLAN-0.0.2 T2.2）。
+fn sys_chdir(proc: &mut GuestProcess, host: &dyn Host, path_ptr: u64) -> i64 {
+    let path = match read_cstr(proc, path_ptr) {
+        Ok(p) => p,
+        Err(e) => return -(e as i64),
+    };
+    let Some(host_path) = proc.fs.translate(&resolve_rel(proc, &path)) else {
+        return -(abi::ENOENT as i64);
+    };
+    match host.stat_path(&HostPath(host_path)) {
+        Ok(st) if st.is_dir => {}
+        Ok(_) => return -(abi::ENOTDIR as i64),
+        Err(e) => return -(host_err_to_errno(&e) as i64),
+    }
+    // 规范化客户侧 cwd：组件折叠（"." 去除）；目标必为已翻译合法路径
+    let joined = resolve_rel(proc, &path);
+    let comps: Vec<&str> = joined.split('/').filter(|c| !c.is_empty() && *c != ".").collect();
+    proc.cwd = if comps.is_empty() { "/".to_string() } else { format!("/{}", comps.join("/")) };
+    0
+}
+
 // ---------------------------------------------------------------- stat 家族
 
 fn sys_stat(proc: &mut GuestProcess, host: &dyn Host, path_ptr: u64, statbuf: u64) -> i64 {
@@ -247,7 +292,7 @@ fn sys_stat(proc: &mut GuestProcess, host: &dyn Host, path_ptr: u64, statbuf: u6
         Err(e) => return -(e as i64),
     };
     // v0 无 symlink 语义，lstat ≡ stat（NONGOALS：不做真实 symlink）
-    let Some(host_path) = vela_fs::translate(&resolve_rel(proc, &path)) else {
+    let Some(host_path) = proc.fs.translate(&resolve_rel(proc, &path)) else {
         return -(abi::ENOENT as i64);
     };
     fill_stat(proc, host.stat_path(&HostPath(host_path)), statbuf)
@@ -281,7 +326,7 @@ fn sys_newfstatat(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 
         return -(abi::EBADF as i64); // 目录 fd 相对路径 v0.2 仍不支持（规格 5.5）
     }
     // AT_SYMLINK_NOFOLLOW 与否等价（无 symlink 语义）
-    let Some(host_path) = vela_fs::translate(&resolve_rel(proc, &path)) else {
+    let Some(host_path) = proc.fs.translate(&resolve_rel(proc, &path)) else {
         return -(abi::ENOENT as i64);
     };
     fill_stat(proc, host.stat_path(&HostPath(host_path)), statbuf)
