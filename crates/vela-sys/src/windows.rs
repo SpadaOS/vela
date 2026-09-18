@@ -192,6 +192,28 @@ pub fn clear_guest_exec_ranges() {
     }
 }
 
+/// 用新范围集合整体替换已登记范围（PLAN-0.0.5 T1.1：execve 原地重注册）。
+/// 前缀覆盖 + 尾部清零，无分配无递归；超过 MAX_GUEST_RANGES 响亮警告。
+pub fn replace_guest_exec_ranges(ranges: &[(u64, u64)]) {
+    let n = ranges.len().min(MAX_GUEST_RANGES);
+    for (i, (s, e)) in ranges.iter().take(n).enumerate() {
+        RANGE_START[i].store(*s, Ordering::Relaxed);
+        RANGE_END[i].store(*e, Ordering::Relaxed);
+    }
+    for slot in RANGE_START[n..MAX_GUEST_RANGES].iter() {
+        slot.store(0, Ordering::Relaxed);
+    }
+    for slot in RANGE_END[n..MAX_GUEST_RANGES].iter() {
+        slot.store(0, Ordering::Relaxed);
+    }
+    if ranges.len() > MAX_GUEST_RANGES {
+        eprintln!(
+            "[vela] warn: exec range table full ({MAX_GUEST_RANGES}), {} ranges NOT registered",
+            ranges.len() - MAX_GUEST_RANGES
+        );
+    }
+}
+
 /// 注册 syscall dispatch 回调。
 pub fn set_trap_fn(f: TrapFn) {
     TRAP_FN.store(f as usize, Ordering::Relaxed);

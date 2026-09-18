@@ -323,8 +323,8 @@ fn do_execve(st: &mut GuestState, args: &[u64; 6]) -> Result<(u64, u64), i64> {
         });
     }
 
-    // 4. 卸载旧客户地址空间（新映像仍在 host 内存中，不受影响）
-    vela_sys::windows::clear_guest_exec_ranges();
+    // 4. 卸载旧客户地址空间（新映像仍在 host 内存中，不受影响；
+    //    exec-range 表由第 7 步 replace 原地重注册覆盖）
     let old: Vec<vela_runtime::MemRange> = st.proc.mem.ranges.values().copied().collect();
     for r in old {
         // Reserve 块（映像/堆/栈）不调用 VirtualFree：实测对含 musl donate
@@ -362,15 +362,12 @@ fn do_execve(st: &mut GuestState, args: &[u64; 6]) -> Result<(u64, u64), i64> {
     st.proc.fs_apply_pending = None;
     vela_sys::windows::set_soft_tls_base(0);
 
-    // 7. 注册新可执行范围，返回新入口
-    for (s, e) in &st.proc.load.exec_ranges {
-        vela_sys::windows::add_guest_exec_range(*s, *e);
-    }
+    // 7. 原地重注册新可执行范围，返回新入口
+    let mut ranges = st.proc.load.exec_ranges.clone();
     if let Some(i) = &st.proc.load.interp {
-        for (s, e) in &i.exec_ranges {
-            vela_sys::windows::add_guest_exec_range(*s, *e);
-        }
+        ranges.extend(i.exec_ranges.iter().copied());
     }
+    vela_sys::windows::replace_guest_exec_ranges(&ranges);
     let entry = match &st.proc.load.interp {
         Some(i) => i.entry,
         None => st.proc.load.entry,
@@ -610,9 +607,8 @@ fn run_elf(
         let ptr = Box::into_raw(state);
         GUEST.store(ptr, Ordering::Relaxed);
         set_trap_fn(trap);
-        for (s, e) in &exec_ranges {
-            add_guest_exec_range(*s, *e);
-        }
+        // exec-range 原地注册（T1.1）：初始装载与后续 execve 重载共用同一路径
+        vela_sys::windows::replace_guest_exec_ranges(&exec_ranges);
         if let Err(e) = install_syscall_trap() {
             eprintln!("vela: failed to install exception trap: {e}");
             return Err(1);
