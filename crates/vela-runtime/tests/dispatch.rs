@@ -16,6 +16,8 @@ use vela_sys::{
 struct MockHost {
     out: Mutex<Vec<u8>>,
     allocs: Mutex<std::collections::HashMap<usize, std::alloc::Layout>>,
+    /// map_file 分配的"视图"基址集合（跨 kind 释放原语校验用）。
+    views: Mutex<std::collections::HashSet<usize>>,
 }
 
 impl MockHost {
@@ -23,6 +25,7 @@ impl MockHost {
         MockHost {
             out: Mutex::new(Vec::new()),
             allocs: Mutex::new(std::collections::HashMap::new()),
+            views: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -39,8 +42,9 @@ impl HostMem for MockHost {
         _prot: HostProt,
         _anon: bool,
     ) -> Result<usize, HostError> {
-        let layout =
-            std::alloc::Layout::from_size_align(len.max(1), 16).map_err(|_| HostError::Invalid)?;
+        // 页对齐模拟真实宿主（VirtualAlloc 64K / munmap 页粒度语义）
+        let layout = std::alloc::Layout::from_size_align(len.max(1), 4096)
+            .map_err(|_| HostError::Invalid)?;
         // SAFETY: 布局非零大小；测试专用
         let p = unsafe { std::alloc::alloc_zeroed(layout) };
         if p.is_null() {
@@ -53,6 +57,42 @@ impl HostMem for MockHost {
         Ok(())
     }
     unsafe fn unmap(&self, addr: usize, _len: usize) -> Result<(), HostError> {
+        assert!(
+            !self.views.lock().unwrap().contains(&addr),
+            "reserve unmap used on a file view {addr:#x}"
+        );
+        if let Some(l) = self.allocs.lock().unwrap().remove(&addr) {
+            // SAFETY: addr 由本实现 alloc，配对 dealloc
+            unsafe { std::alloc::dealloc(addr as *mut u8, l) };
+        }
+        Ok(())
+    }
+    // 模拟文件视图：分配一块零内存并登记为 view（真实内容语义由 Windows 宿主
+    // 测试覆盖；这里验证 runtime 的登记/释放原语分发）。
+    unsafe fn map_file(
+        &self,
+        _f: &HostFile,
+        _off: u64,
+        len: usize,
+        _hint: usize,
+        _prot: HostProt,
+    ) -> Result<usize, HostError> {
+        let layout = std::alloc::Layout::from_size_align(len.max(1), 4096)
+            .map_err(|_| HostError::Invalid)?;
+        // SAFETY: 布局非零大小；测试专用
+        let p = unsafe { std::alloc::alloc_zeroed(layout) };
+        if p.is_null() {
+            return Err(HostError::NoMemory);
+        }
+        self.allocs.lock().unwrap().insert(p as usize, layout);
+        self.views.lock().unwrap().insert(p as usize);
+        Ok(p as usize)
+    }
+    unsafe fn unmap_view(&self, addr: usize) -> Result<(), HostError> {
+        assert!(
+            self.views.lock().unwrap().remove(&addr),
+            "unmap_view on a non-view address {addr:#x}"
+        );
         if let Some(l) = self.allocs.lock().unwrap().remove(&addr) {
             // SAFETY: addr 由本实现 alloc，配对 dealloc
             unsafe { std::alloc::dealloc(addr as *mut u8, l) };
@@ -91,6 +131,12 @@ impl HostFileOps for MockHost {
     fn read(&self, f: &HostFile, buf: &mut [u8]) -> Result<usize, HostError> {
         match &f.0 {
             HostFileKind::StdIn => Ok(0), // v0 stdin 先返回 0（规格 5.4）
+            HostFileKind::Disk { file, .. } => {
+                use std::io::Read;
+                (&*file)
+                    .read(buf)
+                    .map_err(|e| HostError::Other(e.raw_os_error().unwrap_or(5)))
+            }
             _ => Err(HostError::Access),
         }
     }
@@ -103,8 +149,21 @@ impl HostFileOps for MockHost {
             _ => Err(HostError::Access),
         }
     }
-    fn seek(&self, _f: &HostFile, _off: i64, _w: i32) -> Result<u64, HostError> {
-        Err(HostError::Invalid)
+    fn seek(&self, f: &HostFile, off: i64, w: i32) -> Result<u64, HostError> {
+        match &f.0 {
+            HostFileKind::Disk { file, .. } => {
+                use std::io::{Seek, SeekFrom};
+                let from = match w {
+                    0 => SeekFrom::Start(off as u64),
+                    1 => SeekFrom::Current(off),
+                    _ => SeekFrom::End(off),
+                };
+                (&*file)
+                    .seek(from)
+                    .map_err(|e| HostError::Other(e.raw_os_error().unwrap_or(5)))
+            }
+            _ => Err(HostError::Invalid),
+        }
     }
     fn stat_path(&self, _p: &HostPath) -> Result<HostStat, HostError> {
         // 目录元数据（chdir 校验与 stat 路径测试用）
@@ -191,10 +250,7 @@ fn setup(len: usize) -> (MockHost, GuestProcess, usize) {
             prot: 5,
         }],
         exec_ranges: vec![],
-        span: MemRange {
-            start: addr as u64,
-            len: len as u64,
-        },
+        span: MemRange::reserve(addr as u64, len as u64),
     };
     let mut proc = GuestProcess::new(1000, img);
     proc.attach_stdio(&host);
@@ -301,15 +357,224 @@ fn mmap_anonymous_registers_mapping() {
 }
 
 #[test]
-fn mmap_rejects_file_backed() {
+fn mmap_file_readback_matches_content_and_zero_fills_past_eof() {
     let (host, mut proc, _addr) = setup(4096);
+    // 文件 8192 字节，映射 offset 4096（非 64K 对齐 → 强制读入回退路径），
+    // 内容 4096 字节 + EOF 之后零填充
+    let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    let dir = std::env::temp_dir().join(format!("vela_rt_mmap_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("payload.bin");
+    let mut file_bytes = vec![0u8; 8192];
+    file_bytes[4096..].copy_from_slice(&payload);
+    std::fs::write(&p, &file_bytes).unwrap();
+    let hf = HostFile(HostFileKind::Disk {
+        file: std::fs::File::open(&p).unwrap(),
+        path: p,
+    });
+    let fd = proc.fds.alloc_fd(GuestFd::Host(hf));
     let r = dispatch(
         &mut proc,
         &host,
         abi::SYS_MMAP,
-        [0, 4096, 3, abi::MAP_PRIVATE as u64, 5, 0],
+        [
+            0,
+            8192,
+            1, /* PROT_READ */
+            abi::MAP_PRIVATE as u64,
+            fd as u64,
+            4096,
+        ],
+    );
+    assert!(r > 0, "mmap file failed: {r}");
+    let mapped = r as u64;
+    assert!(proc.mem.contains(mapped, 8192));
+    // SAFETY: mapped 已登记且 mock 内存可读
+    let data = unsafe { std::slice::from_raw_parts(mapped as *const u8, 8192) };
+    assert_eq!(&data[..4096], &payload[..]);
+    assert!(data[4096..].iter().all(|&b| b == 0));
+    // fd 游标未被读入过程移动
+    let cur = dispatch(&mut proc, &host, abi::SYS_LSEEK, [fd as u64, 0, 1, 0, 0, 0]);
+    assert_eq!(cur, 0);
+    // munmap 走 reserve 原语（读入副本登记为 Reserve；mock 断言原语不混用）
+    let u = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_MUNMAP,
+        [mapped, 8192, 0, 0, 0, 0],
+    );
+    assert_eq!(u, 0);
+    assert!(!proc.mem.contains(mapped, 1));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn mmap_file_fixed_inside_reservation_carves_readback() {
+    let (host, mut proc, _addr) = setup(4096);
+    let payload: Vec<u8> = (0..4096u32).map(|i| (i * 7 % 256) as u8).collect();
+    let dir = std::env::temp_dir().join(format!("vela_rt_carve_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("seg.bin");
+    std::fs::write(&p, &payload).unwrap();
+    let hf = HostFile(HostFileKind::Disk {
+        file: std::fs::File::open(&p).unwrap(),
+        path: p,
+    });
+    let fd = proc.fds.alloc_fd(GuestFd::Host(hf));
+
+    // ld-musl 模式：先 PROT_NONE 匿名预留（2 页），再 MAP_FIXED 文件映射覆盖前 1 页
+    let anon_flags = (abi::MAP_PRIVATE | abi::MAP_ANONYMOUS) as u64;
+    let res = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_MMAP,
+        [
+            0,
+            8192,
+            0, /* PROT_NONE */
+            anon_flags,
+            (-1i64) as u64,
+            0,
+        ],
+    );
+    assert!(res > 0);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_MMAP,
+        [
+            res as u64,
+            4096,
+            1,
+            (abi::MAP_PRIVATE | abi::MAP_FIXED) as u64,
+            fd as u64,
+            0,
+        ],
+    );
+    assert_eq!(r, res, "fixed carve must return the requested address");
+    // SAFETY: carve 已把文件内容写入预留区首页
+    let data = unsafe { std::slice::from_raw_parts(res as *const u8, 4096) };
+    assert_eq!(data, &payload[..]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn mmap_file_view_registers_and_unmaps_via_view_primitive() {
+    let (host, mut proc, _addr) = setup(4096);
+    let dir = std::env::temp_dir().join(format!("vela_rt_view_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("lib.bin");
+    std::fs::write(&p, vec![0x5A; 0x10000]).unwrap();
+    let hf = HostFile(HostFileKind::Disk {
+        file: std::fs::File::open(&p).unwrap(),
+        path: p,
+    });
+    let fd = proc.fds.alloc_fd(GuestFd::Host(hf));
+    // offset 0（对齐）→ 真视图路径
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_MMAP,
+        [0, 8192, 1, abi::MAP_PRIVATE as u64, fd as u64, 0],
+    );
+    assert!(r > 0);
+    let mapped = r as u64;
+    assert!(host.views.lock().unwrap().contains(&(mapped as usize)));
+    assert!(proc.mem.contains(mapped, 8192));
+    let u = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_MUNMAP,
+        [mapped, 8192, 0, 0, 0, 0],
+    );
+    assert_eq!(u, 0);
+    assert!(host.views.lock().unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn mmap_file_error_semantics() {
+    let (host, mut proc, _addr) = setup(4096);
+    // fd 越界 → EBADF
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_MMAP,
+        [0, 4096, 1, abi::MAP_PRIVATE as u64, 77, 0],
+    );
+    assert_eq!(r, -(abi::EBADF as i64));
+    // /dev/null 型 fd（Null）→ ENODEV
+    let nfd = proc.fds.alloc_fd(GuestFd::Null);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_MMAP,
+        [0, 4096, 1, abi::MAP_PRIVATE as u64, nfd as u64, 0],
+    );
+    assert_eq!(r, -(abi::ENODEV as i64));
+    // MAP_SHARED 文件映射 → ENOSYS（PLAN-0.0.4 延后）
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_MMAP,
+        [0, 4096, 1, abi::MAP_SHARED as u64, 0, 0],
     );
     assert_eq!(r, -(abi::ENOSYS as i64));
+    // flags 缺 PRIVATE/SHARED → EINVAL
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_MMAP,
+        [0, 4096, 1, abi::MAP_ANONYMOUS as u64, (-1i64) as u64, 0],
+    );
+    assert_eq!(r, -(abi::EINVAL as i64));
+}
+
+#[test]
+fn msync_validates_and_noops() {
+    let (host, mut proc, _addr) = setup(4096);
+    let flags = (abi::MAP_PRIVATE | abi::MAP_ANONYMOUS) as u64;
+    let m = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_MMAP,
+        [0, 8192, 3, flags, (-1i64) as u64, 0],
+    );
+    assert!(m > 0);
+    // 未对齐 / 零长度 → EINVAL
+    assert_eq!(
+        dispatch(
+            &mut proc,
+            &host,
+            abi::SYS_MSYNC,
+            [m as u64 + 1, 4096, 0, 0, 0, 0]
+        ),
+        -(abi::EINVAL as i64)
+    );
+    assert_eq!(
+        dispatch(&mut proc, &host, abi::SYS_MSYNC, [m as u64, 0, 0, 0, 0, 0]),
+        -(abi::EINVAL as i64)
+    );
+    // 区间未登记 → ENOMEM
+    assert_eq!(
+        dispatch(
+            &mut proc,
+            &host,
+            abi::SYS_MSYNC,
+            [m as u64, 0x1_0000, 0, 0, 0, 0]
+        ),
+        -(abi::ENOMEM as i64)
+    );
+    // 合法区间 → 0（MAP_PRIVATE 无回写语义）
+    assert_eq!(
+        dispatch(
+            &mut proc,
+            &host,
+            abi::SYS_MSYNC,
+            [m as u64, 8192, 0, 0, 0, 0]
+        ),
+        0
+    );
 }
 
 #[test]

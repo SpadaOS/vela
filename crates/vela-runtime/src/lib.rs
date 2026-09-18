@@ -157,10 +157,7 @@ impl GuestProcess {
                 true,
             )
         }? as u64;
-        let r = MemRange {
-            start: addr,
-            len: size,
-        };
+        let r = MemRange::reserve(addr, size);
         self.heap = Some(r);
         self.mem.add(r);
         self.brk_start = addr;

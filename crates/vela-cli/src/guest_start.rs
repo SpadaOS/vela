@@ -146,11 +146,5 @@ pub fn build_stack(
         std::ptr::copy_nonoverlapping(buf.as_ptr(), rsp as *mut u8, buf.len());
     }
 
-    Ok((
-        rsp,
-        MemRange {
-            start: base,
-            len: stack_size,
-        },
-    ))
+    Ok((rsp, MemRange::reserve(base, stack_size)))
 }

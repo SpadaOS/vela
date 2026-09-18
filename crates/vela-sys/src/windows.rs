@@ -2,13 +2,14 @@
 //! VEH（UD2 → dispatch）syscall 陷阱。所有 Win32 FFI 集中在本模块（规格 2.4）。
 
 use std::ffi::c_void;
+use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::file_ops;
 use crate::{
-    Host, HostDir, HostError, HostFile, HostFileOps, HostMem, HostOpen, HostPath, HostProt,
-    HostStat, HostTime, HostTls, StdioHandles,
+    Host, HostDir, HostError, HostFile, HostFileKind, HostFileOps, HostMem, HostOpen, HostPath,
+    HostProt, HostStat, HostTime, HostTls, StdioHandles,
 };
 
 // ---------------------------------------------------------------- Win32 FFI
@@ -19,9 +20,20 @@ const MEM_RELEASE: u32 = 0x8000;
 const PAGE_NOACCESS: u32 = 0x01;
 const PAGE_READONLY: u32 = 0x02;
 const PAGE_READWRITE: u32 = 0x04;
+const PAGE_WRITECOPY: u32 = 0x08;
 const PAGE_EXECUTE: u32 = 0x10;
 const PAGE_EXECUTE_READ: u32 = 0x20;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
+
+// 文件映射视图访问位（MapViewOfFileEx dwDesiredAccess）
+const FILE_MAP_COPY: u32 = 0x0000_0001;
+const FILE_MAP_READ: u32 = 0x0000_0004;
+const FILE_MAP_EXECUTE: u32 = 0x0020_0000;
+
+/// Windows 分配粒度：VirtualAlloc 基址与 MapViewOfFileEx 的 lpBaseAddress /
+/// 文件偏移都必须对齐到它。x64 平台文档保证 64K；若未来变化需换 GetSystemInfo。
+const ALLOC_GRANULARITY: usize = 0x1_0000;
 
 const STATUS_ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
@@ -42,6 +54,24 @@ extern "system" {
         lpflOldProtect: *mut u32,
     ) -> i32;
     fn VirtualFree(lpAddress: *mut c_void, dwSize: usize, dwFreeType: u32) -> i32;
+    fn CreateFileMappingW(
+        hFile: *mut c_void,
+        lpAttributes: *mut c_void,
+        flProtect: u32,
+        dwMaximumSizeHigh: u32,
+        dwMaximumSizeLow: u32,
+        lpName: *const u16,
+    ) -> *mut c_void;
+    fn MapViewOfFileEx(
+        hFileMappingObject: *mut c_void,
+        dwDesiredAccess: u32,
+        dwFileOffsetHigh: u32,
+        dwFileOffsetLow: u32,
+        dwNumberOfBytesToMap: usize,
+        lpBaseAddress: *mut c_void,
+    ) -> *mut c_void;
+    fn UnmapViewOfFile(lpBaseAddress: *mut c_void) -> i32;
+    fn CloseHandle(hObject: *mut c_void) -> i32;
     fn SetConsoleOutputCP(wCodePageID: u32) -> i32;
     fn AddVectoredExceptionHandler(
         First: u32,
@@ -548,6 +578,86 @@ impl HostMem for WindowsHost {
             Ok(())
         }
     }
+
+    unsafe fn map_file(
+        &self,
+        file: &HostFile,
+        offset: u64,
+        len: usize,
+        hint: usize,
+        prot: HostProt,
+    ) -> Result<usize, HostError> {
+        if len == 0 {
+            return Err(HostError::Invalid);
+        }
+        if !offset.is_multiple_of(ALLOC_GRANULARITY as u64) {
+            return Err(HostError::Invalid);
+        }
+        if hint != 0 && !hint.is_multiple_of(ALLOC_GRANULARITY) {
+            return Err(HostError::Invalid);
+        }
+        let crate::HostFile(HostFileKind::Disk { file, .. }) = file else {
+            return Err(HostError::Invalid); // stdio / 匿名句柄无文件背书
+        };
+        // MAP_PRIVATE：写入绝不回写文件。可写视图一律走 COW（PAGE_*WRITECOPY +
+        // FILE_MAP_COPY）；此时绝不可再对该视图 VirtualProtect 成 PAGE_READWRITE，
+        // 那会关闭 COW 并把后续写入穿透到宿主文件（runtime 层已规避）。
+        let (map_prot, view_access) = match (
+            prot.contains(HostProt::WRITE),
+            prot.contains(HostProt::EXEC),
+        ) {
+            (true, true) => (PAGE_EXECUTE_WRITECOPY, FILE_MAP_COPY | FILE_MAP_EXECUTE),
+            (true, false) => (PAGE_WRITECOPY, FILE_MAP_COPY),
+            (false, true) => (PAGE_EXECUTE_READ, FILE_MAP_READ | FILE_MAP_EXECUTE),
+            (false, false) => (PAGE_READONLY, FILE_MAP_READ),
+        };
+        // SAFETY: file 为有效打开的宿主文件句柄；其余参数均为文档允许的取值
+        let handle = unsafe {
+            CreateFileMappingW(
+                file.as_raw_handle(),
+                std::ptr::null_mut(),
+                map_prot,
+                0,
+                0,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() || handle as isize == -1 {
+            return Err(HostError::Other(file_ops::os_to_errno(
+                unsafe { GetLastError() } as i32,
+            )));
+        }
+        // 视图创建失败也要释放映射对象（视图本身持有引用，先建视图再关句柄）
+        let base = unsafe {
+            MapViewOfFileEx(
+                handle,
+                view_access,
+                (offset >> 32) as u32,
+                offset as u32,
+                len,
+                hint as *mut c_void,
+            )
+        };
+        let closed = unsafe { CloseHandle(handle) } != 0;
+        if base.is_null() || !closed {
+            if !base.is_null() {
+                // SAFETY: base 来自配对的 MapViewOfFileEx
+                unsafe { UnmapViewOfFile(base) };
+            }
+            // hint 冲突 / 资源不足：交给 runtime 走读入私有副本回退
+            return Err(HostError::NoMemory);
+        }
+        Ok(base as usize)
+    }
+
+    unsafe fn unmap_view(&self, addr: usize) -> Result<(), HostError> {
+        // SAFETY: addr 为 MapViewOfFileEx 返回的视图基址（MemRegistry 登记保证）
+        if unsafe { UnmapViewOfFile(addr as *mut c_void) } == 0 {
+            Err(HostError::Invalid)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl HostFileOps for WindowsHost {
@@ -636,5 +746,86 @@ impl Host for WindowsHost {
     }
     fn process_exit(&self, code: i32) -> ! {
         std::process::exit(code)
+    }
+}
+
+#[cfg(test)]
+mod file_map_tests {
+    //! 文件映射（PLAN-0.0.4 T1.1）：读一致、COW 不回写、对齐校验。
+    use super::*;
+    use crate::{HostOpen, HostPath};
+
+    fn temp_payload(
+        len: usize,
+        name: &str,
+    ) -> (WindowsHost, HostFile, std::path::PathBuf, Vec<u8>) {
+        let dir = std::env::temp_dir().join(format!("vela_mapfile_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&p, &payload).unwrap();
+        let host = WindowsHost::new();
+        let f = host
+            .open(
+                &HostPath(p.clone()),
+                HostOpen {
+                    read: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        (host, f, p, payload)
+    }
+
+    #[test]
+    fn read_view_matches_file_content() {
+        let (host, f, _p, payload) = temp_payload(0x3_0000, "read.bin"); // 192K，含跨 64K 偏移
+                                                                         // offset 0 系统自选基址
+        let base = unsafe { host.map_file(&f, 0, 0x2000, 0, HostProt::READ) }.unwrap();
+        assert_eq!(base % ALLOC_GRANULARITY, 0);
+        // SAFETY: base 为 map_file 返回的有效视图
+        let s = unsafe { std::slice::from_raw_parts(base as *const u8, 0x2000) };
+        assert_eq!(s, &payload[..0x2000]);
+        unsafe { host.unmap_view(base) }.unwrap();
+        // offset 64K 对齐 + 固定 hint
+        let base2 =
+            unsafe { host.map_file(&f, 0x1_0000, 0x1000, 0x2_0000, HostProt::READ) }.unwrap();
+        assert_eq!(base2, 0x2_0000);
+        // SAFETY: 同上
+        let s2 = unsafe { std::slice::from_raw_parts(base2 as *const u8, 0x1000) };
+        assert_eq!(s2, &payload[0x1_0000..0x1_1000]);
+        unsafe { host.unmap_view(base2) }.unwrap();
+    }
+
+    #[test]
+    fn cow_write_is_private_and_never_touches_file() {
+        let (host, f, p, payload) = temp_payload(0x1_0000, "cow.bin");
+        // PROT_READ|PROT_WRITE → PAGE_WRITECOPY COW 视图
+        let base =
+            unsafe { host.map_file(&f, 0, 0x1_0000, 0, HostProt::READ | HostProt::WRITE) }.unwrap();
+        // SAFETY: base 为本测试独占的 COW 视图
+        let s = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, 0x1_0000) };
+        assert_eq!(&s[..16], &payload[..16]);
+        s[..16].copy_from_slice(&[0xAB; 16]);
+        // 读回一致（COW 私有页生效）
+        assert_eq!(&s[..16], &[0xAB; 16]);
+        assert_eq!(&s[16..32], &payload[16..32]);
+        // 释放视图后宿主文件必须原样
+        unsafe { host.unmap_view(base) }.unwrap();
+        drop(f);
+        assert_eq!(std::fs::read(&p).unwrap(), payload);
+    }
+
+    #[test]
+    fn rejects_misaligned_offset_and_hint() {
+        let (host, f, _p, _payload) = temp_payload(0x2_0000, "align.bin");
+        assert_eq!(
+            unsafe { host.map_file(&f, 0x1000, 0x1000, 0, HostProt::READ) },
+            Err(HostError::Invalid)
+        );
+        assert_eq!(
+            unsafe { host.map_file(&f, 0, 0x1000, 0x1004, HostProt::READ) },
+            Err(HostError::Invalid)
+        );
     }
 }

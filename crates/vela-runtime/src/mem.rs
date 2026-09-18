@@ -35,6 +35,34 @@ pub struct LoadedImage {
 pub struct MemRange {
     pub start: u64,
     pub len: u64,
+    /// 登记项类型：决定 munmap 用哪种宿主释放原语（两者在 Windows 上不可互换）。
+    pub kind: MemKind,
+}
+
+/// 映射类型（PLAN-0.0.4 T1.3）。
+/// - Reserve：匿名预留块（VirtualAlloc → VirtualFree 整块释放）；
+/// - FileView：文件映射视图（MapViewOfFileEx → UnmapViewOfFile）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemKind {
+    Reserve,
+    FileView,
+}
+
+impl MemRange {
+    pub fn reserve(start: u64, len: u64) -> MemRange {
+        MemRange {
+            start,
+            len,
+            kind: MemKind::Reserve,
+        }
+    }
+    pub fn view(start: u64, len: u64) -> MemRange {
+        MemRange {
+            start,
+            len,
+            kind: MemKind::FileView,
+        }
+    }
 }
 
 /// 客户地址登记表：EFAULT 检查与 munmap 账本（规格 5.4）。
@@ -67,6 +95,19 @@ impl MemRegistry {
             Some((_, r)) => addr >= r.start && end <= r.start + r.len,
             None => false,
         }
+    }
+
+    /// 返回完全包含 [addr, addr+len) 的登记项（mprotect/mmap 需要区分类型时用）。
+    pub fn containing(&self, addr: u64, len: u64) -> Option<&MemRange> {
+        if len == 0 {
+            return None;
+        }
+        let end = addr.checked_add(len)?;
+        self.ranges
+            .range(..=addr)
+            .next_back()
+            .filter(|(_, r)| addr >= r.start && end <= r.start + r.len)
+            .map(|(_, r)| r)
     }
 
     pub fn overlaps(&self, start: u64, len: u64) -> bool {
@@ -109,10 +150,7 @@ mod tests {
     #[test]
     fn contains_checks_full_coverage() {
         let mut m = MemRegistry::default();
-        m.add(MemRange {
-            start: 0x1000,
-            len: 0x2000,
-        });
+        m.add(MemRange::reserve(0x1000, 0x2000));
         assert!(m.contains(0x1000, 1));
         assert!(m.contains(0x1000, 0x2000));
         assert!(m.contains(0x1FFF, 0x1000));
@@ -121,15 +159,16 @@ mod tests {
         assert!(!m.contains(0x1000, 0x2001));
         assert!(!m.contains(0x1000, 0)); // len=0 一律 false
         assert!(!m.contains(u64::MAX, 1));
+        assert_eq!(
+            m.containing(0x1000, 0x2000).map(|r| r.kind),
+            Some(MemKind::Reserve)
+        );
     }
 
     #[test]
     fn overlaps_detects_any_intersection() {
         let mut m = MemRegistry::default();
-        m.add(MemRange {
-            start: 0x1000,
-            len: 0x1000,
-        });
+        m.add(MemRange::reserve(0x1000, 0x1000));
         assert!(m.overlaps(0x1800, 0x100));
         assert!(m.overlaps(0x0800, 0x900)); // 头部相交
         assert!(m.overlaps(0x1800, 0x1000)); // 尾部相交
@@ -141,23 +180,11 @@ mod tests {
     #[test]
     fn remove_only_fully_covered() {
         let mut m = MemRegistry::default();
-        m.add(MemRange {
-            start: 0x1000,
-            len: 0x1000,
-        });
-        m.add(MemRange {
-            start: 0x3000,
-            len: 0x1000,
-        });
+        m.add(MemRange::reserve(0x1000, 0x1000));
+        m.add(MemRange::reserve(0x3000, 0x1000));
         // 只完全覆盖第一个
         let r = m.remove_fully_covered(0x0, 0x2000);
-        assert_eq!(
-            r,
-            vec![MemRange {
-                start: 0x1000,
-                len: 0x1000
-            }]
-        );
+        assert_eq!(r, vec![MemRange::reserve(0x1000, 0x1000)]);
         assert!(m.contains(0x3000, 1));
         // 部分覆盖不删除
         let r = m.remove_fully_covered(0x3000, 0x800);
@@ -167,5 +194,20 @@ mod tests {
         let r = m.remove_fully_covered(0x3000, 0x1000);
         assert_eq!(r.len(), 1);
         assert!(!m.contains(0x3000, 1));
+    }
+
+    #[test]
+    fn view_ranges_carry_kind() {
+        let mut m = MemRegistry::default();
+        m.add(MemRange::view(0x5000, 0x2000));
+        assert_eq!(
+            m.containing(0x5000, 1).map(|r| r.kind),
+            Some(MemKind::FileView)
+        );
+        assert_eq!(m.containing(0x4FFF, 1), None);
+        assert_eq!(
+            m.containing(0x6000, 0x1000).map(|r| r.kind),
+            Some(MemKind::FileView)
+        );
     }
 }

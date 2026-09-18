@@ -317,9 +317,6 @@ pub fn load(bytes: &[u8], host: &dyn Host, hint: u64) -> Result<LoadedImage, Loa
         phentsize: info.phentsize,
         segments,
         exec_ranges,
-        span: MemRange {
-            start: base,
-            len: span as u64,
-        },
+        span: MemRange::reserve(base, span as u64),
     })
 }

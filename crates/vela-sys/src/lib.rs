@@ -233,6 +233,32 @@ pub trait HostMem: Send + Sync + 'static {
 
     /// 仅能整块释放 reserve 基址（Windows 限制，规格 5.2 表）。
     unsafe fn unmap(&self, addr: usize, len: usize) -> Result<(), HostError>;
+
+    /// 文件映射（Linux MAP_PRIVATE 语义：读走文件、写 COW 私有页、不回写文件）。
+    /// offset 与 hint（非 0 时）必须是宿主分配粒度的倍数（Windows 64K），
+    /// 返回值可能不是调用方请求的地址——MAP_FIXED 语义由 runtime 层校验与回退。
+    /// 默认未实现；实现方缺失时 runtime 自动退化为"匿名映射 + 读入文件内容"。
+    ///
+    /// # Safety（组级约定）
+    /// - 返回的视图归客户使用，必须经 MemRegistry 以 FileView 登记后访问；
+    /// - 解除必须用 `unmap_view`（与 `unmap` 原语不可互换）。
+    unsafe fn map_file(
+        &self,
+        file: &HostFile,
+        offset: u64,
+        len: usize,
+        hint: usize,
+        prot: HostProt,
+    ) -> Result<usize, HostError> {
+        let _ = (file, offset, len, hint, prot);
+        Err(HostError::Unimplemented)
+    }
+
+    /// 解除 `map_file` 返回的视图（Windows 侧为 UnmapViewOfFile）。
+    unsafe fn unmap_view(&self, addr: usize) -> Result<(), HostError> {
+        let _ = addr;
+        Err(HostError::Unimplemented)
+    }
 }
 
 /// 组 2 file：文件系统与 stdio。
