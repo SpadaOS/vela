@@ -1,5 +1,6 @@
 //! vela-loader：ELF64 解析、校验、加载与 syscall patch（规格 5.3）。
-//! 仅支持 ELF64 / x86_64 / ET_DYN（静态 PIE）/ 无 PT_INTERP。
+//! 支持 ELF64 / x86_64 / ET_DYN；PT_INTERP 仅接受 musl 解释器（白名单
+//! 前缀 `ld-musl`，PLAN-0.0.4 T2.1），由 CLI 装载双映像。
 //! 依赖方向：loader → runtime（LoadedImage 类型定义在 runtime）/ loader → sys（Host trait）。
 
 use std::fmt;
@@ -24,7 +25,8 @@ pub enum LoadError {
     WrongEndian,
     WrongMachine,
     WrongType,
-    DynamicBinary,
+    /// PT_INTERP 存在但不是 musl 解释器（诚实拒绝，不做通用动态链接）。
+    UnsupportedInterp(String),
     NoLoadSegments,
     BadLayout(&'static str),
     TooLarge,
@@ -41,11 +43,11 @@ impl fmt::Display for LoadError {
             LoadError::WrongMachine => write!(f, "not x86_64 ELF (EM_X86_64 required)"),
             LoadError::WrongType => write!(
                 f,
-                "non-PIE or unsupported e_type (v0 requires ET_DYN static PIE)"
+                "non-PIE or unsupported e_type (vela requires ET_DYN PIE)"
             ),
-            LoadError::DynamicBinary => write!(
+            LoadError::UnsupportedInterp(p) => write!(
                 f,
-                "dynamic binaries not supported in v0 (PT_INTERP present)"
+                "unsupported interpreter '{p}' (only musl ld-musl-* is supported)"
             ),
             LoadError::NoLoadSegments => write!(f, "no PT_LOAD segments"),
             LoadError::BadLayout(m) => write!(f, "bad ELF layout: {m}"),
@@ -81,6 +83,8 @@ pub struct ElfInfo {
     pub phentsize: u16,
     pub phnum: u16,
     pub loads: Vec<RawLoadSeg>,
+    /// PT_INTERP 内容（解释器路径，如 /lib/ld-musl-x86_64.so.1）。
+    pub interp: Option<String>,
 }
 
 fn u16le(b: &[u8], off: usize) -> Result<u16, LoadError> {
@@ -146,12 +150,24 @@ pub fn parse(bytes: &[u8]) -> Result<ElfInfo, LoadError> {
     }
 
     let mut loads = Vec::new();
-    let mut has_interp = false;
+    let mut interp: Option<String> = None;
     for i in 0..e_phnum as usize {
         let p = e_phoff as usize + i * 56;
         let p_type = u32le(bytes, p)?;
         if p_type == PT_INTERP {
-            has_interp = true;
+            // 解释器路径：文件内 NUL 结尾字符串（PLAN-0.0.4 T2.1）
+            let off = u64le(bytes, p + 8)?;
+            let fsz = u64le(bytes, p + 32)?;
+            let end = off
+                .checked_add(fsz)
+                .ok_or(LoadError::BadLayout("interp p_offset+p_filesz overflow"))?;
+            if end > bytes.len() as u64 {
+                return Err(LoadError::Truncated);
+            }
+            let raw = &bytes[off as usize..end as usize];
+            let s = raw.split(|&b| b == 0).next().unwrap_or(&[]);
+            interp = Some(String::from_utf8_lossy(s).into_owned());
+            continue;
         }
         if p_type != PT_LOAD {
             continue;
@@ -182,8 +198,13 @@ pub fn parse(bytes: &[u8]) -> Result<ElfInfo, LoadError> {
             flags,
         });
     }
-    if has_interp {
-        return Err(LoadError::DynamicBinary);
+    if let Some(p) = &interp {
+        // 白名单：仅 musl 解释器（ld-musl 前缀的 basename）。其余诚实拒绝，
+        // 不假装支持通用 glibc 动态链接（规格 0：诚实的 ENOSYS 优于错误结果）
+        let base = p.rsplit('/').next().unwrap_or(p);
+        if !base.starts_with("ld-musl") {
+            return Err(LoadError::UnsupportedInterp(p.clone()));
+        }
     }
     if loads.is_empty() {
         return Err(LoadError::NoLoadSegments);
@@ -194,6 +215,7 @@ pub fn parse(bytes: &[u8]) -> Result<ElfInfo, LoadError> {
         phentsize: e_phentsize,
         phnum: e_phnum,
         loads,
+        interp,
     })
 }
 
@@ -318,5 +340,6 @@ pub fn load(bytes: &[u8], host: &dyn Host, hint: u64) -> Result<LoadedImage, Loa
         segments,
         exec_ranges,
         span: MemRange::reserve(base, span as u64),
+        interp: None,
     })
 }

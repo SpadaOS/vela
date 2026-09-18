@@ -4,7 +4,7 @@
 pub mod mem;
 pub mod syscalls;
 
-pub use mem::{LoadedImage, MemRange, Segment};
+pub use mem::{InterpImage, LoadedImage, MemRange, Segment};
 pub use syscalls::dispatch;
 
 use std::collections::BTreeMap;
@@ -124,6 +124,10 @@ impl GuestProcess {
     pub fn new(pid: u32, load: LoadedImage) -> Self {
         let mut memreg = MemRegistry::default();
         memreg.add(load.span);
+        if let Some(i) = &load.interp {
+            // 解释器映像同样纳入 EFAULT 检查与 munmap 记账（PLAN-0.0.4 T2.2）
+            memreg.add(i.span);
+        }
         GuestProcess {
             pid,
             uid: 1000,

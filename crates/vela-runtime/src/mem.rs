@@ -29,6 +29,21 @@ pub struct LoadedImage {
     pub exec_ranges: Vec<(u64, u64)>,
     /// 整块映射范围（用于内存登记）。
     pub span: MemRange,
+    /// 动态链接解释器（PLAN-0.0.4 T2.2）：PT_INTERP 存在时由 CLI 装载
+    /// ld-musl 并挂载。真实入口 = interp.entry；AT_BASE = interp.bias；
+    /// AT_PHDR/AT_ENTRY 仍指向主映像（与 Linux 内核 auxv 约定一致）。
+    pub interp: Option<InterpImage>,
+}
+
+/// 解释器映像（ld-musl）的装载摘要。
+#[derive(Clone, Debug)]
+pub struct InterpImage {
+    pub bias: u64,
+    /// 已加 bias 的解释器入口（_dlstart）。
+    pub entry: u64,
+    /// 解释器整块映射范围（内存登记与 munmap 记账）。
+    pub span: MemRange,
+    pub exec_ranges: Vec<(u64, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

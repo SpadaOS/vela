@@ -12,7 +12,7 @@ mod guest_start;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use vela_loader as loader;
-use vela_runtime::GuestProcess;
+use vela_runtime::{GuestProcess, InterpImage};
 
 #[cfg(target_os = "linux")]
 use vela_sys::linux_dev::LinuxDevHost;
@@ -76,6 +76,8 @@ fn print_usage() {
     eprintln!("  --map <g>=<host>   追加前缀映射（可多次；默认 /mnt/c -> C:\\）");
     eprintln!("  --env K=V          传递/覆盖环境变量；K= 表示删除（默认继承宿主全部）");
     eprintln!("  --uid <n> --gid <n>  客户 uid/gid（默认 1000）");
+    eprintln!("  --interp <host-path> 动态链接解释器（默认：fs 映射解析 PT_INTERP 路径，");
+    eprintln!("                       回退到 guest ELF 同目录下的同名文件）");
     eprintln!("  --stack-mb <n>     客户栈大小 MiB（默认 8，1-512）");
     eprintln!("  --heap-mb <n>      客户堆大小 MiB（默认 8，1-1024）");
     eprintln!("  -v                 syscall 日志到 stderr（或 VELA_LOG=1）");
@@ -92,6 +94,7 @@ struct RunOpts {
     gid: Option<u32>,
     stack_mb: u64,
     heap_mb: u64,
+    interp: Option<String>,
 }
 
 fn cmd_run(rest: &[String]) -> i32 {
@@ -104,6 +107,7 @@ fn cmd_run(rest: &[String]) -> i32 {
         gid: None,
         stack_mb: 8,
         heap_mb: 8,
+        interp: None,
     };
     let mut pos: Vec<String> = Vec::new();
     let mut i = 0;
@@ -131,6 +135,13 @@ fn cmd_run(rest: &[String]) -> i32 {
                     return usage_err("--env 需要参数");
                 };
                 opts.envs.push(v.clone());
+                i += 1;
+            }
+            "--interp" => {
+                let Some(v) = rest.get(i + 1) else {
+                    return usage_err("--interp 需要参数");
+                };
+                opts.interp = Some(v.clone());
                 i += 1;
             }
             "--uid" | "--gid" | "--stack-mb" | "--heap-mb" => {
@@ -185,6 +196,31 @@ fn usage_err(msg: &str) -> i32 {
     eprintln!("vela: {msg}");
     print_usage();
     2
+}
+
+/// 解释器宿主路径解析（PLAN-0.0.4 T2.2）：
+/// 1. --interp 显式指定（最高优先）；
+/// 2. fs 映射翻译 PT_INTERP 客户路径（如 --map /lib=D:\musl\lib）；
+/// 3. 回退：guest ELF 同目录下的同名文件（guest/bin/hello-dyn + ld-musl-*.so.1）。
+fn resolve_interp(
+    fs: &vela_fs::FsMap,
+    gpath: &str,
+    elf_path: &str,
+    explicit: &Option<String>,
+) -> std::path::PathBuf {
+    if let Some(p) = explicit {
+        return std::path::PathBuf::from(p);
+    }
+    if let Some(hp) = fs.translate(gpath) {
+        if hp.exists() {
+            return hp;
+        }
+    }
+    let base = std::path::Path::new(elf_path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let name = gpath.rsplit('/').next().unwrap_or(gpath);
+    base.join(name)
 }
 
 /// 环境自检（PLAN-0.0.2 T4.3）：排障入口，报告宿主能力与常见问题。
@@ -289,7 +325,8 @@ fn run_elf(
 
     let host = PlatformHost::new();
 
-    let img = match loader::load(&bytes, &host, GUEST_HINT) {
+    // 先解析：格式错误尽早失败，同时取 PT_INTERP 路径（PLAN-0.0.4 T2.1）
+    let info = match loader::parse(&bytes) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("vela: {elf_path}: {e}");
@@ -297,11 +334,18 @@ fn run_elf(
         }
     };
 
-    let mut proc = GuestProcess::new(1000, img);
-    proc.attach_stdio(&host);
-    // T2.1/T2.5：路径映射与身份
+    let mut img = match loader::load(&bytes, &host, GUEST_HINT) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("vela: {elf_path}: {e}");
+            return Err(1);
+        }
+    };
+
+    // 路径映射提前构建：解释器解析（T2.2）与客户运行共用同一张表
+    let mut fs = vela_fs::FsMap::legacy();
     if let Some(root) = &opts.root {
-        if let Err(e) = proc.fs.add("/", std::path::Path::new(root)) {
+        if let Err(e) = fs.add("/", std::path::Path::new(root)) {
             eprintln!("vela: --root: {e}");
             return Err(2);
         }
@@ -311,11 +355,51 @@ fn run_elf(
             eprintln!("vela: --map 需要 <guest>=<host> 形式，得到 '{m}'");
             return Err(2);
         };
-        if let Err(e) = proc.fs.add(g, std::path::Path::new(h)) {
+        if let Err(e) = fs.add(g, std::path::Path::new(h)) {
             eprintln!("vela: --map: {e}");
             return Err(2);
         }
     }
+
+    // 动态链接（T2.2/T2.3）：vela 只负责装载解释器与构造 auxv，重定位
+    // 全部交给 ld-musl 自身（它是完整的 ELF 加载器）。
+    if let Some(gpath) = &info.interp {
+        let ipath = resolve_interp(&fs, gpath, elf_path, &opts.interp);
+        let ibytes = match std::fs::read(&ipath) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("vela: cannot read interpreter '{}': {e}", ipath.display());
+                eprintln!("vela: hint: use --interp <host-path> or --map /lib=<host-dir>");
+                return Err(127);
+            }
+        };
+        match loader::load(&ibytes, &host, 0) {
+            Ok(iimg) => {
+                if logx::enabled() {
+                    eprintln!(
+                        "[vela] interp {gpath} → {} base {:#x} entry {:#x}",
+                        ipath.display(),
+                        iimg.bias,
+                        iimg.entry
+                    );
+                }
+                img.interp = Some(InterpImage {
+                    bias: iimg.bias,
+                    entry: iimg.entry,
+                    span: iimg.span,
+                    exec_ranges: iimg.exec_ranges,
+                });
+            }
+            Err(e) => {
+                eprintln!("vela: interpreter {}: {e}", ipath.display());
+                return Err(1);
+            }
+        }
+    }
+
+    let mut proc = GuestProcess::new(1000, img);
+    proc.attach_stdio(&host);
+    proc.fs = fs;
     if let Some(u) = opts.uid {
         proc.uid = u;
     }
@@ -342,8 +426,15 @@ fn run_elf(
         };
     proc.mem.add(stack_range);
 
-    let entry = proc.load.entry;
-    let exec_ranges = proc.load.exec_ranges.clone();
+    // 入口语义（T2.3）：动态映像跳解释器入口（_dlstart），静态跳自身入口
+    let entry = match &proc.load.interp {
+        Some(i) => i.entry,
+        None => proc.load.entry,
+    };
+    let mut exec_ranges = proc.load.exec_ranges.clone();
+    if let Some(i) = &proc.load.interp {
+        exec_ranges.extend(i.exec_ranges.iter().copied());
+    }
     let heap_start = proc.heap.map(|h| h.start);
 
     #[cfg(windows)]
@@ -405,9 +496,10 @@ unsafe extern "system" fn trap(
         if vela_sys::windows::stub_hit() {
             eprintln!("[vela] stub HIT ✓");
         }
-        // strace 风格：name(args...) 便于与 Linux 侧 strace 记录对照（PLAN T3.5）
+        // strace 风格：name(args...) + rip，便于与 Linux 侧 strace 对照及
+        // 定位 ldso 启动期问题（M2 排障）
         eprintln!(
-            "[vela] {}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) [nr={}]",
+            "[vela] {}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) [nr={}, rip={:#x}]",
             vela_abi::syscall_name(nr),
             args[0],
             args[1],
@@ -415,7 +507,8 @@ unsafe extern "system" fn trap(
             args[3],
             args[4],
             args[5],
-            nr
+            nr,
+            rip
         );
     }
     let r = vela_runtime::dispatch(&mut st.proc, &st.host, nr, *args);

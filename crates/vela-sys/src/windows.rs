@@ -36,6 +36,7 @@ const FILE_MAP_EXECUTE: u32 = 0x0020_0000;
 const ALLOC_GRANULARITY: usize = 0x1_0000;
 
 const STATUS_ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
+const STATUS_PRIVILEGED_INSTRUCTION: u32 = 0xC000_0096;
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
 
@@ -254,7 +255,9 @@ unsafe extern "system" fn veh_handler(ep: *mut ExceptionPointers) -> i32 {
         }
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    if rec.exception_code != STATUS_ILLEGAL_INSTRUCTION {
+    if rec.exception_code != STATUS_ILLEGAL_INSTRUCTION
+        && rec.exception_code != STATUS_PRIVILEGED_INSTRUCTION
+    {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     // SAFETY: 同上
@@ -270,6 +273,19 @@ unsafe extern "system" fn veh_handler(ep: *mut ExceptionPointers) -> i32 {
     let Some(_range) = guest_range_containing(rip) else {
         return EXCEPTION_CONTINUE_SEARCH;
     };
+    // 客户段内的 #GP（特权指令）：与 AV 同样致命，给出 rip/字节便于定位
+    // （M2 排障：wrfsbase 等在 CR4.FSGSBASE 关闭时触发 #GP）
+    if rec.exception_code == STATUS_PRIVILEGED_INSTRUCTION {
+        // SAFETY: rip 在客户映射内（已确认），读 16 字节仅用于诊断
+        let bytes = unsafe { std::slice::from_raw_parts(rip as *const u8, 16) };
+        let hb: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        eprintln!(
+            "[vela] privileged instruction in guest rip={:#x} bytes={} (hint: privileged opcode executed by guest; if this is rdfsbase/wrfsbase, CR4.FSGSBASE is off)",
+            rip,
+            hb.join(" ")
+        );
+        std::process::exit(139);
+    }
     // 确认该位置确为 patch 点（UD2），避免吞掉客户真实的非法指令
     // SAFETY: rip..rip+2 已确认位于客户可执行映射内
     let code = unsafe { std::slice::from_raw_parts(rip as *const u8, 2) };

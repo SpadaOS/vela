@@ -251,6 +251,7 @@ fn setup(len: usize) -> (MockHost, GuestProcess, usize) {
         }],
         exec_ranges: vec![],
         span: MemRange::reserve(addr as u64, len as u64),
+        interp: None,
     };
     let mut proc = GuestProcess::new(1000, img);
     proc.attach_stdio(&host);

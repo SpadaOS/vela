@@ -47,3 +47,28 @@ pub fn build_min_hello() -> Vec<u8> {
     e[lea_at + 3..lea_at + 7].copy_from_slice(&disp.to_le_bytes());
     e
 }
+
+/// 带 PT_INTERP 的最小 PIE（动态链接形态，PLAN-0.0.4 T2.1 loader 测试用）。
+/// interp 为解释器路径（如 /lib/ld-musl-x86_64.so.1）。
+/// phdr 表整体追加到文件尾并重指 e_phoff（原 0x78 槽位被代码占用）。
+pub fn build_min_dyn_hello(interp: &str) -> Vec<u8> {
+    let mut e = build_min_hello();
+    let interp_off = e.len() as u64;
+    let mut s = interp.as_bytes().to_vec();
+    s.push(0);
+    e.extend_from_slice(&s);
+    // 新 phdr 表 = 原 PT_LOAD + PT_INTERP，共 2 项
+    let phoff = e.len() as u64;
+    let mut table = e[0x40..0x40 + 56].to_vec();
+    let mut ph = [0u8; 56];
+    ph[0..4].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+    ph[4..8].copy_from_slice(&4u32.to_le_bytes()); // PF_R
+    ph[8..16].copy_from_slice(&interp_off.to_le_bytes());
+    ph[32..40].copy_from_slice(&(s.len() as u64).to_le_bytes()); // p_filesz
+    ph[40..48].copy_from_slice(&(s.len() as u64).to_le_bytes()); // p_memsz
+    table.extend_from_slice(&ph);
+    e.extend_from_slice(&table);
+    e[0x20..0x28].copy_from_slice(&phoff.to_le_bytes()); // e_phoff
+    e[0x38..0x3a].copy_from_slice(&2u16.to_le_bytes()); // e_phnum: 1 → 2
+    e
+}

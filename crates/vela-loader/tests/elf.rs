@@ -69,10 +69,26 @@ fn parse_rejects_non_pie() {
 }
 
 #[test]
-fn parse_rejects_interp() {
-    let mut bytes = common::build_min_hello();
-    bytes[0x40] = 3; // 第一个 phdr 改成 PT_INTERP
-    assert_eq!(parse(&bytes), Err(LoadError::DynamicBinary));
+fn parse_accepts_musl_interp_and_extracts_path() {
+    let bytes = common::build_min_dyn_hello("/lib/ld-musl-x86_64.so.1");
+    let info = parse(&bytes).expect("parse ok");
+    assert_eq!(info.interp.as_deref(), Some("/lib/ld-musl-x86_64.so.1"));
+    assert_eq!(info.loads.len(), 1);
+}
+
+#[test]
+fn parse_rejects_non_musl_interp() {
+    let bytes = common::build_min_dyn_hello("/lib64/ld-linux-x86-64.so.2");
+    assert!(matches!(
+        parse(&bytes),
+        Err(LoadError::UnsupportedInterp(_))
+    ));
+}
+
+#[test]
+fn parse_static_pie_has_no_interp() {
+    let bytes = common::build_min_hello();
+    assert_eq!(parse(&bytes).expect("parse ok").interp, None);
 }
 
 #[cfg(windows)]

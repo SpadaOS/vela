@@ -92,12 +92,15 @@ pub fn build_stack(
     let strings_lo = cursor;
     let execfn_addr = str_ptrs[0];
 
+    // AT_BASE：静态映像为自身 bias；动态映像为解释器 bias（Linux 内核 auxv
+    // 约定：AT_PHDR/AT_ENTRY 指主程序，AT_BASE 指解释器，PLAN-0.0.4 T2.2）
+    let at_base = img.interp.as_ref().map_or(img.bias, |i| i.bias);
     let auxv: Vec<(u64, u64)> = vec![
         (abi::AT_PHDR, img.phdr),
         (abi::AT_PHENT, img.phentsize as u64),
         (abi::AT_PHNUM, img.phnum as u64),
         (abi::AT_PAGESZ, 4096),
-        (abi::AT_BASE, img.bias),
+        (abi::AT_BASE, at_base),
         (abi::AT_ENTRY, img.entry),
         (abi::AT_UID, 1000),
         (abi::AT_EUID, 1000),
