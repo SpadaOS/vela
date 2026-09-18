@@ -1,0 +1,11 @@
+# Rust
+/target
+**/*.rs.bk
+
+# 测试/调试临时产物
+out.bin
+*.tmp
+
+# 系统杂物
+Thumbs.db
+.DS_Store

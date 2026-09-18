@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/vela-abi",
+  "crates/vela-sys",
+  "crates/vela-loader",
+  "crates/vela-runtime",
+  "crates/vela-fs",
+  "crates/vela-cli",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+version = "0.0.1"
+
+# 低内存机器：关闭增量编译，减少磁盘/内存占用
+[profile.dev]
+incremental = false
