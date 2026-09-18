@@ -289,6 +289,16 @@ pub trait HostFileOps: Send + Sync + 'static {
     fn stat_path(&self, path: &HostPath) -> Result<HostStat, HostError>;
     /// 对已打开句柄取元数据（fstat 语义）；stdio 为字符设备。
     fn stat_file(&self, f: &HostFile) -> Result<HostStat, HostError>;
+    /// 截断/扩展已打开文件到 len（ftruncate 语义；PLAN-0.0.5 M4）。
+    fn set_len(&self, f: &HostFile, len: u64) -> Result<(), HostError> {
+        let _ = (f, len);
+        Err(HostError::Unimplemented)
+    }
+    /// 设置只读属性（fchmod 的 Windows 诚实近似：仅读写位，其余忽略）。
+    fn set_readonly_file(&self, f: &HostFile, readonly: bool) -> Result<(), HostError> {
+        let _ = (f, readonly);
+        Err(HostError::Unimplemented)
+    }
     fn close(&self, f: HostFile) -> Result<(), HostError>;
     fn stdio(&self) -> StdioHandles;
 }

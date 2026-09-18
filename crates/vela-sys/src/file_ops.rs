@@ -1,5 +1,6 @@
 //! 基于 std 的文件/时间公共实现，供 windows 与 linux_dev 两个宿主复用。
 
+use std::path::Path;
 use std::time::Instant;
 
 use crate::{
@@ -190,6 +191,35 @@ pub(crate) fn stat_file(f: &HostFile) -> Result<HostStat, HostError> {
             Ok(host_stat_from(&md, Some(path)))
         }
     }
+}
+
+/// ftruncate 语义：截断/扩展已打开文件（std File::set_len，含 Windows）。
+pub(crate) fn set_len(f: &HostFile, len: u64) -> Result<(), HostError> {
+    match &f.0 {
+        HostFileKind::Disk { file, .. } => file.set_len(len).map_err(|e| io_err(&e)),
+        _ => Err(HostError::Invalid),
+    }
+}
+
+/// fchmod 的 Windows 诚实近似：仅读写位（readonly=true → 去写权限）。
+pub(crate) fn set_readonly(f: &HostFile, readonly: bool) -> Result<(), HostError> {
+    match &f.0 {
+        HostFileKind::Disk { path, .. } => {
+            let md = std::fs::metadata(path).map_err(|e| io_err(&e))?;
+            let mut perm = md.permissions();
+            perm.set_readonly(readonly);
+            std::fs::set_permissions(path, perm).map_err(|e| io_err(&e))
+        }
+        _ => Err(HostError::Invalid),
+    }
+}
+
+/// chmod 的路径版（不经 fd）。
+pub(crate) fn set_readonly_path(path: &Path, readonly: bool) -> Result<(), HostError> {
+    let md = std::fs::metadata(path).map_err(|e| io_err(&e))?;
+    let mut perm = md.permissions();
+    perm.set_readonly(readonly);
+    std::fs::set_permissions(path, perm).map_err(|e| io_err(&e))
 }
 
 /// std::fs::Metadata → 完整 HostStat（Windows 与 linux_dev 共用）。

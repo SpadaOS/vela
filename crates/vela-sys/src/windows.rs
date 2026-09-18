@@ -1001,6 +1001,12 @@ impl HostFileOps for WindowsHost {
     fn stat_file(&self, f: &HostFile) -> Result<HostStat, HostError> {
         file_ops::stat_file(f)
     }
+    fn set_len(&self, f: &HostFile, len: u64) -> Result<(), HostError> {
+        file_ops::set_len(f, len)
+    }
+    fn set_readonly_file(&self, f: &HostFile, readonly: bool) -> Result<(), HostError> {
+        file_ops::set_readonly(f, readonly)
+    }
     fn close(&self, f: HostFile) -> Result<(), HostError> {
         file_ops::close(f)
     }

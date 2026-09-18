@@ -30,6 +30,14 @@ pub fn dispatch(proc: &mut GuestProcess, host: &dyn Host, nr: u64, a: [u64; 6]) 
         abi::SYS_PIPE2 => sys_pipe2(proc, a[0], a[1]),
         abi::SYS_WAIT4 => sys_wait4(a[0], a[1], a[2]),
         abi::SYS_GETPPID => sys_getppid(proc),
+        abi::SYS_SYSINFO => sys_sysinfo(proc, host, a[0]),
+        abi::SYS_FCHMOD => sys_fchmod(proc, host, a[0], a[1]),
+        abi::SYS_READLINK | abi::SYS_READLINKAT => sys_readlinkat(0, a[0], a[1], a[2]),
+        abi::SYS_FTRUNCATE => sys_ftruncate(proc, host, a[0], a[1]),
+        abi::SYS_FCHOWN => sys_fchown(proc, a[0]),
+        abi::SYS_FCHOWNAT => sys_fchown(proc, a[1]),
+        abi::SYS_GETRLIMIT => sys_getrlimit(proc, a[1]),
+        abi::SYS_SETRLIMIT => 0,
         abi::SYS_EXIT | abi::SYS_EXIT_GROUP => sys_exit(host, a[0]),
         abi::SYS_UNAME => sys_uname(proc, a[0]),
         abi::SYS_ARCH_PRCTL => sys_arch_prctl(proc, host, a[0], a[1]),
@@ -546,6 +554,85 @@ fn sys_close(proc: &mut GuestProcess, host: &dyn Host, fd_raw: u64) -> i64 {
 }
 
 // ---------------------------------------------------------------- 管道 / 进程族
+
+/// sysinfo(99)（PLAN-0.0.5 M4）：struct sysinfo（112 字节）。
+/// uptime 用宿主运行时长；内存量诚实近似（vela 无宿主内存记账）。
+fn sys_sysinfo(proc: &mut GuestProcess, host: &dyn Host, buf: u64) -> i64 {
+    const SI_LOAD_SHIFT: u64 = 16;
+    let mut b = [0u8; 112];
+    // uptime（秒）
+    let uptime = host.monotonic_ns() / 1_000_000_000;
+    b[0..8].copy_from_slice(&(uptime as i64).to_le_bytes());
+    // loads[3]：0（无负载记账），按内核 SI_LOAD_SHIFT 定点编码
+    for i in 0..3 {
+        let o = 8 + i * 8;
+        b[o..o + 8].copy_from_slice(&(1u64 << SI_LOAD_SHIFT).to_le_bytes());
+    }
+    // totalram/freeram：诚实近似（固定 8 GiB / 4 GiB）；mem_unit=1
+    b[32..40].copy_from_slice(&8u64.wrapping_mul(1024 * 1024 * 1024).to_le_bytes());
+    b[40..48].copy_from_slice(&4u64.wrapping_mul(1024 * 1024 * 1024).to_le_bytes());
+    // procs = 1（单进程）
+    b[80..82].copy_from_slice(&1u16.to_le_bytes());
+    match write_guest(proc, buf, &b) {
+        Ok(()) => 0,
+        Err(e) => -(e as i64),
+    }
+}
+
+/// fchmod(91)/chmod(90)（PLAN-0.0.5 M4）：Windows 只读位近似。
+/// mode & 0222 == 0 → 只读；其余权限位忽略（记录于 SYSCALLS.md）。
+fn sys_fchmod(proc: &mut GuestProcess, host: &dyn Host, fd: u64, mode: u64) -> i64 {
+    let fd = fd as u32 as i32;
+    let readonly = mode & 0o222 == 0;
+    match proc.fds.get(fd) {
+        Some(GuestFd::Host(f)) => host
+            .set_readonly_file(f, readonly)
+            .map(|_| 0)
+            .unwrap_or_else(|e| -(host_err_to_errno(&e) as i64)),
+        Some(GuestFd::PipeRead(_)) | Some(GuestFd::PipeWrite(_)) => 0, // 无持久化语义
+        _ => -(abi::EBADF as i64),
+    }
+}
+
+/// readlinkat(267)/readlink(89)：vela 无 procfs、无 symlink——
+/// 一律 -ENOENT（与 Linux 对不存在路径的语义一致）。
+fn sys_readlinkat(_dirfd: i32, _path: u64, _buf: u64, _size: u64) -> i64 {
+    -(abi::ENOENT as i64)
+}
+
+/// ftruncate(77)（PLAN-0.0.5 M4）：截断/扩展已打开文件到 len。
+fn sys_ftruncate(proc: &mut GuestProcess, host: &dyn Host, fd: u64, len: u64) -> i64 {
+    let fd = fd as u32 as i32;
+    match proc.fds.get(fd) {
+        Some(GuestFd::Host(f)) => host
+            .set_len(f, len)
+            .map(|_| 0)
+            .unwrap_or_else(|e| -(host_err_to_errno(&e) as i64)),
+        Some(GuestFd::PipeRead(_)) | Some(GuestFd::PipeWrite(_)) => -(abi::EINVAL as i64),
+        _ => -(abi::EBADF as i64),
+    }
+}
+
+/// fchown(93)/fchownat(260)：Windows 无 per-file 属主——校验 fd 后返回 0
+/// （诚实 no-op，记录于 SYSCALLS.md）。
+fn sys_fchown(proc: &mut GuestProcess, fd: u64) -> i64 {
+    let fd = fd as u32 as i32;
+    match proc.fds.get(fd) {
+        Some(GuestFd::Host(_) | GuestFd::PipeRead(_) | GuestFd::PipeWrite(_)) => 0,
+        _ => -(abi::EBADF as i64),
+    }
+}
+
+/// getrlimit(160)/setrlimit(161)：RLIM_INFINITY（与 prlimit64 一致）。
+fn sys_getrlimit(proc: &mut GuestProcess, buf: u64) -> i64 {
+    let mut b = [0u8; 16];
+    b[0..8].copy_from_slice(&abi::RLIM_INFINITY.to_le_bytes());
+    b[8..16].copy_from_slice(&abi::RLIM_INFINITY.to_le_bytes());
+    match write_guest(proc, buf, &b) {
+        Ok(()) => 0,
+        Err(e) => -(e as i64),
+    }
+}
 
 /// pipe2(293)（PLAN-0.0.4 T3.2）：进程内环形缓冲 fd 对（容量 64 KiB）。
 /// flags 仅接受 O_CLOEXEC（fd 记账）；非阻塞语义见 sys_read/sys_write。

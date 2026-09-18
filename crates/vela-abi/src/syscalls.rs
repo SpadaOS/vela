@@ -40,6 +40,18 @@ pub const SYS_RENAME: u64 = 82;
 pub const SYS_MKDIR: u64 = 83;
 pub const SYS_RMDIR: u64 = 84;
 pub const SYS_UNLINK: u64 = 87;
+pub const SYS_TRUNCATE: u64 = 76;
+pub const SYS_FTRUNCATE: u64 = 77;
+pub const SYS_CHMOD: u64 = 90;
+pub const SYS_FCHMOD: u64 = 91;
+pub const SYS_FCHMODAT: u64 = 92;
+pub const SYS_FCHOWN: u64 = 93;
+pub const SYS_FCHOWNAT: u64 = 260;
+pub const SYS_READLINK: u64 = 89;
+pub const SYS_READLINKAT: u64 = 267;
+pub const SYS_SYSINFO: u64 = 99;
+pub const SYS_GETRLIMIT: u64 = 160;
+pub const SYS_SETRLIMIT: u64 = 161;
 pub const SYS_GETRUSAGE: u64 = 98;
 pub const SYS_GETUID: u64 = 102;
 pub const SYS_GETGID: u64 = 104;
@@ -130,6 +142,18 @@ pub fn syscall_name(nr: u64) -> &'static str {
         SYS_STATX => "statx",
         SYS_SOCKET => "socket",
         SYS_PIPE => "pipe",
+        SYS_TRUNCATE => "truncate",
+        SYS_FTRUNCATE => "ftruncate",
+        SYS_CHMOD => "chmod",
+        SYS_FCHMOD => "fchmod",
+        SYS_FCHMODAT => "fchmodat",
+        SYS_FCHOWN => "fchown",
+        SYS_FCHOWNAT => "fchownat",
+        SYS_READLINK => "readlink",
+        SYS_READLINKAT => "readlinkat",
+        SYS_SYSINFO => "sysinfo",
+        SYS_GETRLIMIT => "getrlimit",
+        SYS_SETRLIMIT => "setrlimit",
         _ => "unknown",
     }
 }
