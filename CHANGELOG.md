@@ -2,6 +2,43 @@
 
 本项目的所有显著变更记录于此（Keep a Changelog 格式）。
 
+## [0.0.3] - 2026-09-19
+
+主题：性能、广度、SpadaOS 就绪（计划见 docs/plans/PLAN-0.0.3.md）。
+
+### Added
+
+- **syscall 矩阵扩容（+16 号，共 ~50）**：
+  - 文件写路径：`mkdir`/`mkdirat`/`rmdir`/`unlink`/`unlinkat`/`rename`/`renameat`
+  - `access`/`faccessat`（W_OK 按宿主只读位）
+  - 定位读写 `pread64`/`pwrite64`（单线程 seek→io→seek-back 契约）+ `fsync`/`fdatasync`
+  - fd 复制：`dup`/`dup2`/`dup3` + fcntl `F_DUPFD`/`F_DUPFD_CLOEXEC`（Host::dup_file）
+  - `statx`（128B 完整布局，STATX_BASIC_STATS）
+  - musl/busybox 启动兜底：`rt_sigaction`/`rt_sigprocmask`/`madvise`/`getrusage`/`prlimit64` 诚实 stub
+  - `clock_gettime` 支持 CLOCK_MONOTONIC_RAW / BOOTTIME
+- **性能基准设施**：`vela-mkguest bench` 变体（2M 次纯翻译 getpid 循环）+
+  `docs/bench.md` 数据档案
+- **SpadaOS 就绪**：`Host` 按内核能力拆为五组 supertrait
+  （`HostMem`/`HostFileOps`/`HostTime`/`HostTls` + thread/futex 生命周期），
+  SpadaOS 实现者可逐组填实；HOST.md 重写为五组契约与能力映射表
+- **专业度**：workspace lints 统一（`missing_safety_doc` 按 HOST.md 组级
+  SAFETY 约定放行）；CI 前置 `cargo fmt --check` 与 `clippy -D warnings`
+  （全仓已清零）；crate 全部挂 `[lints] workspace = true`
+- guest 预编译产物归位 `guest/bin/`（源码与产物分离）
+
+### Changed
+
+- **性能结论（bench 驱动，docs/bench.md）**：纯翻译 syscall 往返 ~2 µs，
+  瓶颈在 VEH 内核异常往返的固有成本；exec_ranges 提前退出与热路径去分配
+  的收益在噪音内如实记录，dispatch 函数表因"不可测量"按计划规则放弃
+- getdents64 每条 dirent 从堆分配改为 280B 栈缓冲；FsMap::translate 常规
+  路径零中间分配
+- CI 生成 guest 增加 bench 变体
+
+### Fixed
+
+- `FsMap::translate` 对反斜杠开头的 Windows 风格路径误拒（归一顺序）
+
 ## [0.0.2] - 2026-09-19
 
 主题：从 demo 到可用的运行时 —— 真实 musl C 程序 + 文件 IO 成为

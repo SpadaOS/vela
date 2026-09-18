@@ -83,7 +83,7 @@ fn missing_file_exits_127() {
 #[test]
 fn version_and_help() {
     let v = vela().arg("--version").output().unwrap();
-    assert_eq!(String::from_utf8_lossy(&v.stdout).trim(), "vela 0.0.2");
+    assert_eq!(String::from_utf8_lossy(&v.stdout).trim(), "vela 0.0.3");
     let h = vela().arg("--help").output().unwrap();
     assert!(String::from_utf8_lossy(&h.stdout).is_empty() || h.status.success());
 }

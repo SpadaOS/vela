@@ -24,12 +24,27 @@
 | 10 | mprotect | ✅ | |
 | 11 | munmap | 🟨 | 仅释放完全覆盖的整块（Windows VirtualFree 限制） |
 | 12 | brk | ✅ | 预映射堆块内移动 |
+| 13 | rt_sigaction | ⭕ | 记录后返回 0；信号**投递**未实现（NONGOALS） |
+| 14 | rt_sigprocmask | ⭕ | 同上 |
+| 17 | pread64 | ✅ | seek→io→seek-back（单线程契约） |
+| 18 | pwrite64 | ✅ | 同上 |
+| 21 | access | 🟨 | W_OK 按宿主只读位；X_OK 语义简化 |
+| 28 | madvise | ⭕ | no-op |
+| 32 | dup | ✅ | |
+| 33 | dup2 | ✅ | |
+| 74 | fsync | ✅ | stdio/伪设备 no-op |
+| 75 | fdatasync | ✅ | |
+| 82 | rename | ✅ | |
+| 83 | mkdir | ✅ | |
+| 84 | rmdir | ✅ | |
+| 87 | unlink | ✅ | |
+| 98 | getrusage | ⭕ | 填零结构（无记账） |
 | 16 | ioctl | 🟨 | 仅 TIOCGWINSZ（固定 80x25）；其余 ENOTTY（非终端语义） |
 | 20 | writev | ✅ | |
 | 39 | getpid | ✅ | 固定假 pid |
 | 60 | exit | ✅ | 退出前 flush stdio |
 | 63 | uname | ✅ | Linux / vela / 6.6.0-vela |
-| 72 | fcntl | 🟨 | F_GETFD/F_SETFD/F_GETFL/F_SETFL 记账；其余 EINVAL |
+| 72 | fcntl | 🟨 | F_GETFD/F_SETFD/F_GETFL/F_SETFL/F_DUPFD/F_DUPFD_CLOEXEC；其余 EINVAL |
 | 79 | getcwd | ✅ | ERANGE 语义 |
 | 80 | chdir | 🟨 | 记账式 cwd；宿主侧校验目录存在；`..` 拒绝 |
 | 96 | gettimeofday | ✅ | |
@@ -42,7 +57,14 @@
 | 257 | openat | 🟨 | dirfd 支持目录 fd 相对路径（`..` 拒绝）；O_EXCL/O_TRUNC/O_APPEND/O_CLOEXEC |
 | 262 | newfstatat | 🟨 | AT_EMPTY_PATH；dirfd 相对路径同 openat |
 | 273 | set_robust_list | ⭕ | 记录后返回 0（musl 启动路径） |
+| 258 | mkdirat | ✅ | |
+| 263 | unlinkat | ✅ | AT_REMOVEDIR 支持 |
+| 264 | renameat | ✅ | |
+| 269 | faccessat | 🟨 | 同 access |
+| 292 | dup3 | ✅ | 仅接受 O_CLOEXEC flag |
+| 302 | prlimit64 | ⭕ | 上报 RLIM_INFINITY（无资源限制语义） |
 | 318 | getrandom | ✅ | 上限 64MiB 防呆 |
+| 332 | statx | 🟨 | 128B 布局，mask=STATX_BASIC_STATS；btime 恒 0 |
 
 ## 已知不做（NONGOALS，见 docs/NONGOALS.md）
 
