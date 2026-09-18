@@ -1,0 +1,13 @@
+* text=auto eol=lf
+
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.S text eol=lf
+*.c text eol=lf
+
+# 预编译 Linux ELF 产物
+guest/hello binary
+guest/hello-musl binary
+guest/torture binary
+guest/tls binary
