@@ -35,6 +35,21 @@ impl Host for SpadaOsHost {
     fn open_dir(&self, _path: &HostPath) -> Result<HostDir, HostError> {
         Err(HostError::Unimplemented)
     }
+    fn mkdir(&self, _path: &HostPath) -> Result<(), HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn remove(&self, _path: &HostPath, _dir: bool) -> Result<(), HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn rename(&self, _old: &HostPath, _new: &HostPath) -> Result<(), HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn sync_file(&self, _f: &HostFile, _data_only: bool) -> Result<(), HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn dup_file(&self, _f: &HostFile) -> Result<HostFile, HostError> {
+        Err(HostError::Unimplemented)
+    }
     fn read(&self, _f: &HostFile, _buf: &mut [u8]) -> Result<usize, HostError> {
         Err(HostError::Unimplemented)
     }

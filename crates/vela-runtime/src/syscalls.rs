@@ -38,8 +38,29 @@ pub fn dispatch(proc: &mut GuestProcess, host: &dyn Host, nr: u64, a: [u64; 6]) 
         abi::SYS_CLOCK_GETTIME => sys_clock_gettime(proc, host, a[0], a[1]),
         abi::SYS_GETTIMEOFDAY => sys_gettimeofday(proc, host, a[0]),
         abi::SYS_GETDENTS64 => sys_getdents64(proc, host, a[0], a[1], a[2]),
-        abi::SYS_FCNTL => sys_fcntl(proc, a[0], a[1], a[2]),
+        abi::SYS_FCNTL => sys_fcntl(proc, host, a[0], a[1], a[2]),
         abi::SYS_IOCTL => sys_ioctl(proc, host, a[0], a[1], a[2]),
+        abi::SYS_PREAD64 => sys_pread64(proc, host, a[0], a[1], a[2], a[3]),
+        abi::SYS_PWRITE64 => sys_pwrite64(proc, host, a[0], a[1], a[2], a[3]),
+        abi::SYS_ACCESS => sys_access(proc, host, a[0], a[1]),
+        abi::SYS_FACCESSAT => sys_faccessat(proc, host, a),
+        abi::SYS_DUP => sys_dup(proc, host, a[0]),
+        abi::SYS_DUP2 | abi::SYS_DUP3 => sys_dup2(proc, host, a[0], a[1], a[2], nr == abi::SYS_DUP3),
+        abi::SYS_FSYNC | abi::SYS_FDATASYNC => sys_fsync(proc, host, a[0], nr == abi::SYS_FDATASYNC),
+        abi::SYS_MKDIR => sys_mkdir(proc, host, abi::AT_FDCWD, a[0]),
+        abi::SYS_MKDIRAT => sys_mkdir(proc, host, a[0] as u32 as i32, a[1]),
+        abi::SYS_RMDIR => sys_unlink_path(proc, host, abi::AT_FDCWD, a[0], true),
+        abi::SYS_UNLINK => sys_unlink_path(proc, host, abi::AT_FDCWD, a[0], false),
+        abi::SYS_UNLINKAT => sys_unlink_path(proc, host, a[0] as u32 as i32, a[1], a[2] & abi::AT_REMOVEDIR != 0),
+        abi::SYS_RENAME => sys_rename(proc, host, abi::AT_FDCWD, a[0], abi::AT_FDCWD, a[1]),
+        abi::SYS_RENAMEAT => sys_rename(proc, host, a[0] as u32 as i32, a[1], a[2] as u32 as i32, a[3]),
+        abi::SYS_STATX => sys_statx(proc, host, a),
+        abi::SYS_GETRUSAGE => sys_getrusage(proc, a[1]),
+        // 诚实 stub：信号投递未实现（NONGOALS），但 musl/busybox 启动路径
+        // 必须成功——记录后返回 0（与 set_robust_list 同模式）
+        abi::SYS_RT_SIGACTION | abi::SYS_RT_SIGPROCMASK | abi::SYS_MADVISE => 0,
+        abi::SYS_PRLIMIT64 => sys_prlimit64(proc, a[3]),
+        abi::SYS_SOCKET => -(abi::ENOSYS as i64), // NONGOALS：socket 体系
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -436,7 +457,7 @@ fn sys_getdents64(proc: &mut GuestProcess, host: &dyn Host, fd_raw: u64, buf: u6
 
 /// fcntl 最小集：fd 标志（FD_CLOEXEC）与 status flags（O_APPEND/O_NONBLOCK 等）
 /// 记账实现；O_NONBLOCK/O_APPEND 对当前同步 fd 语义无实际作用（记录即可）。
-fn sys_fcntl(proc: &mut GuestProcess, fd_raw: u64, cmd: u64, arg: u64) -> i64 {
+fn sys_fcntl(proc: &mut GuestProcess, host: &dyn Host, fd_raw: u64, cmd: u64, arg: u64) -> i64 {
     let fd = fd_raw as u32 as i32;
     if proc.fds.get(fd).is_none() {
         return -(abi::EBADF as i64);
@@ -453,6 +474,10 @@ fn sys_fcntl(proc: &mut GuestProcess, fd_raw: u64, cmd: u64, arg: u64) -> i64 {
             let new_status = (arg as u32) & mask;
             proc.fds.update_flags(fd, |v| (v & !(0x1_FFFF << 8)) | (new_status << 8));
             0
+        }
+        abi::F_DUPFD | abi::F_DUPFD_CLOEXEC => {
+            // 复制 fd；v0.3 从最小可用号分配（≥arg 语义极少依赖，注释见 SYSCALLS.md）
+            dup_impl(proc, host, fd, None, cmd == abi::F_DUPFD_CLOEXEC)
         }
         _ => -(abi::EINVAL as i64),
     }
@@ -474,6 +499,307 @@ fn sys_ioctl(proc: &GuestProcess, _host: &dyn Host, fd_raw: u64, cmd: u64, arg: 
         };
     }
     -(abi::ENOTTY as i64)
+}
+
+// ---------------------------------------------------------------- 定位读写 / fsync
+
+/// pread64/pwrite64：单线程模型下 seek→io→seek-back 等价于定位读写
+/// （HostFile 单所有权，契约见 PLAN-0.0.3 T2.3）。
+fn positioned(proc: &mut GuestProcess, host: &dyn Host, fd_raw: u64, buf: u64, len: u64, off: u64, is_write: bool) -> i64 {
+    let fd = fd_raw as u32 as i32;
+    if !matches!(proc.fds.get(fd), Some(GuestFd::Host(_))) {
+        return -(abi::ESPIPE as i64); // 非 Host fd（含目录/伪设备）不支持定位
+    }
+    // 段 1：保存当前游标
+    let cur = match proc.fds.get(fd) {
+        Some(GuestFd::Host(f)) => host.seek(f, 0, 1),
+        _ => unreachable!(),
+    };
+    let cur = match cur {
+        Ok(c) => c,
+        Err(e) => return -(host_err_to_errno(&e) as i64),
+    };
+    // 段 2：定位
+    if let Err(e) = match proc.fds.get(fd) {
+        Some(GuestFd::Host(f)) => host.seek(f, off as i64, 0),
+        _ => unreachable!(),
+    } {
+        return -(host_err_to_errno(&e) as i64);
+    }
+    // 段 3：IO
+    let r = if is_write {
+        match read_guest(proc, buf, len as usize) {
+            Ok(data) => match proc.fds.get(fd) {
+                Some(GuestFd::Host(f)) => {
+                    host.write(f, data).map(|n| n as i64).unwrap_or_else(|e| -(host_err_to_errno(&e) as i64))
+                }
+                _ => unreachable!(),
+            },
+            Err(e) => -(e as i64),
+        }
+    } else {
+        match read_guest_mut(proc, buf, len as usize) {
+            Ok(dst) => match proc.fds.get(fd) {
+                Some(GuestFd::Host(f)) => {
+                    host.read(f, dst).map(|n| n as i64).unwrap_or_else(|e| -(host_err_to_errno(&e) as i64))
+                }
+                _ => unreachable!(),
+            },
+            Err(e) => -(e as i64),
+        }
+    };
+    // 段 4：恢复游标（尽力而为）
+    if let Some(GuestFd::Host(f)) = proc.fds.get(fd) {
+        let _ = host.seek(f, cur as i64, 0);
+    }
+    r
+}
+
+fn sys_pread64(proc: &mut GuestProcess, host: &dyn Host, fd: u64, buf: u64, len: u64, off: u64) -> i64 {
+    positioned(proc, host, fd, buf, len, off, false)
+}
+
+fn sys_pwrite64(proc: &mut GuestProcess, host: &dyn Host, fd: u64, buf: u64, len: u64, off: u64) -> i64 {
+    positioned(proc, host, fd, buf, len, off, true)
+}
+
+fn sys_fsync(proc: &GuestProcess, host: &dyn Host, fd_raw: u64, data_only: bool) -> i64 {
+    let fd = fd_raw as u32 as i32;
+    match proc.fds.get(fd) {
+        Some(GuestFd::Host(f)) => host.sync_file(f, data_only).map_or_else(|e| -(host_err_to_errno(&e) as i64), |_| 0),
+        Some(GuestFd::HostDir(_)) | Some(GuestFd::Null) | Some(GuestFd::Zero) => 0, // 无持久化语义
+        _ => -(abi::EBADF as i64),
+    }
+}
+
+// ---------------------------------------------------------------- 路径写操作
+
+/// 路径解析（dirfd 支持，与 open_common 同一规则），返回宿主路径。
+fn resolve_path(proc: &GuestProcess, dirfd: i32, path: &str) -> Result<std::path::PathBuf, i32> {
+    if path.starts_with('/') {
+        return proc.fs.translate(path).ok_or(abi::ENOENT);
+    }
+    if dirfd == abi::AT_FDCWD {
+        return proc.fs.translate(&resolve_rel(proc, path)).ok_or(abi::ENOENT);
+    }
+    match proc.fds.get(dirfd) {
+        Some(GuestFd::HostDir(d)) => {
+            if path.split('/').any(|c| c == "..") {
+                return Err(abi::EINVAL);
+            }
+            let mut p = d.host_path().to_path_buf();
+            for c in path.split('/') {
+                if !c.is_empty() && c != "." {
+                    p.push(c);
+                }
+            }
+            Ok(p)
+        }
+        _ => Err(abi::EBADF),
+    }
+}
+
+fn sys_mkdir(proc: &mut GuestProcess, host: &dyn Host, dirfd: i32, path_ptr: u64) -> i64 {
+    let path = match read_cstr(proc, path_ptr) {
+        Ok(p) => p,
+        Err(e) => return -(e as i64),
+    };
+    match resolve_path(proc, dirfd, &path) {
+        Ok(hp) => host.mkdir(&HostPath(hp)).map_or_else(|e| -(host_err_to_errno(&e) as i64), |_| 0),
+        Err(e) => -(e as i64),
+    }
+}
+
+fn sys_unlink_path(proc: &mut GuestProcess, host: &dyn Host, dirfd: i32, path_ptr: u64, dir: bool) -> i64 {
+    let path = match read_cstr(proc, path_ptr) {
+        Ok(p) => p,
+        Err(e) => return -(e as i64),
+    };
+    match resolve_path(proc, dirfd, &path) {
+        Ok(hp) => host.remove(&HostPath(hp), dir).map_or_else(|e| -(host_err_to_errno(&e) as i64), |_| 0),
+        Err(e) => -(e as i64),
+    }
+}
+
+fn sys_rename(proc: &mut GuestProcess, host: &dyn Host, old_fd: i32, old_ptr: u64, new_fd: i32, new_ptr: u64) -> i64 {
+    let old = match read_cstr(proc, old_ptr) {
+        Ok(p) => p,
+        Err(e) => return -(e as i64),
+    };
+    let new = match read_cstr(proc, new_ptr) {
+        Ok(p) => p,
+        Err(e) => return -(e as i64),
+    };
+    let r = (|| -> Result<HostPath, i32> {
+        let o = resolve_path(proc, old_fd, &old)?;
+        let n = resolve_path(proc, new_fd, &new)?;
+        Ok(HostPath(n))
+    })()
+    .and_then(|np| resolve_path(proc, old_fd, &old).map(|op| (op, np)));
+    match r {
+        Ok((op, HostPath(np))) => host.rename(&HostPath(op), &HostPath(np)).map_or_else(|e| -(host_err_to_errno(&e) as i64), |_| 0),
+        Err(e) => -(e as i64),
+    }
+}
+
+fn sys_access(proc: &mut GuestProcess, host: &dyn Host, path_ptr: u64, mode: u64) -> i64 {
+    access_common(proc, host, abi::AT_FDCWD, path_ptr, mode)
+}
+
+fn sys_faccessat(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 {
+    access_common(proc, host, a[0] as u32 as i32, a[1], a[2])
+}
+
+/// access 语义：存在性 + 按宿主只读位判 W_OK；X_OK 对目录成立、对文件按执行位推断
+/// （Windows 权限位固定 0644/0755，故普通文件恒 X_OK——语义注释见 SYSCALLS.md）。
+fn access_common(proc: &mut GuestProcess, host: &dyn Host, dirfd: i32, path_ptr: u64, mode: u64) -> i64 {
+    let path = match read_cstr(proc, path_ptr) {
+        Ok(p) => p,
+        Err(e) => return -(e as i64),
+    };
+    let hp = match resolve_path(proc, dirfd, &path) {
+        Ok(p) => p,
+        Err(e) => return -(e as i64),
+    };
+    match host.stat_path(&HostPath(hp)) {
+        Ok(st) => {
+            if mode & abi::W_OK != 0 && st.is_readonly {
+                return -(abi::EACCES as i64);
+            }
+            0
+        }
+        Err(e) => -(host_err_to_errno(&e) as i64),
+    }
+}
+
+// ---------------------------------------------------------------- fd 复制
+
+fn sys_dup(proc: &mut GuestProcess, host: &dyn Host, oldfd_raw: u64) -> i64 {
+    dup_impl(proc, host, oldfd_raw as u32 as i32, None, false)
+}
+
+/// dup2/dup3：目标 fd 已打开则先关闭；dup3 的 flags 仅接受 O_CLOEXEC。
+fn sys_dup2(proc: &mut GuestProcess, host: &dyn Host, oldfd_raw: u64, newfd_raw: u64, flags: u64, is_dup3: bool) -> i64 {
+    let oldfd = oldfd_raw as u32 as i32;
+    let newfd = newfd_raw as u32 as i32;
+    if oldfd < 0 || newfd < 0 || proc.fds.get(oldfd).is_none() {
+        return -(abi::EBADF as i64);
+    }
+    if is_dup3 && oldfd == newfd {
+        return -(abi::EINVAL as i64);
+    }
+    if is_dup3 && flags & !abi::O_CLOEXEC != 0 {
+        return -(abi::EINVAL as i64);
+    }
+    if oldfd == newfd {
+        return newfd as i64; // dup2：等价 no-op
+    }
+    // 先移除目标（触发 host close）
+    let _ = proc.fds.remove(newfd);
+    dup_impl(proc, host, oldfd, Some(newfd), is_dup3 && flags & abi::O_CLOEXEC != 0)
+}
+
+/// dup 核心：复制 Host 句柄或伪设备标记，分配（或落到指定）fd。
+fn dup_impl(proc: &mut GuestProcess, host: &dyn Host, oldfd: i32, at: Option<i32>, cloexec: bool) -> i64 {
+    let new_entry = match proc.fds.get(oldfd) {
+        Some(GuestFd::Host(f)) => match host.dup_file(f) {
+            Ok(nf) => GuestFd::Host(nf),
+            Err(e) => return -(host_err_to_errno(&e) as i64),
+        },
+        Some(GuestFd::Null) => GuestFd::Null,
+        Some(GuestFd::Zero) => GuestFd::Zero,
+        _ => return -(abi::EBADF as i64),
+    };
+    let fd = match at {
+        Some(n) => {
+            proc.fds.insert_at(n, new_entry);
+            n
+        }
+        None => proc.fds.alloc_fd(new_entry),
+    };
+    if cloexec {
+        proc.fds.update_flags(fd, |v| v | 1);
+    }
+    fd as i64
+}
+
+// ---------------------------------------------------------------- statx / 资源
+
+/// statx(332)：写入完整 128 字节 struct statx（mask = STATX_BASIC_STATS）。
+/// btime（创建时间）填 0——HostStat 无该字段时的诚实缺省。
+fn sys_statx(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 {
+    let (dirfd, path_ptr, buf, _flags, mask) = (a[0] as u32 as i32, a[1], a[2], a[3], a[4]);
+    let _ = mask; // 全量填充，mask 请求子集由客户自行过滤
+    let path = match read_cstr(proc, path_ptr) {
+        Ok(p) => p,
+        Err(e) => return -(e as i64),
+    };
+    let r = if path.is_empty() {
+        // AT_EMPTY_PATH：stat dirfd
+        let fd = dirfd;
+        return sys_fstat(proc, host, fd as u64, a[2]);
+    } else {
+        let hp = match resolve_path(proc, dirfd, &path) {
+            Ok(p) => p,
+            Err(e) => return -(e as i64),
+        };
+        host.stat_path(&HostPath(hp))
+    };
+    let hs = match r {
+        Ok(hs) => hs,
+        Err(e) => return -(host_err_to_errno(&e) as i64),
+    };
+    let mut b = [0u8; 128];
+    b[0..4].copy_from_slice(&abi::STATX_BASIC_STATS.to_le_bytes());
+    b[4..8].copy_from_slice(&4096u32.to_le_bytes());
+    b[16..20].copy_from_slice(&(hs.nlink as u32).to_le_bytes());
+    b[20..24].copy_from_slice(&proc.uid.to_le_bytes());
+    b[24..28].copy_from_slice(&proc.gid.to_le_bytes());
+    b[28..30].copy_from_slice(&(hs.mode as u16).to_le_bytes());
+    b[32..40].copy_from_slice(&hs.ino.to_le_bytes());
+    b[40..48].copy_from_slice(&(hs.size as u64).to_le_bytes());
+    b[48..56].copy_from_slice(&(((hs.size + 511) / 512) as u64).to_le_bytes());
+    b[56..64].copy_from_slice(&(abi::STATX_BASIC_STATS as u64).to_le_bytes());
+    put_timespec16(&mut b[64..80], hs.atime_ns);
+    put_timespec16(&mut b[80..96], hs.mtime_ns);
+    put_timespec16(&mut b[96..112], hs.ctime_ns);
+    match write_guest(proc, a[2], &b) {
+        Ok(()) => 0,
+        Err(e) => -(e as i64),
+    }
+}
+
+fn put_timespec16(b: &mut [u8], ns: i64) {
+    b[0..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
+    b[8..12].copy_from_slice(&((ns % 1_000_000_000) as u32).to_le_bytes());
+}
+
+/// getrusage：单线程记账缺失，诚实填零结构并返回 0（调用方校验 ru 字段的场景罕见）。
+fn sys_getrusage(proc: &mut GuestProcess, buf: u64) -> i64 {
+    let who = 0u64;
+    let _ = who;
+    if buf == 0 {
+        return -(abi::EINVAL as i64);
+    }
+    let zeros = [0u8; 144];
+    match write_guest(proc, buf, &zeros) {
+        Ok(()) => 0,
+        Err(e) => -(e as i64),
+    }
+}
+
+/// prlimit64：上报 RLIM_INFINITY（无资源限制语义），忽略 new 设置。
+fn sys_prlimit64(proc: &mut GuestProcess, old_buf: u64) -> i64 {
+    if old_buf == 0 {
+        return 0;
+    }
+    let mut b = [0u8; 16];
+    b[0..8].copy_from_slice(&abi::RLIM_INFINITY.to_le_bytes());
+    b[8..16].copy_from_slice(&abi::RLIM_INFINITY.to_le_bytes());
+    match write_guest(proc, old_buf, &b) {
+        Ok(()) => 0,
+        Err(e) => -(e as i64),
+    }
 }
 
 fn sys_lseek(proc: &GuestProcess, host: &dyn Host, fd_raw: u64, off_raw: u64, whence_raw: u64) -> i64 {
@@ -647,7 +973,8 @@ fn sys_clock_gettime(proc: &GuestProcess, host: &dyn Host, clk: u64, tp: u64) ->
             let (s, ns) = host.realtime();
             (s as u64, ns as u64)
         }
-        abi::CLOCK_MONOTONIC => {
+        // MONOTONIC_RAW/BOOTTIME 语义子集：统一映射宿主单调时钟（PLAN T2.7）
+        abi::CLOCK_MONOTONIC | abi::CLOCK_MONOTONIC_RAW | abi::CLOCK_BOOTTIME => {
             let n = host.monotonic_ns();
             (n / 1_000_000_000, n % 1_000_000_000)
         }

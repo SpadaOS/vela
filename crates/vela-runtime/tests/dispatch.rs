@@ -54,6 +54,26 @@ impl Host for MockHost {
     fn open_dir(&self, _p: &HostPath) -> Result<HostDir, HostError> {
         Err(HostError::Unimplemented)
     }
+    fn mkdir(&self, _p: &HostPath) -> Result<(), HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn remove(&self, _p: &HostPath, _dir: bool) -> Result<(), HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn rename(&self, _o: &HostPath, _n: &HostPath) -> Result<(), HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn sync_file(&self, _f: &HostFile, _d: bool) -> Result<(), HostError> {
+        Ok(())
+    }
+    fn dup_file(&self, f: &HostFile) -> Result<HostFile, HostError> {
+        Ok(match &f.0 {
+            HostFileKind::StdIn => HostFile(HostFileKind::StdIn),
+            HostFileKind::StdOut => HostFile(HostFileKind::StdOut),
+            HostFileKind::StdErr => HostFile(HostFileKind::StdErr),
+            HostFileKind::Disk { .. } => return Err(HostError::Unimplemented),
+        })
+    }
     fn read(&self, f: &HostFile, buf: &mut [u8]) -> Result<usize, HostError> {
         match &f.0 {
             HostFileKind::StdIn => Ok(0), // v0 stdin 先返回 0（规格 5.4）
@@ -578,6 +598,87 @@ fn openat_dirfd_relative_rejects_escape_and_bad_fd() {
     let nullfd = proc.fds.alloc_fd(GuestFd::Null);
     let r = dispatch(&mut proc, &host, abi::SYS_OPENAT, [nullfd as u64, p, abi::O_RDONLY as u64, 0, 0, 0]);
     assert_eq!(r, -(abi::EBADF as i64));
+}
+
+// ---------------------------------------------------------------- M2 广度
+
+#[test]
+fn dup_and_dup2_semantics() {
+    let (host, mut proc, _addr) = setup(4096);
+    // dup(1) → 新 fd 3（最小可用），Host 句柄复制
+    let r = dispatch(&mut proc, &host, abi::SYS_DUP, [1, 0, 0, 0, 0, 0]);
+    assert_eq!(r, 3);
+    assert!(matches!(proc.fds.get(3), Some(GuestFd::Host(_))));
+    // dup2(1, 5) → 强制占用 5
+    let r = dispatch(&mut proc, &host, abi::SYS_DUP2, [1, 5, 0, 0, 0, 0]);
+    assert_eq!(r, 5);
+    assert!(matches!(proc.fds.get(5), Some(GuestFd::Host(_))));
+    // dup3(1, 1) → EINVAL（dup3 禁止同 fd）
+    let r = dispatch(&mut proc, &host, abi::SYS_DUP3, [1, 1, 0, 0, 0, 0]);
+    assert_eq!(r, -(abi::EINVAL as i64));
+    // dup 坏 fd
+    let r = dispatch(&mut proc, &host, abi::SYS_DUP, [99, 0, 0, 0, 0, 0]);
+    assert_eq!(r, -(abi::EBADF as i64));
+    // fcntl F_DUPFD_CLOEXEC → 最小可用 fd（3 被 dup 占用，落在 4）
+    let r = dispatch(&mut proc, &host, abi::SYS_FCNTL, [1, abi::F_DUPFD_CLOEXEC, 0, 0, 0, 0]);
+    assert_eq!(r, 4);
+    assert!(matches!(proc.fds.get(4), Some(GuestFd::Host(_))));
+}
+
+#[test]
+fn statx_fills_basic_layout() {
+    let (host, mut proc, addr) = setup(4096);
+    let p = (addr + 0x200) as u64;
+    // SAFETY: p 为 mock 分配的可写内存
+    unsafe {
+        let s = b"/mnt/c/Windows\0";
+        std::ptr::copy_nonoverlapping(s.as_ptr(), p as *mut u8, s.len());
+    }
+    let buf = (addr + 0x100) as u64;
+    let r = dispatch(&mut proc, &host, abi::SYS_STATX, [abi::AT_FDCWD as u64, p, buf, 0, abi::STATX_BASIC_STATS as u64, 0]);
+    assert_eq!(r, 0);
+    // SAFETY: buf 为 mock 分配的可写内存
+    let mask = unsafe { std::ptr::read_unaligned(buf as *const u32) };
+    let nlink = unsafe { std::ptr::read_unaligned((buf + 16) as *const u32) };
+    let mode = unsafe { std::ptr::read_unaligned((buf + 28) as *const u16) };
+    let ino = unsafe { std::ptr::read_unaligned((buf + 32) as *const u64) };
+    assert_eq!(mask, abi::STATX_BASIC_STATS);
+    assert_eq!(nlink, 1);
+    assert_eq!(mode, (abi::S_IFDIR | 0o755) as u16);
+    assert_eq!(ino, 11);
+}
+
+#[test]
+fn honest_stubs_and_errors() {
+    let (host, mut proc, addr) = setup(4096);
+    // 信号类诚实 stub：记录返回 0
+    for nr in [abi::SYS_RT_SIGACTION, abi::SYS_RT_SIGPROCMASK, abi::SYS_MADVISE] {
+        let r = dispatch(&mut proc, &host, nr, [0, 0, 0, 0, 0, 0]);
+        assert_eq!(r, 0, "nr={nr}");
+    }
+    // getrusage 填零结构
+    let r = dispatch(&mut proc, &host, abi::SYS_GETRUSAGE, [0, (addr + 0x100) as u64, 0, 0, 0, 0]);
+    assert_eq!(r, 0);
+    // prlimit64 上报 RLIM_INFINITY
+    let r = dispatch(&mut proc, &host, abi::SYS_PRLIMIT64, [0, 0, 0, (addr + 0x180) as u64, 0, 0]);
+    assert_eq!(r, 0);
+    // SAFETY: mock 分配内存
+    let lim = unsafe { std::ptr::read_unaligned((addr + 0x180) as *const u64) };
+    assert_eq!(lim, abi::RLIM_INFINITY);
+    // socket 体系明确 ENOSYS
+    let r = dispatch(&mut proc, &host, abi::SYS_SOCKET, [0, 0, 0, 0, 0, 0]);
+    assert_eq!(r, -(abi::ENOSYS as i64));
+}
+
+#[test]
+fn clock_gettime_monotonic_variants() {
+    let (host, mut proc, addr) = setup(4096);
+    for clk in [abi::CLOCK_MONOTONIC, abi::CLOCK_MONOTONIC_RAW, abi::CLOCK_BOOTTIME] {
+        let r = dispatch(&mut proc, &host, abi::SYS_CLOCK_GETTIME, [clk, (addr + 0x100) as u64, 0, 0, 0, 0]);
+        assert_eq!(r, 0, "clk={clk}");
+    }
+    let r = dispatch(&mut proc, &host, abi::SYS_CLOCK_GETTIME, [99, (addr + 0x100) as u64, 0, 0, 0, 0]);
+    assert_eq!(r, -(abi::EINVAL as i64));
 }
 
 #[test]

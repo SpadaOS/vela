@@ -15,14 +15,31 @@ pub const SYS_MMAP: u64 = 9;
 pub const SYS_MPROTECT: u64 = 10;
 pub const SYS_MUNMAP: u64 = 11;
 pub const SYS_BRK: u64 = 12;
+pub const SYS_RT_SIGACTION: u64 = 13;
+pub const SYS_RT_SIGPROCMASK: u64 = 14;
 pub const SYS_IOCTL: u64 = 16;
+pub const SYS_PREAD64: u64 = 17;
+pub const SYS_PWRITE64: u64 = 18;
 pub const SYS_WRITEV: u64 = 20;
+pub const SYS_ACCESS: u64 = 21;
+pub const SYS_PIPE: u64 = 22;
+pub const SYS_DUP: u64 = 32;
+pub const SYS_DUP2: u64 = 33;
+pub const SYS_GETPID: u64 = 39;
+pub const SYS_MADVISE: u64 = 28;
+pub const SYS_SOCKET: u64 = 41;
 pub const SYS_EXIT: u64 = 60;
 pub const SYS_UNAME: u64 = 63;
 pub const SYS_FCNTL: u64 = 72;
+pub const SYS_FSYNC: u64 = 74;
+pub const SYS_FDATASYNC: u64 = 75;
 pub const SYS_GETCWD: u64 = 79;
 pub const SYS_CHDIR: u64 = 80;
-pub const SYS_GETPID: u64 = 39;
+pub const SYS_RENAME: u64 = 82;
+pub const SYS_MKDIR: u64 = 83;
+pub const SYS_RMDIR: u64 = 84;
+pub const SYS_UNLINK: u64 = 87;
+pub const SYS_GETRUSAGE: u64 = 98;
 pub const SYS_GETUID: u64 = 102;
 pub const SYS_GETGID: u64 = 104;
 pub const SYS_GETEUID: u64 = 107;
@@ -31,12 +48,19 @@ pub const SYS_GETTIMEOFDAY: u64 = 96;
 pub const SYS_ARCH_PRCTL: u64 = 158;
 pub const SYS_EXIT_GROUP: u64 = 231;
 pub const SYS_OPENAT: u64 = 257;
+pub const SYS_MKDIRAT: u64 = 258;
 pub const SYS_NEWFSTATAT: u64 = 262;
+pub const SYS_UNLINKAT: u64 = 263;
+pub const SYS_RENAMEAT: u64 = 264;
+pub const SYS_FACCESSAT: u64 = 269;
 pub const SYS_GETDENTS64: u64 = 217;
 pub const SYS_SET_TID_ADDRESS: u64 = 218;
 pub const SYS_SET_ROBUST_LIST: u64 = 273;
+pub const SYS_DUP3: u64 = 292;
+pub const SYS_PRLIMIT64: u64 = 302;
 pub const SYS_CLOCK_GETTIME: u64 = 228;
 pub const SYS_GETRANDOM: u64 = 318;
+pub const SYS_STATX: u64 = 332;
 
 // ---------------------------------------------------------------- errno
 
@@ -105,6 +129,32 @@ pub const DT_REG: u8 = 8;
 pub const AT_FDCWD: i32 = -100;
 pub const AT_EMPTY_PATH: u64 = 0x1000;
 pub const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+pub const AT_REMOVEDIR: u64 = 0x200;
+
+/// access(2)/faccessat(2) mode。
+pub const F_OK: u64 = 0;
+pub const X_OK: u64 = 1;
+pub const W_OK: u64 = 2;
+pub const R_OK: u64 = 4;
+
+/// statx(2)：STATX_* mask 与返回结构尺寸（128 字节完整布局）。
+pub const STATX_TYPE: u32 = 0x1;
+pub const STATX_MODE: u32 = 0x2;
+pub const STATX_NLINK: u32 = 0x4;
+pub const STATX_SIZE: u32 = 0x8;
+pub const STATX_BASIC_STATS: u32 = 0x7ff;
+pub const STATX_ALL: u32 = 0xfff;
+
+/// fcntl 扩展 cmd。
+pub const F_DUPFD: u64 = 0;
+pub const F_DUPFD_CLOEXEC: u64 = 1030;
+
+/// clock_gettime 扩展（映射 monotonic）。
+pub const CLOCK_MONOTONIC_RAW: u64 = 4;
+pub const CLOCK_BOOTTIME: u64 = 7;
+
+/// prlimit64 的 RLIM_INFINITY。
+pub const RLIM_INFINITY: u64 = u64::MAX;
 
 // ---------------------------------------------------------------- file type (st_mode)
 
@@ -231,6 +281,28 @@ pub fn syscall_name(nr: u64) -> &'static str {
         SYS_SET_ROBUST_LIST => "set_robust_list",
         SYS_CLOCK_GETTIME => "clock_gettime",
         SYS_GETRANDOM => "getrandom",
+        SYS_RT_SIGACTION => "rt_sigaction",
+        SYS_RT_SIGPROCMASK => "rt_sigprocmask",
+        SYS_PREAD64 => "pread64",
+        SYS_PWRITE64 => "pwrite64",
+        SYS_ACCESS => "access",
+        SYS_DUP => "dup",
+        SYS_DUP2 => "dup2",
+        SYS_DUP3 => "dup3",
+        SYS_MADVISE => "madvise",
+        SYS_FSYNC => "fsync",
+        SYS_FDATASYNC => "fdatasync",
+        SYS_RENAME => "rename",
+        SYS_MKDIR => "mkdir",
+        SYS_RMDIR => "rmdir",
+        SYS_UNLINK => "unlink",
+        SYS_GETRUSAGE => "getrusage",
+        SYS_MKDIRAT => "mkdirat",
+        SYS_UNLINKAT => "unlinkat",
+        SYS_RENAMEAT => "renameat",
+        SYS_FACCESSAT => "faccessat",
+        SYS_PRLIMIT64 => "prlimit64",
+        SYS_STATX => "statx",
         _ => "unknown",
     }
 }

@@ -529,6 +529,21 @@ impl Host for WindowsHost {
     fn open_dir(&self, path: &HostPath) -> Result<HostDir, HostError> {
         file_ops::open_dir(path)
     }
+    fn mkdir(&self, path: &HostPath) -> Result<(), HostError> {
+        file_ops::mkdir(path)
+    }
+    fn remove(&self, path: &HostPath, dir: bool) -> Result<(), HostError> {
+        file_ops::remove(path, dir)
+    }
+    fn rename(&self, old: &HostPath, new: &HostPath) -> Result<(), HostError> {
+        file_ops::rename(old, new)
+    }
+    fn sync_file(&self, f: &HostFile, data_only: bool) -> Result<(), HostError> {
+        file_ops::sync_file(f, data_only)
+    }
+    fn dup_file(&self, f: &HostFile) -> Result<HostFile, HostError> {
+        file_ops::dup_file(f)
+    }
     fn read(&self, f: &HostFile, buf: &mut [u8]) -> Result<usize, HostError> {
         file_ops::read(f, buf)
     }

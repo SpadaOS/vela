@@ -82,6 +82,43 @@ pub(crate) fn open_dir(path: &HostPath) -> Result<HostDir, HostError> {
     Ok(HostDir::from_parts(path.0.clone(), v))
 }
 
+pub(crate) fn mkdir(path: &HostPath) -> Result<(), HostError> {
+    std::fs::create_dir(&path.0).map_err(|e| io_err(&e))
+}
+
+pub(crate) fn remove(path: &HostPath, dir: bool) -> Result<(), HostError> {
+    let r = if dir { std::fs::remove_dir(&path.0) } else { std::fs::remove_file(&path.0) };
+    r.map_err(|e| io_err(&e))
+}
+
+pub(crate) fn rename(old: &HostPath, new: &HostPath) -> Result<(), HostError> {
+    std::fs::rename(&old.0, &new.0).map_err(|e| io_err(&e))
+}
+
+pub(crate) fn sync_file(f: &HostFile, data_only: bool) -> Result<(), HostError> {
+    match &f.0 {
+        HostFileKind::Disk { file, .. } => {
+            if data_only {
+                file.sync_data().map_err(|e| io_err(&e))
+            } else {
+                file.sync_all().map_err(|e| io_err(&e))
+            }
+        }
+        // stdio 无持久化语义，no-op 成功
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn dup_file(f: &HostFile) -> Result<HostFile, HostError> {
+    match &f.0 {
+        HostFileKind::Disk { file, path } => {
+            let nf = file.try_clone().map_err(|e| io_err(&e))?;
+            Ok(HostFile(HostFileKind::Disk { file: nf, path: path.clone() }))
+        }
+        _ => Ok(HostFile(f.0.clone_kind())),
+    }
+}
+
 pub(crate) fn read(f: &HostFile, buf: &mut [u8]) -> Result<usize, HostError> {
     use std::io::Read;
     match &f.0 {

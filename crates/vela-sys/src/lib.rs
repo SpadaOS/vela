@@ -65,6 +65,18 @@ pub enum HostFileKind {
     Disk { file: std::fs::File, path: PathBuf },
 }
 
+impl HostFileKind {
+    /// std 变体的复制（dup 语义）；Disk 用 try_clone 由调用方处理。
+    pub(crate) fn clone_kind(&self) -> HostFileKind {
+        match self {
+            HostFileKind::StdIn => HostFileKind::StdIn,
+            HostFileKind::StdOut => HostFileKind::StdOut,
+            HostFileKind::StdErr => HostFileKind::StdErr,
+            HostFileKind::Disk { .. } => unreachable!("dup_file handles Disk via try_clone"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------- 目录遍历
 
 /// 目录条目（getdents64 组装用）。
@@ -201,6 +213,16 @@ pub trait Host: Send + Sync + 'static {
     fn open(&self, path: &HostPath, opt: HostOpen) -> Result<HostFile, HostError>;
     /// 打开目录做快照遍历（O_DIRECTORY 语义）。
     fn open_dir(&self, path: &HostPath) -> Result<HostDir, HostError>;
+    /// 创建目录（mkdir 语义；父目录必须已存在，对应 0o755）。
+    fn mkdir(&self, path: &HostPath) -> Result<(), HostError>;
+    /// 删除文件（unlink）或空目录（rmdir）。
+    fn remove(&self, path: &HostPath, dir: bool) -> Result<(), HostError>;
+    /// 重命名/移动（rename 语义）。
+    fn rename(&self, old: &HostPath, new: &HostPath) -> Result<(), HostError>;
+    /// 刷新文件（fsync=sync_all / fdatasync=sync_data）。
+    fn sync_file(&self, f: &HostFile, data_only: bool) -> Result<(), HostError>;
+    /// 复制句柄（dup 语义；返回的新句柄与原句柄独立游标）。
+    fn dup_file(&self, f: &HostFile) -> Result<HostFile, HostError>;
     fn read(&self, f: &HostFile, buf: &mut [u8]) -> Result<usize, HostError>;
     fn write(&self, f: &HostFile, buf: &[u8]) -> Result<usize, HostError>;
     fn seek(&self, f: &HostFile, off: i64, whence: i32) -> Result<u64, HostError>;

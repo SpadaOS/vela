@@ -72,6 +72,11 @@ impl FdTable {
         fd
     }
 
+    /// 强制占用指定 fd（dup2 语义）；已存在条目由调用方先 remove。
+    pub fn insert_at(&mut self, fd: i32, entry: GuestFd) {
+        self.table.insert(fd, entry);
+    }
+
     /// 记账 fd 标志（open 时记录客户传入 flags 的编码）。
     pub fn set_flags(&mut self, fd: i32, v: u32) {
         self.flags.insert(fd, v);
