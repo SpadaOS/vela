@@ -10,12 +10,13 @@
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 3 {
-        eprintln!("usage: vela-mkguest <torture|tls> <output-file>");
+        eprintln!("usage: vela-mkguest <torture|tls|bench> <output-file>");
         std::process::exit(2);
     }
     let elf = match args[1].as_str() {
         "torture" => build_torture(),
         "tls" => build_tls(),
+        "bench" => build_bench(),
         other => {
             eprintln!("unknown kind: {other}");
             std::process::exit(2);
@@ -324,6 +325,45 @@ fn build_torture() -> Vec<u8> {
     c.lea_rip(0x35, "iovB");
     c.mov_rdx_i32(2);
     c.syscall();
+
+    // exit_group(0)
+    c.mov_rax_i32(231);
+    c.xor_rdi();
+    c.syscall();
+
+    frame(c, d)
+}
+
+/// "mmap ?t? ok\n"，?0 = fs:[0x40] 存取往返，?1 = GET_FS 回读 == tls_area。
+/// 需要 FSGSBASE；不支持时 fs 基址为 0 → fs 写会崩溃（视为诚实的失败）。
+
+/// bench guest（PLAN-0.0.3 T1.1）：纯翻译 syscall 吞吐基准。
+/// 循环 N 次 getpid(39)（无内存/路径/IO 参与，纯 VEH→dispatch→返回往返），
+/// 后 exit_group(0)。host 侧用外部计时（进程含固定 ~10ms 启动开销）：
+///   Measure-Command { vela run guest/bench }  →  ns/op ≈ (elapsed - 启动) / N
+/// r12 做计数器（callee-saved，syscall 语义不触碰；VEH 只改 rax/rcx/rip/r11）。
+fn build_bench() -> Vec<u8> {
+    const N: i32 = 2_000_000;
+    let mut d = Data::new();
+    d.zero("pad", 16); // 双段框架要求非空数据段
+
+    let mut c = Code::new();
+    // mov r12, N
+    c.e(&[0x49, 0xC7, 0xC4]);
+    c.imm32(N);
+    // loop_start:
+    let loop_start = c.buf.len();
+    // mov eax, 39 (getpid)
+    c.e(&[0xB8]);
+    c.imm32(39);
+    // syscall
+    c.syscall();
+    // dec r12
+    c.e(&[0x49, 0xFF, 0xCC]);
+    // jnz loop_start（rel32 向后回填：rel = start - end）
+    c.e(&[0x0F, 0x85]);
+    let rel = loop_start as i32 - (c.buf.len() + 4) as i32;
+    c.imm32(rel);
 
     // exit_group(0)
     c.mov_rax_i32(231);

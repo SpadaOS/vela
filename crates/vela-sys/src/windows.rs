@@ -156,10 +156,15 @@ pub fn install_syscall_trap() -> Result<(), HostError> {
 }
 
 fn guest_range_containing(rip: usize) -> Option<(usize, usize)> {
+    // 槽按登记顺序填充，遇到空槽即可提前退出（PLAN-0.0.3 T1.3：
+    // VEH 热路径每 syscall 调用一次，省掉尾部 30 槽 × 2 次原子 load）
     for (s, e) in RANGE_START.iter().zip(RANGE_END.iter()) {
         let s = s.load(Ordering::Relaxed) as usize;
+        if s == 0 {
+            break; // 空槽 = 已登记范围的尾部
+        }
         let e = e.load(Ordering::Relaxed) as usize;
-        if s != 0 && rip >= s && rip + 2 <= e {
+        if rip >= s && rip + 2 <= e {
             return Some((s, e));
         }
     }

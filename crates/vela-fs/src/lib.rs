@@ -53,29 +53,74 @@ impl FsMap {
     }
 
     /// 翻译绝对 Linux 路径；不可翻译/含 `..`/相对路径返回 None。
+    /// 热路径零中间分配（PLAN-0.0.3 T1.4）：仅反斜杠归一与 `.` 折叠需要拷贝，
+    /// 常规正斜杠路径全程借用切片。
     pub fn translate(&self, path: &str) -> Option<PathBuf> {
-        let comps = split_components(path)?;
+        if path.is_empty() {
+            return None;
+        }
+        if path.split('/').any(|c| c == "..") {
+            return None; // 逃逸防护（与 add() 一致）
+        }
+        // 归一：反斜杠 → 正斜杠；含 "/./" 才折叠（罕见路径才分配）
+        let norm_owned;
+        let norm: &str = if path.contains('\\') {
+            norm_owned = path.replace('\\', "/");
+            &norm_owned
+        } else if path.contains("/./") {
+            norm_owned = fold_dots(path);
+            &norm_owned
+        } else {
+            path
+        };
+        if norm.is_empty() || !norm.starts_with('/') {
+            return None; // 相对路径不接受（调用方负责拼接 cwd）
+        }
         for m in &self.maps {
-            let guest_comps: Vec<&str> = if m.guest.is_empty() {
-                Vec::new()
-            } else {
-                m.guest.trim_start_matches('/').split('/').collect()
-            };
-            let is_root = m.guest.is_empty();
-            let matches = is_root
-                || (comps.len() >= guest_comps.len()
-                    && comps.iter().zip(&guest_comps).all(|(a, b)| a == b));
-            if matches {
+            if m.guest.is_empty() {
+                // 根映射：整段归入 host
                 let mut out = m.host.clone();
-                let rest = if is_root { &comps[..] } else { &comps[guest_comps.len()..] };
-                for c in rest {
+                for c in norm.split('/').filter(|c| !c.is_empty()) {
                     out.push(c);
                 }
                 return Some(out);
             }
+            let g = m.guest.as_str();
+            if norm == g {
+                return Some(m.host.clone());
+            }
+            if norm.starts_with(g) {
+                let rest = &norm[g.len()..];
+                if rest.starts_with('/') {
+                    let mut out = m.host.clone();
+                    for c in rest.split('/').filter(|c| !c.is_empty()) {
+                        out.push(c);
+                    }
+                    return Some(out);
+                }
+                // 组件边界：/mnt/cd 不命中 /mnt/c，继续尝试更短前缀
+            }
         }
         None
     }
+}
+
+/// 折叠路径中的 `.` 组件（仅该罕见情形调用，允许一次分配）。
+fn fold_dots(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut need_slash = false;
+    for c in path.split('/') {
+        if c.is_empty() || c == "." {
+            continue;
+        }
+        if need_slash {
+            out.push('/');
+        }
+        out.push_str(c);
+        need_slash = true;
+    }
+    out.insert(0, '/');
+    out
 }
 
 /// 拆分路径为组件：反斜杠归一、要求绝对路径、拒绝 `..`、折叠 `.`/空段。

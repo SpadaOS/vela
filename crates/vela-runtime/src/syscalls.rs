@@ -415,14 +415,15 @@ fn sys_getdents64(proc: &mut GuestProcess, host: &dyn Host, fd_raw: u64, buf: u6
             }
             break; // 这条留给下次调用
         }
-        let mut rec = vec![0u8; reclen];
+        // 栈缓冲复用（T1.4）：reclen 上限 19+255+1 对齐 = 280
+        let mut rec = [0u8; 280];
         rec[0..8].copy_from_slice(&ent.ino.to_le_bytes());
         // d_off：目录 cookie。快照遍历下用递增序号（musl 只用其排序/停止判断）
         rec[8..16].copy_from_slice(&((filled as i64 + 1).to_le_bytes()));
         rec[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
         rec[18] = if ent.is_dir { abi::DT_DIR } else { abi::DT_REG };
         rec[19..19 + name.len()].copy_from_slice(name);
-        if let Err(e) = write_guest(proc, buf + filled as u64, &rec) {
+        if let Err(e) = write_guest(proc, buf + filled as u64, &rec[..reclen]) {
             return -(e as i64);
         }
         dir.advance();
