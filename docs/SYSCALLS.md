@@ -1,4 +1,4 @@
-# Vela syscall 兼容矩阵（0.0.4）
+# Vela syscall 兼容矩阵（0.0.5）
 
 > 状态约定（效仿 Gramine 的诚实标注）：
 > - ✅ 完整翻译
@@ -37,11 +37,18 @@
 | 61 | wait4 | ⭕ | 恒 -ECHILD（单进程无 fork） |
 | 74 | fsync | ✅ | stdio/伪设备 no-op |
 | 75 | fdatasync | ✅ | |
+| 76 | truncate | ❌ | 路径版未实现（ftruncate fd 版可用） |
+| 77 | ftruncate | ✅ | File::set_len（截断/扩展） |
 | 82 | rename | ✅ | |
 | 83 | mkdir | ✅ | |
 | 84 | rmdir | ✅ | |
 | 87 | unlink | ✅ | |
+| 89/267 | readlink/readlinkat | ⭕ | 恒 -ENOENT（vela 无 procfs、无 symlink） |
+| 90/92 | chmod/fchmodat | ❌ | 路径版只读位近似未接（fchmod fd 版可用） |
+| 91 | fchmod | 🟨 | Windows 只读位近似：mode & 0222 == 0 → 只读，其余位忽略 |
+| 93/260 | fchown/fchownat | ⭕ | 校验 fd 后恒 0（Windows 无 per-file 属主） |
 | 98 | getrusage | ⭕ | 填零结构（无记账） |
+| 99 | sysinfo | 🟨 | uptime 真实（宿主时钟）；内存量固定近似；procs=1 |
 | 16 | ioctl | 🟨 | 仅 TIOCGWINSZ（固定 80x25）；其余 ENOTTY（非终端语义） |
 | 20 | writev | ✅ | 管道支持（容量内逐 iov 追加） |
 | 39 | getpid | ✅ | 固定假 pid |
@@ -54,6 +61,7 @@
 | 102/104/107/108 | getuid/getgid/geteuid/getegid | ✅ | `--uid/--gid` 可配，默认 1000 |
 | 110 | getppid | ✅ | 宿主 pid 派生的稳定值（真实父进程不存在） |
 | 158 | arch_prctl | 🟨 | SET_FS 依赖 FSGSBASE；不支持时仅记录（`--soft-tls` 下 fs 访问由 VEH 软件模拟，见 DESIGN.md） |
+| 160/161 | getrlimit/setrlimit | ⭕ | RLIM_INFINITY（与 prlimit64 一致） |
 | 217 | getdents64 | ✅ | 快照式目录遍历（打开后不感知变化）；`..` 逃逸防护 |
 | 218 | set_tid_address | ✅ | 单线程假 pid |
 | 228 | clock_gettime | ✅ | REALTIME / MONOTONIC |

@@ -2,6 +2,45 @@
 
 本项目的所有显著变更记录于此（Keep a Changelog 格式）。
 
+## [0.0.5] - 2026-09-19
+
+主题：真实软件之门 —— busybox 静态子集压力测试 + 工程地基加固
+（计划见 docs/plans/PLAN-0.0.5.md）。
+
+### Added
+
+- **busybox 静态子集（M3）**：`tools/build-busybox.sh`（msys2 make +
+  zig cc musl 静态 PIE），applet 白名单 echo/ls/cat/true/false/nproc/
+  env/printf；CI 现场构建并验收 echo/nproc/true
+- **管道组合（M2）**：`pipe-a`/`pipe-b` 验收 guest——
+  `vela run pipe-a | vela run pipe-b`（PowerShell 宿主管道）端到端
+  输出 `pipe-b ok: 29 bytes, 3 lines`；stdin 直通验证（GuestFd::StdIn
+  经 file_ops 真实读取）
+- **syscall 广度（M4，+9）**：
+  - `fchmod`（Windows 只读位近似：mode & 0222 == 0 → 只读）
+  - `ftruncate`（File::set_len，截断/扩展）
+  - `fchown`/`fchownat`（校验 fd 后 0——无 per-file 属主）
+  - `readlink`/`readlinkat`（恒 -ENOENT：无 procfs、无 symlink）
+  - `sysinfo`（uptime 真实、内存固定近似、procs=1）
+  - `getrlimit`/`setrlimit`（RLIM_INFINITY）
+- **soft-tls 形态回归资产（M5）**：decode_fs_mov 表驱动测试
+  （REX.W/R/B × 8b/89 × mod 0/1/2 × SIB × disp 宽度，10 组合向量 + 负例）
+
+### Changed
+
+- **exec-range 原地重注册（M1 T1.1）**：`replace_guest_exec_ranges`
+  前缀覆盖 + 尾部清零，execve 重载不再受 32 静态槽累积限制
+- **abi 模块化（M1 T1.2）**：vela-abi 拆 10 个子模块，`pub use` 全量
+  重导出保持 API 兼容
+- **mmap carve 清零（M1 T1.4）**：Reserve 内 MAP_FIXED 覆盖显式清零，
+  对齐 Linux "替换 = 匿名零页" 语义
+- **syscall 名表完备性测试（M1 T1.3）**：dispatch 全部号必须有可读名字
+
+### Fixed
+
+- CI `version_and_help` 硬编码版本号在 0.0.4 升版后失败——改为
+  `CARGO_PKG_VERSION` 动态断言
+
 ## [0.0.4] - 2026-09-19
 
 主题：动态程序之门 —— 文件映射 mmap、动态链接、execve 重载、软 TLS

@@ -443,7 +443,9 @@ fn decode_fs_mov(b: &[u8]) -> Option<FsMov> {
     i += 1;
     let mode = modrm >> 6;
     let reg = (((modrm >> 3) & 7) as usize) | if reg_ext { 8 } else { 0 };
-    let mut rm = (modrm & 7) as usize;
+    // SIB 存在性由 modrm.rm == 4 决定（REX.B 扩展之前）
+    let raw_rm = (modrm & 7) as usize;
+    let mut rm = raw_rm;
     if rex & 0x01 != 0 {
         rm |= 8;
     }
@@ -469,7 +471,7 @@ fn decode_fs_mov(b: &[u8]) -> Option<FsMov> {
                 m.disp = i32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) as i64;
                 i += 4;
             } else {
-                if rm == 4 {
+                if raw_rm == 4 {
                     // SIB
                     if i >= b.len() {
                         return None;
@@ -477,18 +479,27 @@ fn decode_fs_mov(b: &[u8]) -> Option<FsMov> {
                     let sib = b[i];
                     i += 1;
                     m.scale = 1 << (sib >> 6);
-                    m.idx = (((sib >> 3) & 7) as usize) | if rex & 0x02 != 0 { 8 } else { 0 };
-                    let base = (sib & 7) as usize | if rex & 0x01 != 0 { 8 } else { 0 };
-                    if base == 5 {
-                        // 无基址，disp32 绝对（fs:0 形态）
+                    let idx_raw = ((sib >> 3) & 7) as usize;
+                    // SIB idx=4 且无 REX.X = 无变址
+                    if idx_raw != 4 || rex & 0x02 != 0 {
+                        m.idx = idx_raw | if rex & 0x02 != 0 { 8 } else { 0 };
+                    }
+                    let base_raw = (sib & 7) as usize;
+                    if base_raw == 5 {
+                        // mod=00 + SIB base=5：编码上必有 disp32。
+                        // REX.B=0 → disp32 绝对（fs:0 形态，无基址）；
+                        // REX.B=1 → 基址 r13 + disp32。
                         if i + 4 > b.len() {
                             return None;
                         }
                         m.disp = i32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) as i64;
                         i += 4;
+                        if rex & 0x01 != 0 {
+                            m.base = 13;
+                        }
                         m.idx = usize::MAX; // 绝对形态忽略变址（musl 不发射）
                     } else {
-                        m.base = base;
+                        m.base = base_raw | if rex & 0x01 != 0 { 8 } else { 0 };
                     }
                 } else {
                     m.base = rm;
@@ -496,13 +507,29 @@ fn decode_fs_mov(b: &[u8]) -> Option<FsMov> {
             }
         }
         1 => {
+            // x86 编码顺序：modrm → SIB → disp8
+            let mut rm2 = (modrm & 7) as usize;
+            if rm2 == 4 {
+                if i >= b.len() {
+                    return None;
+                }
+                let sib = b[i];
+                i += 1;
+                m.scale = 1 << (sib >> 6);
+                m.idx = (((sib >> 3) & 7) as usize) | if rex & 0x02 != 0 { 8 } else { 0 };
+                rm2 = (sib & 7) as usize | if rex & 0x01 != 0 { 8 } else { 0 };
+            }
             if i >= b.len() {
                 return None;
             }
             m.disp = b[i] as i8 as i64;
             i += 1;
-            if rm == 4 {
-                // mod=01 SIB：取 SIB + disp8（含基址）
+            m.base = rm2;
+        }
+        2 => {
+            // x86 编码顺序：modrm → SIB → disp32
+            let mut rm2 = (modrm & 7) as usize;
+            if rm2 == 4 {
                 if i >= b.len() {
                     return None;
                 }
@@ -510,25 +537,14 @@ fn decode_fs_mov(b: &[u8]) -> Option<FsMov> {
                 i += 1;
                 m.scale = 1 << (sib >> 6);
                 m.idx = (((sib >> 3) & 7) as usize) | if rex & 0x02 != 0 { 8 } else { 0 };
-                m.base = (sib & 7) as usize | if rex & 0x01 != 0 { 8 } else { 0 };
+                rm2 = (sib & 7) as usize | if rex & 0x01 != 0 { 8 } else { 0 };
             }
-        }
-        2 => {
             if i + 4 > b.len() {
                 return None;
             }
             m.disp = i32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) as i64;
             i += 4;
-            if rm == 4 {
-                if i >= b.len() {
-                    return None;
-                }
-                let sib = b[i];
-                i += 1;
-                m.scale = 1 << (sib >> 6);
-                m.idx = (((sib >> 3) & 7) as usize) | if rex & 0x02 != 0 { 8 } else { 0 };
-                m.base = (sib & 7) as usize | if rex & 0x01 != 0 { 8 } else { 0 };
-            }
+            m.base = rm2;
         }
         _ => return None,
     }
@@ -1108,6 +1124,111 @@ mod soft_tls_tests {
         assert!(decode_fs_mov(&[0x64, 0x48, 0x8b, 0xc8]).is_none());
         // 截断
         assert!(decode_fs_mov(&[0x64, 0x48, 0x8b]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod soft_tls_table_tests {
+    //! T5.1（PLAN-0.0.5）：decode_fs_mov 形态回归资产——表驱动，
+    //! 覆盖 musl 发射的全部解码维度（REX/ModRM/SIB/disp/读写）。
+
+    use super::*;
+
+    /// (字节, 期望 len, 期望 reg, 期望 rip_rel, 期望 disp)
+    const LOAD_CASES: &[(&[u8], usize, usize, bool, i64)] = &[
+        // musl 真实形态：mov rcx, fs:0（SIB 绝对）
+        (
+            &[0x64, 0x48, 0x8b, 0x0c, 0x25, 0x00, 0x00, 0x00, 0x00],
+            9,
+            1,
+            false,
+            0,
+        ),
+        // mov rax, fs:0
+        (
+            &[0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00],
+            9,
+            0,
+            false,
+            0,
+        ),
+        // mov r8, fs:0（REX.R 扩展）
+        (
+            &[0x64, 0x4c, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00],
+            9,
+            8,
+            false,
+            0,
+        ),
+        // mov r15, fs:0（REX.R+B）
+        (
+            &[0x64, 0x4f, 0x8b, 0x3c, 0x25, 0x00, 0x00, 0x00, 0x00],
+            9,
+            15,
+            false,
+            0,
+        ),
+        // mov rax, fs:[rip+0x10]
+        (
+            &[0x64, 0x48, 0x8b, 0x05, 0x10, 0x00, 0x00, 0x00],
+            8,
+            0,
+            true,
+            0x10,
+        ),
+        // mov rax, fs:[rip-4]
+        (
+            &[0x64, 0x48, 0x8b, 0x05, 0xfc, 0xff, 0xff, 0xff],
+            8,
+            0,
+            true,
+            -4,
+        ),
+        // mov rax, fs:[rbx+8]（mod=01，基址 rbx）
+        (&[0x64, 0x48, 0x8b, 0x43, 0x08], 5, 0, false, 8),
+        // mov rax, fs:[rbx+0x1234]（mod=02 disp32）
+        (
+            &[0x64, 0x48, 0x8b, 0x83, 0x34, 0x12, 0x00, 0x00],
+            8,
+            0,
+            false,
+            0x1234,
+        ),
+        // mov rax, fs:[rsp+8]（mod=01 SIB，基址 rsp）
+        (&[0x64, 0x48, 0x8b, 0x44, 0x24, 0x08], 6, 0, false, 8),
+        // mov rax, fs:[r12*4+0x40]（mod=01 SIB 变址 r12、无基址 → disp8+idx）
+        (&[0x64, 0x48, 0x8b, 0x44, 0xa5, 0x40], 6, 0, false, 0x40),
+    ];
+
+    /// 写形态：mov fs:[mem], reg
+    const STORE_CASES: &[(&[u8], usize)] = &[
+        // mov fs:[0], rax
+        (&[0x64, 0x48, 0x89, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00], 9),
+        // mov fs:[rbx], rdi
+        (&[0x64, 0x48, 0x89, 0x3b], 4),
+    ];
+
+    #[test]
+    fn table_load_forms_decode() {
+        for (bytes, len, reg, rip_rel, disp) in LOAD_CASES {
+            let m = decode_fs_mov(bytes).unwrap_or_else(|| panic!("decode fail {bytes:?}"));
+            assert!(m.load, "{bytes:?}");
+            assert_eq!(m.len, *len, "{bytes:?}");
+            assert_eq!(m.reg, *reg, "{bytes:?}");
+            assert_eq!(m.rip_rel, *rip_rel, "{bytes:?}");
+            if !*rip_rel {
+                assert_eq!(m.disp, *disp, "{bytes:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn table_store_forms_decode() {
+        for (bytes, len) in STORE_CASES {
+            let m = decode_fs_mov(bytes).unwrap_or_else(|| panic!("decode fail {bytes:?}"));
+            assert!(!m.load, "{bytes:?}");
+            assert_eq!(m.len, *len, "{bytes:?}");
+        }
     }
 }
 

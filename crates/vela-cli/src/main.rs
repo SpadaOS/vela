@@ -19,9 +19,7 @@ use vela_sys::HostMem;
 #[cfg(target_os = "linux")]
 use vela_sys::linux_dev::LinuxDevHost;
 #[cfg(windows)]
-use vela_sys::windows::{
-    add_guest_exec_range, install_syscall_trap, set_console_utf8, set_trap_fn, WindowsHost,
-};
+use vela_sys::windows::{install_syscall_trap, set_console_utf8, set_trap_fn, WindowsHost};
 
 #[cfg(windows)]
 type PlatformHost = WindowsHost;
