@@ -35,6 +35,7 @@ extern "system" {
         Handler: Option<unsafe extern "system" fn(*mut ExceptionPointers) -> i32>,
     ) -> *mut c_void;
     fn RemoveVectoredExceptionHandler(Handler: *mut c_void) -> u32;
+    fn GetLastError() -> u32;
 }
 
 #[link(name = "advapi32")]
@@ -129,6 +130,9 @@ pub fn add_guest_exec_range(start: u64, end: u64) {
             return;
         }
     }
+    // 静态容量是刻意的（VEH 上下文不适合动态分配/加锁）；超限必须可见，
+    // 否则超出段的 syscall 会被静默当成真实非法指令放过
+    eprintln!("[vela] warn: exec range table full ({MAX_GUEST_RANGES}), range {start:#x}-{end:#x} NOT registered");
 }
 
 /// 注册 syscall dispatch 回调。
@@ -144,7 +148,8 @@ pub fn install_syscall_trap() -> Result<(), HostError> {
     // SAFETY: veh_handler 是有效的 extern "system" 回调
     let h = unsafe { AddVectoredExceptionHandler(1, Some(veh_handler)) };
     if h.is_null() {
-        Err(HostError::Other(0))
+        let e = file_ops::os_to_errno(unsafe { GetLastError() } as i32);
+        Err(HostError::Other(e))
     } else {
         Ok(())
     }
@@ -193,6 +198,10 @@ unsafe extern "system" fn veh_handler(ep: *mut ExceptionPointers) -> i32 {
                 hb.join(" "),
                 fs_hint
             );
+            // 客户段内的 AV 一律致命：first-chance 放行只会落到不可控的
+            // second-chance 崩溃（0xC0000005 原始码）。这里以 Linux 语义规范化
+            // 退出码 128+SIGSEGV(11)=139，stdio 经 atexit 正常冲刷。
+            std::process::exit(139);
         }
         return EXCEPTION_CONTINUE_SEARCH;
     }
@@ -549,7 +558,8 @@ impl Host for WindowsHost {
         // SAFETY: 指针/长度来自调用方切片
         let ok = unsafe { SystemFunction036(buf.as_mut_ptr() as *mut c_void, buf.len() as u32) };
         if ok == 0 {
-            Err(HostError::Other(0))
+            let e = file_ops::os_to_errno(unsafe { GetLastError() } as i32);
+            Err(HostError::Other(e))
         } else {
             Ok(())
         }

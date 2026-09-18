@@ -46,16 +46,18 @@ pub fn build_stack(
     img: &LoadedImage,
     argv: &[String],
     envp: &[String],
+    stack_mb: u64,
 ) -> Result<(u64, MemRange), String> {
-    const STACK_SIZE: u64 = 8 * 1024 * 1024;
+    // 16 对齐由「整块 MiB 级尺寸 + 64K 对齐基址」共同保证
+    let stack_size = stack_mb * 1024 * 1024;
     if argv.is_empty() {
         return Err("guest argv is empty".to_string());
     }
 
     // SAFETY: host.map 契约保证零填充可写内存
-    let base = unsafe { host.map(0, STACK_SIZE as usize, HostProt::READ | HostProt::WRITE, true) }
+    let base = unsafe { host.map(0, stack_size as usize, HostProt::READ | HostProt::WRITE, true) }
         .map_err(|e: HostError| format!("map stack: {e}"))? as u64;
-    let top = base + STACK_SIZE; // 8MiB 尺寸 + 64K 对齐基址 ⇒ top 16 字节对齐
+    let top = base + stack_size;
 
     // —— 自顶向下布局：
     //   [rsp(16对齐): argc|argv[]|NULL|envp[]|NULL|auxv]
@@ -137,5 +139,5 @@ pub fn build_stack(
         std::ptr::copy_nonoverlapping(buf.as_ptr(), rsp as *mut u8, buf.len());
     }
 
-    Ok((rsp, MemRange { start: base, len: STACK_SIZE }))
+    Ok((rsp, MemRange { start: base, len: stack_size }))
 }

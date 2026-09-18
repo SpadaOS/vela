@@ -10,8 +10,34 @@ pub(crate) fn io_err(e: &std::io::Error) -> HostError {
         std::io::ErrorKind::PermissionDenied => HostError::Access,
         std::io::ErrorKind::InvalidInput => HostError::Invalid,
         std::io::ErrorKind::AlreadyExists => HostError::Exist,
-        _ => HostError::Other(e.raw_os_error().unwrap_or(0)),
+        _ => match e.raw_os_error() {
+            // Windows raw code → Linux errno（见 win32_to_errno）
+            Some(c) => HostError::Other(os_to_errno(c)),
+            None => HostError::Invalid,
+        },
     }
+}
+
+/// 把宿主原始错误码翻译成 Linux errno，作为 `HostError::Other` 的约定载荷
+/// （host_err_to_errno 直传给客户）。高频码 std 的 ErrorKind 已覆盖，
+/// 这里兜底翻译剩余高频 Win32 码；未知码保守映射 EINVAL——比 0（成功语义）
+/// 诚实，且排障时可从原始码日志定位。
+#[cfg(windows)]
+pub(crate) fn os_to_errno(code: i32) -> i32 {
+    match code {
+        4 => 24,    // ERROR_TOO_MANY_OPEN_FILES → EMFILE
+        32 | 33 => 11, // SHARING_VIOLATION / LOCK_VIOLATION → EAGAIN
+        36 => 36,   // ERROR_FILENAME_EXCED_RANGE → ENAMETOOLONG
+        112 => 28,  // ERROR_DISK_FULL → ENOSPC
+        145 => 39,  // ERROR_DIR_NOT_EMPTY → ENOTEMPTY
+        206 => 36,  // ERROR_META_EXPANSION_TOO_LONG → ENAMETOOLONG
+        _ => 22,    // 未知 → EINVAL（注释见上）
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn os_to_errno(code: i32) -> i32 {
+    code // Linux：raw_os_error 即 errno
 }
 
 pub(crate) fn open(path: &HostPath, opt: HostOpen) -> Result<HostFile, HostError> {

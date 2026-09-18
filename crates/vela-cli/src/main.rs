@@ -24,7 +24,6 @@ type PlatformHost = WindowsHost;
 #[cfg(target_os = "linux")]
 type PlatformHost = LinuxDevHost;
 
-const HEAP_SIZE: u64 = 8 * 1024 * 1024;
 // 规格建议的映射提示基址（0x0000_4000_0000 附近空洞）；冲突时 host 回退让系统自选
 const GUEST_HINT: u64 = 0x0000_4000_0000;
 
@@ -74,6 +73,8 @@ fn print_usage() {
     eprintln!("  --map <g>=<host>   追加前缀映射（可多次；默认 /mnt/c -> C:\\）");
     eprintln!("  --env K=V          传递/覆盖环境变量；K= 表示删除（默认继承宿主全部）");
     eprintln!("  --uid <n> --gid <n>  客户 uid/gid（默认 1000）");
+    eprintln!("  --stack-mb <n>     客户栈大小 MiB（默认 8，1-512）");
+    eprintln!("  --heap-mb <n>      客户堆大小 MiB（默认 8，1-1024）");
     eprintln!("  -v                 syscall 日志到 stderr（或 VELA_LOG=1）");
     eprintln!("env:   VELA_LOG=1 或 -v 打印 syscall 日志到 stderr");
 }
@@ -86,10 +87,21 @@ struct RunOpts {
     envs: Vec<String>,
     uid: Option<u32>,
     gid: Option<u32>,
+    stack_mb: u64,
+    heap_mb: u64,
 }
 
 fn cmd_run(rest: &[String]) -> i32 {
-    let mut opts = RunOpts { verbose: false, root: None, maps: Vec::new(), envs: Vec::new(), uid: None, gid: None };
+    let mut opts = RunOpts {
+        verbose: false,
+        root: None,
+        maps: Vec::new(),
+        envs: Vec::new(),
+        uid: None,
+        gid: None,
+        stack_mb: 8,
+        heap_mb: 8,
+    };
     let mut pos: Vec<String> = Vec::new();
     let mut i = 0;
     // 选项只在 elf 路径之前；elf 之后的参数全部透传给客户
@@ -112,13 +124,19 @@ fn cmd_run(rest: &[String]) -> i32 {
                 opts.envs.push(v.clone());
                 i += 1;
             }
-            "--uid" | "--gid" => {
+            "--uid" | "--gid" | "--stack-mb" | "--heap-mb" => {
                 let Some(v) = rest.get(i + 1) else { return usage_err(&format!("{a} 需要参数")) };
-                let n: u32 = match v.parse() {
+                let n: u64 = match v.parse() {
                     Ok(n) => n,
                     Err(_) => return usage_err(&format!("{a} 需要非负整数")),
                 };
-                if a == "--uid" { opts.uid = Some(n) } else { opts.gid = Some(n) }
+                match a {
+                    "--uid" => opts.uid = Some(n as u32),
+                    "--gid" => opts.gid = Some(n as u32),
+                    "--stack-mb" => opts.stack_mb = n.clamp(1, 512),
+                    "--heap-mb" => opts.heap_mb = n.clamp(1, 1024),
+                    _ => unreachable!(),
+                }
                 i += 1;
             }
             s if s.starts_with('-') && s != "-" => {
@@ -239,12 +257,14 @@ fn run_elf(elf_path: &str, guest_argv: &[String], opts: &RunOpts) -> Result<std:
     if let Some(g) = opts.gid {
         proc.gid = g;
     }
-    if let Err(e) = proc.init_heap(&host, 0, HEAP_SIZE) {
-        eprintln!("[vela] warn: heap init failed: {e}");
+    // 堆是 brk 的后端，失败即无法继续（T3.4：warn-继续改为 fatal）
+    if proc.init_heap(&host, 0, opts.heap_mb * 1024 * 1024).is_err() {
+        eprintln!("vela: heap init failed");
+        return Err(1);
     }
 
     let envp = build_envp(&opts.envs);
-    let (rsp, stack_range) = match guest_start::build_stack(&host, &proc.load, guest_argv, &envp) {
+    let (rsp, stack_range) = match guest_start::build_stack(&host, &proc.load, guest_argv, &envp, opts.stack_mb) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("vela: stack setup failed: {e}");
@@ -311,18 +331,22 @@ unsafe extern "system" fn trap(nr: u64, args: &[u64; 6], rip: u64, ctx: &mut vel
         if vela_sys::windows::stub_hit() {
             eprintln!("[vela] stub HIT ✓");
         }
+        // strace 风格：name(args...) 便于与 Linux 侧 strace 记录对照（PLAN T3.5）
         eprintln!(
-            "[vela] syscall {} nr={} a={:#x},{:#x},{:#x}",
+            "[vela] {}({:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}) [nr={}]",
             vela_abi::syscall_name(nr),
-            nr,
             args[0],
             args[1],
-            args[2]
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+            nr
         );
     }
     let r = vela_runtime::dispatch(&mut st.proc, &st.host, nr, *args);
     if logx::enabled() {
-        eprintln!("[vela]   = {r}");
+        eprintln!("[vela] {} = {r} ({:#x})", vela_abi::syscall_name(nr), r as u64);
     }
     // 模拟硬件 syscall 固定副作用：Rax=返回值、Rcx=返回地址、R11=RFLAGS、Rip+=2
     ctx.rax = r as u64;

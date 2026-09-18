@@ -39,8 +39,10 @@ fn verbose_log_goes_to_stderr() {
         .expect("spawn vela");
     assert!(out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("syscall write"), "log missing: {err}");
-    assert!(err.contains("syscall exit"), "log missing: {err}");
+    // strace 风格日志（PLAN T3.5）：name(args...) 与 name = ret
+    assert!(err.contains("write("), "log missing: {err}");
+    assert!(err.contains("= 21"), "log missing ret: {err}");
+    assert!(err.contains("exit("), "log missing: {err}");
     // 客户 stdout 不被日志污染（规格 12）
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hello from linux elf\n");
 }

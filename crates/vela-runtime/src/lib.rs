@@ -192,21 +192,38 @@ pub fn write_guest(proc: &GuestProcess, addr: u64, data: &[u8]) -> Result<(), i3
 }
 
 /// 读取 NUL 结尾字符串（上限 4096 字节）。
+/// 按页边界分块读取（T3.7）：每块先经 mem.contains 校验整块合法，再零拷贝
+/// 扫描找 NUL——避免逐字节 trap 检查的开销；跨登记边界自动截短到合法长度。
 pub fn read_cstr(proc: &GuestProcess, addr: u64) -> Result<String, i32> {
     let mut out: Vec<u8> = Vec::new();
-    let mut i = 0u64;
+    let mut cur = addr;
     loop {
-        if i >= 4096 {
+        if out.len() >= 4096 {
             return Err(abi::ENAMETOOLONG);
         }
-        let b = read_guest(proc, addr + i, 1)?[0];
-        if b == 0 {
-            break;
+        let page_end = (cur | 0xFFF) + 1; // 本页尾（含）
+        let want = (page_end - cur).min((4096 - out.len()) as u64);
+        // 在请求长度内找最大合法前缀（正常情况 want 即合法；跨界时退化）
+        let mut n = want;
+        while n > 0 && !proc.mem.contains(cur, n) {
+            n -= 1;
         }
-        out.push(b);
-        i += 1;
+        if n == 0 {
+            return Err(abi::EFAULT);
+        }
+        // SAFETY: [cur, cur+n) 已确认登记在客户映射内
+        let slice = unsafe { std::slice::from_raw_parts(cur as *const u8, n as usize) };
+        match slice.iter().position(|&b| b == 0) {
+            Some(i) => {
+                out.extend_from_slice(&slice[..i]);
+                return String::from_utf8(out).map_err(|_| abi::EINVAL);
+            }
+            None => {
+                out.extend_from_slice(slice);
+                cur += n;
+            }
+        }
     }
-    String::from_utf8(out).map_err(|_| abi::EINVAL)
 }
 
 /// HostError → Linux errno（取负由调用方处理）。
