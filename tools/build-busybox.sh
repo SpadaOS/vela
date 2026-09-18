@@ -43,10 +43,11 @@ test -f include/autoconf.h || { echo "FATAL: include/autoconf.h not generated"; 
 
 # zig 0.13 Windows 下 -Wp,-MD,<depfile> 会瞬间 FileNotFound（zig 的 dep-file
 # 缓存 bug，见 CI 二分日志：含 -Wp 必失败、去之立过）。CI 为一次性构建，
-# 依赖追踪无意义：剥离 depfile 参数并禁用 fixdep 后处理（宿主 gcc 工具链
-# 的 depfile 在 Makefile.host 单独定义，不受影响）。
+# 依赖追踪无意义：剥离 depfile 参数并禁用全部 fixdep 后处理（rule_cc_o_c
+# 与 Kbuild.include 的 if_changed_dep 两处；宿主 gcc 工具链的 depfile 在
+# Makefile.host 单独定义，但宿主工具已构建完成，同样禁用无害）。
 sed -i 's/-Wp,-MD,\$(depfile) //' scripts/Makefile.lib
-sed -i 's|scripts/basic/fixdep|: fixdep-disabled|' scripts/Makefile.build
+sed -i 's|scripts/basic/fixdep|: fixdep-disabled|' scripts/Makefile.build scripts/Kbuild.include
 
 # zig cc musl 默认静态；-fPIE -pie 生成 ET_DYN（vela 仅接受 PIE）。
 # -j1：规避多 zig 进程共享缓存的 Windows 竞争；V=1：失败时日志有完整命令。
