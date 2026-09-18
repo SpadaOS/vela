@@ -149,22 +149,10 @@ fn run_elf(elf_path: &str, guest_argv: &[String]) -> Result<std::convert::Infall
 
     let entry = proc.load.entry;
     let exec_ranges = proc.load.exec_ranges.clone();
+    let heap_start = proc.heap.map(|h| h.start);
 
     #[cfg(windows)]
     {
-        // 预切 FS：进入客户前把当前线程 FS 基址切到一张**已映射**的客户占位页，
-        // 让内核从进程一开始就保存/恢复「客户侧」基址（消除还原为陈旧宿主值
-        // 的可能）。占位页取堆前 4KiB（已 RW 且登记），初始全零——即便内核在
-        // arch_prctl 之前发生一次 fs 解引用也只是读到 0，不会 AV；arch_prctl
-        // (SET_FS) 后由 trampoline 切到真实 TLS 区。
-        let heap_start = proc.heap.map(|h| h.start);
-        if vela_sys::windows::fs_base_supported() {
-            if let Some(hs) = heap_start {
-                let _ = vela_sys::windows::set_thread_fs_base_now(hs);
-                // 无条件打印：CI 诊断需要（stderr 不影响客户 stdout 纯净性）
-                eprintln!("[vela] fs preset → {hs:#x}");
-            }
-        }
         let state = Box::new(GuestState { proc, host });
         let ptr = Box::into_raw(state);
         GUEST.store(ptr, Ordering::Relaxed);
@@ -175,6 +163,21 @@ fn run_elf(elf_path: &str, guest_argv: &[String]) -> Result<std::convert::Infall
         if let Err(e) = install_syscall_trap() {
             eprintln!("vela: failed to install exception trap: {e}");
             return Err(1);
+        }
+        // 预切 FS：进入客户前把当前线程 FS 基址切到一张**已映射**的客户占位页，
+        // 让内核从进程一开始就保存/恢复「客户侧」基址（消除还原为陈旧宿主值
+        // 的可能）。占位页取堆前 4KiB（已 RW 且登记），初始全零——即便内核在
+        // arch_prctl 之前发生一次 fs 解引用也只是读到 0，不会 AV；arch_prctl
+        // (SET_FS) 后由 trampoline 切到真实 TLS 区。
+        if vela_sys::windows::fs_base_supported() {
+            if let Some(hs) = heap_start {
+                let _ = vela_sys::windows::set_thread_fs_base_now(hs);
+                // 强制内核按已预切的基址重建保存值：此后偶发还原的也是客户侧
+                // 基址，而非线程创建时保存的 0（CI 实测的崩溃根源）。
+                // 注意必须在 VEH 安装之后调用（commit stub 依赖 VEH 吸收 UD2）。
+                vela_sys::windows::commit_fs_base_after_preset();
+                eprintln!("[vela] fs preset → {hs:#x} (committed)");
+            }
         }
         // SAFETY: 客户映像、堆、栈均已映射且登记；本调用不返回
         unsafe { guest_start::enter_guest(entry, rsp) }

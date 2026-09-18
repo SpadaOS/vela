@@ -193,6 +193,13 @@ unsafe extern "system" fn veh_handler(ep: *mut ExceptionPointers) -> i32 {
     // SAFETY: 同上
     let ctx = unsafe { &mut *ep.context_record };
     let rip = ctx.rip as usize;
+    // FS commit stub：预切后的 ud2+ret，直接跳过 ud2 让 ret 返回调用者。
+    // 必须在 guest range 过滤之前判断（stub 位于 vela.exe 自身代码段）。
+    let commit_stub = vela_fs_commit_stub as usize;
+    if rip >= commit_stub && rip < commit_stub + 4 {
+        ctx.rip = rip as u64 + 2;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     let Some(_range) = guest_range_containing(rip) else {
         return EXCEPTION_CONTINUE_SEARCH;
     };
@@ -216,8 +223,6 @@ unsafe extern "system" fn veh_handler(ep: *mut ExceptionPointers) -> i32 {
     // syscall 模拟（rax/rcx/r11/rip 推进）与控制流改写均由回调完成
     EXCEPTION_CONTINUE_EXECUTION
 }
-
-// ---------------------------------------------------------------- 宿主
 
 /// 控制台输出切 UTF-8（规格 7.2）。
 pub fn set_console_utf8() {
@@ -396,6 +401,28 @@ pub fn set_thread_fs_base_now(v: u64) -> Result<(), HostError> {
     #[cfg(not(target_arch = "x86_64"))]
     let _ = v;
     Ok(())
+}
+
+/// 预切后强制一次内核侧 FS 基址刷新：触发一个被 VEH 吞掉的 UD2，
+/// NtContinue 返回时内核按当前（已预切的）基址重建保存值。
+/// 此后内核偶发还原的也是客户侧基址而非陈旧宿主值/0。
+pub fn commit_fs_base_after_preset() {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: vela_fs_commit_stub 只含 ud2 与 ret；UD2 由已注册的 probe 处理器吸收
+    unsafe { vela_fs_commit_stub() };
+}
+
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    ".globl vela_fs_commit_stub",
+    "vela_fs_commit_stub:",
+    "    ud2",
+    "    ret",
+);
+
+#[cfg(target_arch = "x86_64")]
+extern "C" {
+    fn vela_fs_commit_stub();
 }
 
 #[derive(Debug)]
