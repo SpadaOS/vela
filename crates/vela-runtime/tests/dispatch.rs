@@ -6,7 +6,9 @@ use std::sync::Mutex;
 use vela_abi as abi;
 use vela_runtime::mem::{LoadedImage, MemRange, Segment};
 use vela_runtime::{dispatch, GuestFd, GuestProcess};
-use vela_sys::{Host, HostError, HostFile, HostFileKind, HostOpen, HostPath, HostProt, HostStat, StdioHandles};
+use vela_sys::{
+    Host, HostDir, HostDirEntry, HostError, HostFile, HostFileKind, HostOpen, HostPath, HostProt, HostStat, StdioHandles,
+};
 
 // ---------------------------------------------------------------- MockHost
 
@@ -47,6 +49,9 @@ impl Host for MockHost {
         Ok(())
     }
     fn open(&self, _p: &HostPath, _o: HostOpen) -> Result<HostFile, HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn open_dir(&self, _p: &HostPath) -> Result<HostDir, HostError> {
         Err(HostError::Unimplemented)
     }
     fn read(&self, f: &HostFile, buf: &mut [u8]) -> Result<usize, HostError> {
@@ -251,8 +256,8 @@ fn unimplemented_returns_enosys() {
     let (host, mut proc, _addr) = setup(4096);
     let r = dispatch(&mut proc, &host, 9999, [0, 0, 0, 0, 0, 0]);
     assert_eq!(r, -(abi::ENOSYS as i64));
-    let r = dispatch(&mut proc, &host, abi::SYS_IOCTL, [1, 0x5413, 0, 0, 0, 0]);
-    assert_eq!(r, -(abi::ENOTTY as i64));
+    let r = dispatch(&mut proc, &host, abi::SYS_GETDENTS64, [99, 0, 0, 0, 0, 0]);
+    assert_eq!(r, -(abi::EBADF as i64));
 }
 
 // ---------------------------------------------------------------- stat 家族
@@ -348,10 +353,157 @@ fn stat_untranslatable_path_is_enoent() {
     assert_eq!(r, -(abi::ENOENT as i64));
 }
 
+// ---------------------------------------------------------------- getdents64
+
+/// 注入一个预填快照的目录 fd：a.txt (REG, ino=100) + sub (DIR, ino=200)。
+fn make_dir_fd(proc: &mut GuestProcess) -> i32 {
+    let dir = HostDir::from_parts(
+        std::path::PathBuf::from(r"C:\tmpdir"),
+        vec![
+            HostDirEntry { name: "a.txt".into(), is_dir: false, ino: 100 },
+            HostDirEntry { name: "sub".into(), is_dir: true, ino: 200 },
+        ],
+    );
+    proc.fds.alloc_fd(GuestFd::HostDir(dir))
+}
+
+#[test]
+fn getdents64_fills_dirent64_entries() {
+    let (host, mut proc, addr) = setup(4096);
+    let fd = make_dir_fd(&mut proc);
+    let buf = (addr + 0x100) as u64;
+    // a.txt: reclen=(19+5+1+7)&!7=32；sub: (19+3+1+7)&!7=24 → 共 56
+    let r = dispatch(&mut proc, &host, abi::SYS_GETDENTS64, [fd as u64, buf, 4096, 0, 0, 0]);
+    assert_eq!(r, 56);
+    // SAFETY: buf 为 mock 分配的可写内存
+    let d_ino = unsafe { std::ptr::read_unaligned(buf as *const u64) };
+    assert_eq!(d_ino, 100);
+    let d_type = unsafe { std::ptr::read_unaligned((buf + 18) as *const u8) };
+    assert_eq!(d_type, abi::DT_REG);
+    let name = unsafe { std::slice::from_raw_parts((buf + 19) as *const u8, 5) };
+    assert_eq!(name, b"a.txt");
+    let second = buf + 32;
+    let d_ino2 = unsafe { std::ptr::read_unaligned(second as *const u64) };
+    assert_eq!(d_ino2, 200);
+    let d_type2 = unsafe { std::ptr::read_unaligned((second + 18) as *const u8) };
+    assert_eq!(d_type2, abi::DT_DIR);
+    // 读完后再次调用返回 0
+    let r2 = dispatch(&mut proc, &host, abi::SYS_GETDENTS64, [fd as u64, buf, 4096, 0, 0, 0]);
+    assert_eq!(r2, 0);
+}
+
+#[test]
+fn getdents64_partial_reads_resume() {
+    let (host, mut proc, addr) = setup(4096);
+    let fd = make_dir_fd(&mut proc);
+    let buf = (addr + 0x100) as u64;
+    // count=32：第一次填 a.txt(32)，第二次填 sub(24)，第三次 0
+    let r1 = dispatch(&mut proc, &host, abi::SYS_GETDENTS64, [fd as u64, buf, 32, 0, 0, 0]);
+    assert_eq!(r1, 32);
+    let r2 = dispatch(&mut proc, &host, abi::SYS_GETDENTS64, [fd as u64, buf, 32, 0, 0, 0]);
+    assert_eq!(r2, 24);
+    let r3 = dispatch(&mut proc, &host, abi::SYS_GETDENTS64, [fd as u64, buf, 32, 0, 0, 0]);
+    assert_eq!(r3, 0);
+    // 第二条应是 sub
+    let d_ino = unsafe { std::ptr::read_unaligned(buf as *const u64) };
+    assert_eq!(d_ino, 200);
+}
+
+#[test]
+fn getdents64_count_too_small_is_einval() {
+    let (host, mut proc, addr) = setup(4096);
+    let fd = make_dir_fd(&mut proc);
+    let buf = (addr + 0x100) as u64;
+    let r = dispatch(&mut proc, &host, abi::SYS_GETDENTS64, [fd as u64, buf, 8, 0, 0, 0]);
+    assert_eq!(r, -(abi::EINVAL as i64));
+}
+
+#[test]
+fn getdents64_non_dir_fd_is_enotdir() {
+    let (host, mut proc, addr) = setup(4096);
+    let r = dispatch(&mut proc, &host, abi::SYS_GETDENTS64, [1, (addr + 0x100) as u64, 4096, 0, 0, 0]);
+    assert_eq!(r, -(abi::ENOTDIR as i64));
+    let r = dispatch(&mut proc, &host, abi::SYS_GETDENTS64, [99, (addr + 0x100) as u64, 4096, 0, 0, 0]);
+    assert_eq!(r, -(abi::EBADF as i64));
+}
+
+// ---------------------------------------------------------------- fcntl / ioctl
+
+#[test]
+fn fcntl_flags_roundtrip() {
+    let (host, mut proc, _addr) = setup(4096);
+    let fd = proc.fds.alloc_fd(GuestFd::Null);
+    // F_SETFL(O_APPEND) → F_GETFL 返回 O_APPEND
+    let r = dispatch(&mut proc, &host, abi::SYS_FCNTL, [fd as u64, abi::F_SETFL, abi::O_APPEND, 0, 0, 0]);
+    assert_eq!(r, 0);
+    let r = dispatch(&mut proc, &host, abi::SYS_FCNTL, [fd as u64, abi::F_GETFL, 0, 0, 0, 0]);
+    assert_eq!(r, abi::O_APPEND as i64);
+    // F_SETFD(FD_CLOEXEC) → F_GETFD 返回 1
+    let r = dispatch(&mut proc, &host, abi::SYS_FCNTL, [fd as u64, abi::F_SETFD, abi::FD_CLOEXEC, 0, 0, 0]);
+    assert_eq!(r, 0);
+    let r = dispatch(&mut proc, &host, abi::SYS_FCNTL, [fd as u64, abi::F_GETFD, 0, 0, 0, 0]);
+    assert_eq!(r, 1);
+    // 坏 fd
+    let r = dispatch(&mut proc, &host, abi::SYS_FCNTL, [77, abi::F_GETFL, 0, 0, 0, 0]);
+    assert_eq!(r, -(abi::EBADF as i64));
+    // 未知 cmd
+    let r = dispatch(&mut proc, &host, abi::SYS_FCNTL, [fd as u64, 99, 0, 0, 0, 0]);
+    assert_eq!(r, -(abi::EINVAL as i64));
+}
+
+#[test]
+fn ioctl_tiocgwinsz_returns_winsize() {
+    let (host, mut proc, addr) = setup(4096);
+    let buf = (addr + 0x100) as u64;
+    let r = dispatch(&mut proc, &host, abi::SYS_IOCTL, [1, abi::TIOCGWINSZ, buf, 0, 0, 0]);
+    assert_eq!(r, 0);
+    // SAFETY: buf 为 mock 分配的可写内存
+    let row = unsafe { std::ptr::read_unaligned(buf as *const u16) };
+    let col = unsafe { std::ptr::read_unaligned((buf + 2) as *const u16) };
+    assert_eq!((row, col), (25, 80));
+    // TCGETS 诚实返回 ENOTTY；坏 fd 返回 EBADF
+    let r = dispatch(&mut proc, &host, abi::SYS_IOCTL, [1, abi::TCGETS, buf, 0, 0, 0]);
+    assert_eq!(r, -(abi::ENOTTY as i64));
+    let r = dispatch(&mut proc, &host, abi::SYS_IOCTL, [99, abi::TIOCGWINSZ, buf, 0, 0, 0]);
+    assert_eq!(r, -(abi::EBADF as i64));
+}
+
+// ---------------------------------------------------------------- openat dirfd
+
+#[test]
+fn openat_dirfd_relative_rejects_escape_and_bad_fd() {
+    let (host, mut proc, addr) = setup(4096);
+    let fd = make_dir_fd(&mut proc);
+    let p = (addr + 0x200) as u64;
+    // SAFETY: p 为 mock 分配的可写内存
+    unsafe {
+        let s = b"../x\0";
+        std::ptr::copy_nonoverlapping(s.as_ptr(), p as *mut u8, s.len());
+    }
+    // 目录 fd 相对路径含 ".." → EINVAL（逃逸防护）
+    let r = dispatch(&mut proc, &host, abi::SYS_OPENAT, [fd as u64, p, abi::O_RDONLY as u64, 0, 0, 0]);
+    assert_eq!(r, -(abi::EINVAL as i64));
+    // 相对路径 + 坏 dirfd → EBADF
+    // SAFETY: p 为 mock 分配的可写内存
+    unsafe {
+        let s = b"child\0";
+        std::ptr::copy_nonoverlapping(s.as_ptr(), p as *mut u8, s.len());
+    }
+    let r = dispatch(&mut proc, &host, abi::SYS_OPENAT, [99, p, abi::O_RDONLY as u64, 0, 0, 0]);
+    assert_eq!(r, -(abi::EBADF as i64));
+    // 相对路径 + 非目录 fd（Null）→ EBADF
+    let nullfd = proc.fds.alloc_fd(GuestFd::Null);
+    let r = dispatch(&mut proc, &host, abi::SYS_OPENAT, [nullfd as u64, p, abi::O_RDONLY as u64, 0, 0, 0]);
+    assert_eq!(r, -(abi::EBADF as i64));
+}
+
 #[test]
 fn ioctl_is_not_tty() {
     let (host, mut proc, _addr) = setup(4096);
-    let r = dispatch(&mut proc, &host, abi::SYS_IOCTL, [1, 0x5413, 0, 0, 0, 0]);
+    // TCGETS 诚实返回 ENOTTY（不是终端）；未知 cmd 同样
+    let r = dispatch(&mut proc, &host, abi::SYS_IOCTL, [1, abi::TCGETS, 0, 0, 0, 0]);
+    assert_eq!(r, -(abi::ENOTTY as i64));
+    let r = dispatch(&mut proc, &host, abi::SYS_IOCTL, [1, 0xDEAD, 0, 0, 0, 0]);
     assert_eq!(r, -(abi::ENOTTY as i64));
 }
 

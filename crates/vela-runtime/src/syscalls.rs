@@ -2,7 +2,7 @@
 //! 未实现的 syscall 一律返回 `-ENOSYS`（规格 0 成功标准 5）。
 
 use vela_abi as abi;
-use vela_sys::{Host, HostError, HostFile, HostFileKind, HostOpen, HostPath, HostProt, HostStat};
+use vela_sys::{Host, HostDir, HostError, HostFile, HostFileKind, HostOpen, HostPath, HostProt, HostStat};
 
 use crate::{read_cstr, read_guest, read_guest_mut, write_guest, GuestFd, GuestProcess, host_err_to_errno};
 
@@ -33,8 +33,9 @@ pub fn dispatch(proc: &mut GuestProcess, host: &dyn Host, nr: u64, a: [u64; 6]) 
         abi::SYS_SET_ROBUST_LIST => 0,               // musl 启动路径调用，忽略
         abi::SYS_CLOCK_GETTIME => sys_clock_gettime(proc, host, a[0], a[1]),
         abi::SYS_GETTIMEOFDAY => sys_gettimeofday(proc, host, a[0]),
-        abi::SYS_IOCTL => -(abi::ENOTTY as i64), // 不是 tty
-        abi::SYS_FCNTL => -(abi::ENOSYS as i64),
+        abi::SYS_GETDENTS64 => sys_getdents64(proc, host, a[0], a[1], a[2]),
+        abi::SYS_FCNTL => sys_fcntl(proc, a[0], a[1], a[2]),
+        abi::SYS_IOCTL => sys_ioctl(proc, host, a[0], a[1], a[2]),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -47,6 +48,7 @@ fn sys_write(proc: &GuestProcess, host: &dyn Host, fd_raw: u64, buf: u64, len: u
         None => -(abi::EBADF as i64),
         Some(GuestFd::Null) | Some(GuestFd::Zero) => len as i64,
         Some(GuestFd::Reserved) => -(abi::EBADF as i64),
+        Some(GuestFd::HostDir(_)) => -(abi::EBADF as i64), // 不能 write 目录
         Some(GuestFd::Host(f)) => {
             if len == 0 {
                 return 0;
@@ -67,6 +69,7 @@ fn sys_read(proc: &mut GuestProcess, host: &dyn Host, fd_raw: u64, buf: u64, len
     match proc.fds.get(fd) {
         None | Some(GuestFd::Reserved) => -(abi::EBADF as i64),
         Some(GuestFd::Null) => 0,
+        Some(GuestFd::HostDir(_)) => -(abi::EISDIR as i64), // read 目录
         Some(GuestFd::Zero) => match write_zeros(proc, buf, len as usize) {
             Ok(()) => len as i64,
             Err(e) => -(e as i64),
@@ -93,6 +96,7 @@ fn sys_writev(proc: &GuestProcess, host: &dyn Host, fd_raw: u64, iov: u64, iovcn
     }
     match proc.fds.get(fd) {
         None | Some(GuestFd::Reserved) => return -(abi::EBADF as i64),
+        Some(GuestFd::HostDir(_)) => return -(abi::EBADF as i64),
         Some(GuestFd::Null) | Some(GuestFd::Zero) => {
             // /dev/null 语义：校验可读后返回总长
             let mut total = 0i64;
@@ -138,38 +142,92 @@ fn rd_u64(b: &[u8], off: usize) -> u64 {
 // ---------------------------------------------------------------- 文件
 
 fn sys_open(proc: &mut GuestProcess, host: &dyn Host, path_ptr: u64, flags: u64) -> i64 {
-    open_common(proc, host, path_ptr, flags)
+    open_common(proc, host, abi::AT_FDCWD, path_ptr, flags)
 }
 
 fn sys_openat(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 {
-    let dirfd = a[0] as u32 as i32;
-    if dirfd != abi::AT_FDCWD {
-        return -(abi::EBADF as i64); // v0 仅支持 AT_FDCWD（规格 5.5）
-    }
-    open_common(proc, host, a[1], a[2])
+    open_common(proc, host, a[0] as u32 as i32, a[1], a[2])
 }
 
-fn open_common(proc: &mut GuestProcess, host: &dyn Host, path_ptr: u64, flags: u64) -> i64 {
+/// open/openat 公共路径解析与打开（flags 为 Linux 客户侧标志）。
+fn open_common(proc: &mut GuestProcess, host: &dyn Host, dirfd: i32, path_ptr: u64, flags: u64) -> i64 {
     let path = match read_cstr(proc, path_ptr) {
         Ok(p) => p,
         Err(e) => return -(e as i64),
     };
-    let linux_path = resolve_rel(proc, &path);
-    let Some(host_path) = vela_fs::translate(&linux_path) else {
-        return -(abi::ENOENT as i64);
+    // 解析为宿主路径：绝对路径走 vela-fs 翻译；相对路径按 dirfd（AT_FDCWD→cwd，
+    // 目录 fd→其宿主目录）拼接。规格 2.4：进入 Host 的必须是宿主原生路径。
+    let host_path = if path.starts_with('/') {
+        match vela_fs::translate(&path) {
+            Some(p) => p,
+            None => return -(abi::ENOENT as i64),
+        }
+    } else if dirfd == abi::AT_FDCWD {
+        match vela_fs::translate(&resolve_rel(proc, &path)) {
+            Some(p) => p,
+            None => return -(abi::ENOENT as i64),
+        }
+    } else {
+        match proc.fds.get(dirfd) {
+            Some(GuestFd::HostDir(d)) => {
+                // 相对路径禁止 ".."（与 vela-fs 的逃逸防护一致）
+                if path.split('/').any(|c| c == "..") {
+                    return -(abi::EINVAL as i64);
+                }
+                let mut p = d.host_path().to_path_buf();
+                for c in path.split('/') {
+                    if !c.is_empty() && c != "." {
+                        p.push(c);
+                    }
+                }
+                p
+            }
+            Some(_) | None => return -(abi::EBADF as i64),
+        }
     };
     let acc = flags & 0b11;
     let opt = HostOpen {
         read: acc == abi::O_RDONLY as u64 || acc == abi::O_RDWR as u64,
         write: acc != abi::O_RDONLY as u64,
         create: flags & abi::O_CREAT as u64 != 0,
+        excl: flags & abi::O_EXCL as u64 != 0,
         truncate: flags & abi::O_TRUNC as u64 != 0,
         append: flags & abi::O_APPEND as u64 != 0,
     };
-    match host.open(&HostPath(host_path), opt) {
-        Ok(f) => proc.fds.alloc_fd(GuestFd::Host(f)) as i64,
-        Err(e) => -(host_err_to_errno(&e) as i64),
+    let flag_bits = flags as u32;
+    if flags & abi::O_DIRECTORY != 0 {
+        match host.open_dir(&HostPath(host_path)) {
+            Ok(d) => {
+                let fd = proc.fds.alloc_fd(GuestFd::HostDir(d));
+                proc.fds.set_flags(fd, encode_flags(flag_bits));
+                fd as i64
+            }
+            Err(e) => -(host_err_to_errno(&e) as i64),
+        }
+    } else {
+        match host.open(&HostPath(host_path), opt) {
+            Ok(f) => {
+                let fd = proc.fds.alloc_fd(GuestFd::Host(f));
+                proc.fds.set_flags(fd, encode_flags(flag_bits));
+                fd as i64
+            }
+            Err(e) => -(host_err_to_errno(&e) as i64),
+        }
     }
+}
+
+/// fd 标志编码：bit0 = FD_CLOEXEC，bits 8..24 = status flags。
+fn encode_flags(flags: u32) -> u32 {
+    let mut v = 0u32;
+    if flags & abi::O_CLOEXEC as u32 != 0 {
+        v |= 1;
+    }
+    v | ((flags & 0x1_FFFF) << 8)
+}
+
+/// 编码 → Linux status flags（F_GETFL 返回值）。
+fn decode_status(encoded: u32) -> u32 {
+    (encoded >> 8) & 0x1_FFFF
 }
 
 /// 相对路径拼 cwd；绝对路径原样（vela-fs 只接受 Linux 风格路径）。
@@ -201,6 +259,7 @@ fn sys_fstat(proc: &GuestProcess, host: &dyn Host, fd_raw: u64, statbuf: u64) ->
         None | Some(GuestFd::Reserved) => return -(abi::EBADF as i64),
         Some(GuestFd::Null) | Some(GuestFd::Zero) => Ok(HostStat::char_device()),
         Some(GuestFd::Host(f)) => host.stat_file(f),
+        Some(GuestFd::HostDir(d)) => host.stat_path(&HostPath(d.host_path().to_path_buf())),
     };
     fill_stat(proc, r, statbuf)
 }
@@ -278,6 +337,97 @@ fn sys_close(proc: &mut GuestProcess, host: &dyn Host, fd_raw: u64) -> i64 {
         },
         Some(_) => 0,
     }
+}
+
+// ---------------------------------------------------------------- 目录遍历
+
+/// getdents64(fd, dirp, count)：按 linux_dirent64 填充客户缓冲，填满即停。
+/// 返回已填字节数；0 = 目录读完；count 不足以放一条 → EINVAL。
+/// linux_dirent64 { u64 d_ino; i64 d_off; u16 d_reclen; u8 d_type; char d_name[] }
+fn sys_getdents64(proc: &mut GuestProcess, host: &dyn Host, fd_raw: u64, buf: u64, count: u64) -> i64 {
+    let fd = fd_raw as u32 as i32;
+    let dir = match proc.fds.get(fd) {
+        None | Some(GuestFd::Reserved) => return -(abi::EBADF as i64),
+        Some(GuestFd::HostDir(d)) => d,
+        Some(_) => return -(abi::ENOTDIR as i64), // fd 存在但不是目录
+    };
+    let mut filled = 0usize;
+    loop {
+        let ent = match dir.peek() {
+            Ok(Some(e)) => e,
+            Ok(None) => break, // 目录读完
+            Err(err) => return -(host_err_to_errno(&err) as i64),
+        };
+        let name = ent.name.as_bytes();
+        if name.len() > 255 {
+            dir.advance();
+            continue; // 跳过超长名（Linux 文件名上限 255）
+        }
+        let reclen = (19 + name.len() + 1 + 7) & !7; // 头 19 字节 + NUL + 8 对齐
+        if filled + reclen > count as usize {
+            if filled == 0 {
+                return -(abi::EINVAL as i64); // count 连一条都放不下
+            }
+            break; // 这条留给下次调用
+        }
+        let mut rec = vec![0u8; reclen];
+        rec[0..8].copy_from_slice(&ent.ino.to_le_bytes());
+        // d_off：目录 cookie。快照遍历下用递增序号（musl 只用其排序/停止判断）
+        rec[8..16].copy_from_slice(&((filled as i64 + 1).to_le_bytes()));
+        rec[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
+        rec[18] = if ent.is_dir { abi::DT_DIR } else { abi::DT_REG };
+        rec[19..19 + name.len()].copy_from_slice(name);
+        if let Err(e) = write_guest(proc, buf + filled as u64, &rec) {
+            return -(e as i64);
+        }
+        dir.advance();
+        filled += reclen;
+    }
+    filled as i64
+}
+
+// ---------------------------------------------------------------- fcntl / ioctl
+
+/// fcntl 最小集：fd 标志（FD_CLOEXEC）与 status flags（O_APPEND/O_NONBLOCK 等）
+/// 记账实现；O_NONBLOCK/O_APPEND 对当前同步 fd 语义无实际作用（记录即可）。
+fn sys_fcntl(proc: &mut GuestProcess, fd_raw: u64, cmd: u64, arg: u64) -> i64 {
+    let fd = fd_raw as u32 as i32;
+    if proc.fds.get(fd).is_none() {
+        return -(abi::EBADF as i64);
+    }
+    match cmd {
+        abi::F_GETFD => (proc.fds.get_flags(fd).unwrap_or(0) & 1) as i64,
+        abi::F_SETFD => {
+            proc.fds.update_flags(fd, |v| (v & !1) | (arg as u32 & 1));
+            0
+        }
+        abi::F_GETFL => decode_status(proc.fds.get_flags(fd).unwrap_or(0)) as i64,
+        abi::F_SETFL => {
+            let mask = (abi::O_APPEND | abi::O_NONBLOCK | abi::O_RDWR | abi::O_WRONLY) as u32;
+            let new_status = (arg as u32) & mask;
+            proc.fds.update_flags(fd, |v| (v & !(0x1_FFFF << 8)) | (new_status << 8));
+            0
+        }
+        _ => -(abi::EINVAL as i64),
+    }
+}
+
+/// ioctl：仅 TIOCGWINSZ 提供固定 80x25 窗口尺寸（musl/busybox 探测用）；
+/// 其余（含 TCGETS/TCSETS）返回 ENOTTY——诚实声明「不是终端」，musl isatty 据此走非 tty 路径。
+fn sys_ioctl(proc: &GuestProcess, _host: &dyn Host, fd_raw: u64, cmd: u64, arg: u64) -> i64 {
+    let fd = fd_raw as u32 as i32;
+    if proc.fds.get(fd).is_none() {
+        return -(abi::EBADF as i64);
+    }
+    if cmd == abi::TIOCGWINSZ {
+        // struct winsize { ws_row, ws_col, ws_xpixel, ws_ypixel } = 4 × u16
+        let ws: [u8; 8] = [25, 0, 80, 0, 0, 0, 0, 0]; // row=25, col=80, 像素位 0
+        return match write_guest(proc, arg, &ws) {
+            Ok(()) => 0,
+            Err(e) => -(e as i64),
+        };
+    }
+    -(abi::ENOTTY as i64)
 }
 
 fn sys_lseek(proc: &GuestProcess, host: &dyn Host, fd_raw: u64, off_raw: u64, whence_raw: u64) -> i64 {

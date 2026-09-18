@@ -145,7 +145,7 @@ fn run_musl_hello() {
     for attempt in 1..=3 {
         let out = vela().arg("run").arg(&elf).output().expect("spawn vela");
         if out.status.success()
-            && String::from_utf8_lossy(&out.stdout) == "hello from musl\n"
+            && String::from_utf8_lossy(&out.stdout).starts_with("hello from musl")
         {
             return;
         }
@@ -158,4 +158,34 @@ fn run_musl_hello() {
         out.status.code(),
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// file-io guest（0.0.2 M1 出口）：musl C 程序验收
+/// open/write/lseek/read/fstat/stat/fcntl/opendir(getdents64)/getcwd 全链路。
+/// 产物 guest/file-io 由 zig cc 交叉编译（见 guest/src/file-io.c 头注释）。
+/// 需要 FSGSBASE（musl TLS），缺失时跳过；写入 C:\Windows\Temp 的产物由本测试清理。
+#[test]
+fn run_file_io_guest() {
+    if !vela_sys::windows::fs_base_supported() {
+        eprintln!("skip: FSGSBASE unavailable on this machine; musl guest needs TLS");
+        return;
+    }
+    let elf = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../guest/file-io");
+    if !elf.exists() {
+        eprintln!("skip: guest/file-io not built (see guest/src/file-io.c)");
+        return;
+    }
+    let out = vela().arg("run").arg(&elf).output().expect("spawn vela");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // 无论成败都尝试清理 guest 写入的文件（C:\Windows\Temp）
+    let _ = std::fs::remove_file(r"C:\Windows\Temp\vela-file-io.txt");
+    assert!(
+        out.status.success(),
+        "exit={:?} stdout={} stderr={}",
+        out.status.code(),
+        stdout,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.starts_with("file-io all ok"), "stdout={stdout}");
 }

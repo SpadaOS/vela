@@ -63,6 +63,13 @@ zig cc -target x86_64-linux-musl -fPIE -pie -O2 -o guest/hello-musl guest/src/he
 
 Linux/WSL 上等价命令：`musl-gcc -static-pie -O2 -o guest/hello-musl guest/src/hello-musl.c`。
 
+## `file-io`（0.0.2 M1 出口，文件 syscall 全链路验收）
+
+静态 musl C 程序，验收 `open/write/lseek/read/fstat/stat/fcntl/opendir
+(getdents64)/getcwd` 全链路（源码 `src/file-io.c`，编译命令同上）。在
+`/mnt/c/Windows/Temp` 内创建、回读、遍历并清理验收文件；全链路通过输出
+`file-io all ok`。依赖 TLS（musl），仅 FSGSBASE 机器可跑；集成测试自动跳过。
+
 ## 禁止
 
 - 用 MinGW 编出来的 PE 当测试（规格 8.3）

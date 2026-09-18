@@ -6,7 +6,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 use crate::file_ops::{self, io_err};
-use crate::{Host, HostError, HostFile, HostOpen, HostPath, HostProt, HostStat, StdioHandles};
+use crate::{Host, HostDir, HostError, HostFile, HostOpen, HostPath, HostProt, HostStat, StdioHandles};
 
 pub struct LinuxDevHost {
     start: Instant,
@@ -58,6 +58,9 @@ impl Host for LinuxDevHost {
 
     fn open(&self, path: &HostPath, opt: HostOpen) -> Result<HostFile, HostError> {
         file_ops::open(path, opt)
+    }
+    fn open_dir(&self, path: &HostPath) -> Result<HostDir, HostError> {
+        file_ops::open_dir(path)
     }
     fn read(&self, f: &HostFile, buf: &mut [u8]) -> Result<usize, HostError> {
         file_ops::read(f, buf)

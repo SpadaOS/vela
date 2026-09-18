@@ -10,7 +10,7 @@ pub use syscalls::dispatch;
 use std::collections::BTreeMap;
 
 use vela_abi as abi;
-use vela_sys::{Host, HostFile, HostError, HostProt};
+use vela_sys::{Host, HostDir, HostFile, HostError, HostProt};
 
 use crate::mem::MemRegistry;
 
@@ -19,6 +19,8 @@ use crate::mem::MemRegistry;
 #[derive(Debug)]
 pub enum GuestFd {
     Host(HostFile),
+    /// 目录快照句柄（O_DIRECTORY 打开；getdents64 消费）。
+    HostDir(HostDir),
     Null,
     Zero,
     Reserved,
@@ -27,6 +29,9 @@ pub enum GuestFd {
 #[derive(Debug, Default)]
 pub struct FdTable {
     table: BTreeMap<i32, GuestFd>,
+    /// 每 fd 的标志记账（fcntl）：bit0 = FD_CLOEXEC，bits 8..24 = status flags
+    /// （O_APPEND/O_NONBLOCK/O_ACCMODE），其余保留。
+    flags: BTreeMap<i32, u32>,
 }
 
 impl FdTable {
@@ -40,7 +45,12 @@ impl FdTable {
         t.insert(0, GuestFd::Host(s.stdin));
         t.insert(1, GuestFd::Host(s.stdout));
         t.insert(2, GuestFd::Host(s.stderr));
-        FdTable { table: t }
+        // Linux stdio 以 O_RDWR 打开字符设备
+        let mut f = FdTable { table: t, flags: BTreeMap::new() };
+        for fd in 0..3 {
+            f.flags.insert(fd, (abi::O_RDWR as u32) << 8);
+        }
+        f
     }
 
     pub fn get(&self, fd: i32) -> Option<&GuestFd> {
@@ -48,6 +58,7 @@ impl FdTable {
     }
 
     pub fn remove(&mut self, fd: i32) -> Option<GuestFd> {
+        self.flags.remove(&fd);
         self.table.remove(&fd)
     }
 
@@ -59,6 +70,21 @@ impl FdTable {
         }
         self.table.insert(fd, entry);
         fd
+    }
+
+    /// 记账 fd 标志（open 时记录客户传入 flags 的编码）。
+    pub fn set_flags(&mut self, fd: i32, v: u32) {
+        self.flags.insert(fd, v);
+    }
+
+    pub fn get_flags(&self, fd: i32) -> Option<u32> {
+        self.flags.get(&fd).copied()
+    }
+
+    /// 更新 flags（F_SETFL/F_SETFD）；未记账的 fd 以 0 起始。
+    pub fn update_flags(&mut self, fd: i32, f: impl FnOnce(u32) -> u32) {
+        let v = self.flags.entry(fd).or_insert(0);
+        *v = f(*v);
     }
 }
 
@@ -187,6 +213,7 @@ pub fn host_err_to_errno(e: &HostError) -> i32 {
         HostError::Access => abi::EACCES,
         HostError::Invalid => abi::EINVAL,
         HostError::NoMemory => abi::ENOMEM,
+        HostError::Exist => abi::EEXIST,
         HostError::Unimplemented => abi::ENOSYS,
         HostError::Other(c) => *c,
     }

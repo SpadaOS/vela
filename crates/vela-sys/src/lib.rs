@@ -2,7 +2,7 @@
 //! 所有宿主差异（windows / linux_dev / spadaos）收敛在本 crate；
 //! vela-runtime 及以上禁止出现 `cfg(target_os)` 与宿主类型（规格 2.4）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 // ---------------------------------------------------------------- 保护位
@@ -41,6 +41,8 @@ pub struct HostOpen {
     pub read: bool,
     pub write: bool,
     pub create: bool,
+    /// O_EXCL：与 create 同用时新文件必须不存在（create_new 语义）。
+    pub excl: bool,
     pub truncate: bool,
     pub append: bool,
 }
@@ -61,6 +63,52 @@ pub enum HostFileKind {
     StdErr,
     /// 打开时记录宿主路径：fstat 需要稳定的 ino（路径哈希），std::fs::File 不携带路径。
     Disk { file: std::fs::File, path: PathBuf },
+}
+
+// ---------------------------------------------------------------- 目录遍历
+
+/// 目录条目（getdents64 组装用）。
+#[derive(Clone, Debug)]
+pub struct HostDirEntry {
+    pub name: String,
+    pub is_dir: bool,
+    /// 与 stat 同源（路径哈希），保证 stat/getdents 一致。
+    pub ino: u64,
+}
+
+/// 目录遍历句柄：open_dir 时对目录做一次性快照（按名称排序，保证确定性），
+/// peek/advance 逐条消费。0.0.2 快照语义：不感知遍历期间的目录变化。
+#[derive(Debug)]
+pub struct HostDir {
+    path: PathBuf,
+    queue: std::sync::Mutex<std::collections::VecDeque<HostDirEntry>>,
+}
+
+impl HostDir {
+    /// 测试与宿主实现共用构造。
+    pub fn from_parts(path: PathBuf, entries: Vec<HostDirEntry>) -> HostDir {
+        HostDir { path, queue: std::sync::Mutex::new(entries.into()) }
+    }
+
+    /// 宿主目录路径（openat dirfd 相对路径解析用）。
+    pub fn host_path(&self) -> &Path {
+        &self.path
+    }
+
+    /// 窥视下一条（不消费）；None = 目录读完。
+    pub fn peek(&self) -> Result<Option<HostDirEntry>, HostError> {
+        match self.queue.lock() {
+            Ok(g) => Ok(g.front().cloned()),
+            Err(p) => Ok(p.into_inner().front().cloned()),
+        }
+    }
+
+    /// 消费当前条目（必须先 peek 成功）。
+    pub fn advance(&self) {
+        if let Ok(mut g) = self.queue.lock() {
+            g.pop_front();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -118,6 +166,8 @@ pub enum HostError {
     Access,
     Invalid,
     NoMemory,
+    /// 文件已存在（O_EXCL create_new 冲突）。
+    Exist,
     Unimplemented,
     Other(i32),
 }
@@ -129,6 +179,7 @@ impl std::fmt::Display for HostError {
             HostError::Access => write!(f, "access denied"),
             HostError::Invalid => write!(f, "invalid argument"),
             HostError::NoMemory => write!(f, "out of memory"),
+            HostError::Exist => write!(f, "file exists"),
             HostError::Unimplemented => write!(f, "unimplemented on this host"),
             HostError::Other(e) => write!(f, "host error {e}"),
         }
@@ -148,6 +199,8 @@ pub trait Host: Send + Sync + 'static {
     unsafe fn unmap(&self, addr: usize, len: usize) -> Result<(), HostError>;
 
     fn open(&self, path: &HostPath, opt: HostOpen) -> Result<HostFile, HostError>;
+    /// 打开目录做快照遍历（O_DIRECTORY 语义）。
+    fn open_dir(&self, path: &HostPath) -> Result<HostDir, HostError>;
     fn read(&self, f: &HostFile, buf: &mut [u8]) -> Result<usize, HostError>;
     fn write(&self, f: &HostFile, buf: &[u8]) -> Result<usize, HostError>;
     fn seek(&self, f: &HostFile, off: i64, whence: i32) -> Result<u64, HostError>;

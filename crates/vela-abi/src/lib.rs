@@ -28,6 +28,7 @@ pub const SYS_ARCH_PRCTL: u64 = 158;
 pub const SYS_EXIT_GROUP: u64 = 231;
 pub const SYS_OPENAT: u64 = 257;
 pub const SYS_NEWFSTATAT: u64 = 262;
+pub const SYS_GETDENTS64: u64 = 217;
 pub const SYS_SET_TID_ADDRESS: u64 = 218;
 pub const SYS_SET_ROBUST_LIST: u64 = 273;
 pub const SYS_CLOCK_GETTIME: u64 = 228;
@@ -42,6 +43,7 @@ pub const EACCES: i32 = 13;
 pub const EFAULT: i32 = 14;
 pub const EEXIST: i32 = 17;
 pub const ENOTDIR: i32 = 20;
+pub const EISDIR: i32 = 21;
 pub const EINVAL: i32 = 22;
 pub const ENOTTY: i32 = 25;
 pub const ESPIPE: i32 = 29;
@@ -72,7 +74,28 @@ pub const O_CREAT: u64 = 0x40;
 pub const O_EXCL: u64 = 0x80;
 pub const O_TRUNC: u64 = 0x200;
 pub const O_APPEND: u64 = 0x400;
+pub const O_NONBLOCK: u64 = 0x800;
+pub const O_DIRECTORY: u64 = 0x10000;
 pub const O_CLOEXEC: u64 = 0x80000;
+
+// ---------------------------------------------------------------- fcntl / ioctl
+
+/// fcntl cmd（x86_64 F_* 值）。
+pub const F_GETFD: u64 = 1;
+pub const F_SETFD: u64 = 2;
+pub const F_GETFL: u64 = 3;
+pub const F_SETFL: u64 = 4;
+pub const FD_CLOEXEC: u64 = 1;
+
+/// ioctl 请求（x86_64 tty 相关）。
+pub const TCGETS: u64 = 0x5401;
+pub const TCSETS: u64 = 0x5402;
+pub const TIOCGWINSZ: u64 = 0x5413;
+
+/// linux_dirent64 d_type。
+pub const DT_UNKNOWN: u8 = 0;
+pub const DT_DIR: u8 = 4;
+pub const DT_REG: u8 = 8;
 
 pub const AT_FDCWD: i32 = -100;
 pub const AT_EMPTY_PATH: u64 = 0x1000;
@@ -194,6 +217,7 @@ pub fn syscall_name(nr: u64) -> &'static str {
         SYS_EXIT_GROUP => "exit_group",
         SYS_OPENAT => "openat",
         SYS_NEWFSTATAT => "newfstatat",
+        SYS_GETDENTS64 => "getdents64",
         SYS_SET_TID_ADDRESS => "set_tid_address",
         SYS_SET_ROBUST_LIST => "set_robust_list",
         SYS_CLOCK_GETTIME => "clock_gettime",

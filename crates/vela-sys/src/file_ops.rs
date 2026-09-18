@@ -2,13 +2,14 @@
 
 use std::time::Instant;
 
-use crate::{HostError, HostFile, HostFileKind, HostOpen, HostPath, HostStat, StdioHandles};
+use crate::{HostDir, HostDirEntry, HostError, HostFile, HostFileKind, HostOpen, HostPath, HostStat, StdioHandles};
 
 pub(crate) fn io_err(e: &std::io::Error) -> HostError {
     match e.kind() {
         std::io::ErrorKind::NotFound => HostError::NotFound,
         std::io::ErrorKind::PermissionDenied => HostError::Access,
         std::io::ErrorKind::InvalidInput => HostError::Invalid,
+        std::io::ErrorKind::AlreadyExists => HostError::Exist,
         _ => HostError::Other(e.raw_os_error().unwrap_or(0)),
     }
 }
@@ -25,7 +26,9 @@ pub(crate) fn open(path: &HostPath, opt: HostOpen) -> Result<HostFile, HostError
         o.append(true);
         o.write(true);
     }
-    if opt.create {
+    if opt.create && opt.excl {
+        o.create_new(true);
+    } else if opt.create {
         o.create(true);
     }
     if opt.truncate {
@@ -34,6 +37,23 @@ pub(crate) fn open(path: &HostPath, opt: HostOpen) -> Result<HostFile, HostError
     }
     let f = o.open(&path.0).map_err(|e| io_err(&e))?;
     Ok(HostFile(HostFileKind::Disk { file: f, path: path.0.clone() }))
+}
+
+/// 目录快照遍历：一次读全目录，按名称排序（确定性，getdents64 输出可测）。
+pub(crate) fn open_dir(path: &HostPath) -> Result<HostDir, HostError> {
+    let rd = std::fs::read_dir(&path.0).map_err(|e| io_err(&e))?;
+    let mut v: Vec<HostDirEntry> = Vec::new();
+    for e in rd {
+        let e = e.map_err(|e| io_err(&e))?;
+        let md = e.metadata().map_err(|e| io_err(&e))?;
+        v.push(HostDirEntry {
+            name: e.file_name().to_string_lossy().into_owned(),
+            is_dir: md.is_dir(),
+            ino: path_ino(&e.path()),
+        });
+    }
+    v.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(HostDir::from_parts(path.0.clone(), v))
 }
 
 pub(crate) fn read(f: &HostFile, buf: &mut [u8]) -> Result<usize, HostError> {

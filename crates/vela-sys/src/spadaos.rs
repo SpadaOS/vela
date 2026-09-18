@@ -2,7 +2,7 @@
 //! 未来在 SpadaOS 上把 map/file/time/thread/futex 五组填满（规格 13）。
 //! 任何方法被调用即返回 `Unimplemented`。
 
-use crate::{Host, HostError, HostFile, HostFileKind, HostOpen, HostPath, HostProt, HostStat, StdioHandles};
+use crate::{Host, HostDir, HostError, HostFile, HostFileKind, HostOpen, HostPath, HostProt, HostStat, StdioHandles};
 
 /// 占位实现：所有方法返回 Unimplemented。
 pub struct SpadaOsHost;
@@ -30,6 +30,9 @@ impl Host for SpadaOsHost {
         Err(HostError::Unimplemented)
     }
     fn open(&self, _path: &HostPath, _opt: HostOpen) -> Result<HostFile, HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn open_dir(&self, _path: &HostPath) -> Result<HostDir, HostError> {
         Err(HostError::Unimplemented)
     }
     fn read(&self, _f: &HostFile, _buf: &mut [u8]) -> Result<usize, HostError> {
