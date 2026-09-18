@@ -1,0 +1,29 @@
+[package]
+name = "vela-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vela"
+path = "src/main.rs"
+
+# 开发工具：生成最小合法 Linux 静态 PIE ELF（规格 8.1 允许的生成器路径）
+[[bin]]
+name = "vela-mkhello"
+path = "src/bin/mkhello.rs"
+
+# 开发工具：生成综合压测 guest（torture：无 TLS；tls：验证 wrfsbase）
+[[bin]]
+name = "vela-mkguest"
+path = "src/bin/mkguest.rs"
+
+[dependencies]
+vela-abi = { path = "../vela-abi" }
+vela-sys = { path = "../vela-sys" }
+vela-loader = { path = "../vela-loader" }
+vela-runtime = { path = "../vela-runtime" }
+vela-fs = { path = "../vela-fs" }
+
+[dev-dependencies]
+vela-sys = { path = "../vela-sys" }
