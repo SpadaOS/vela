@@ -49,6 +49,16 @@ sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
 # 固化 config（非交互应答全部默认）
 yes "" | make oldconfig HOSTCC=gcc >/dev/null 2>&1 || true
 
+# 显式强制生成 include/autoconf.h + include/config/auto.conf。
+# CI 实测：主 make 会跳过 autoconf.h 生成规则（Makefile:521，本地不复现），
+# 导致编译 -include include/autoconf.h 报 FileNotFound。silentoldconfig
+# 匹配 %config 目标（Makefile:409），直接调用可绕过主 make 的规则判定。
+rm -f include/autoconf.h
+rm -rf include/config
+make silentoldconfig HOSTCC=gcc
+test -f include/autoconf.h || { echo "FATAL: include/autoconf.h not generated"; exit 1; }
+test -f include/config/auto.conf || { echo "FATAL: include/config/auto.conf not generated"; exit 1; }
+
 # zig cc musl 默认静态；-fPIE -pie 生成 ET_DYN（vela 仅接受 PIE）。
 # -j1：规避多 zig 进程共享缓存的 Windows 竞争；V=1：失败时日志有完整命令。
 make V=1 -j1 \
