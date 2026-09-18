@@ -33,7 +33,7 @@ jobs:
       - name: Setup zig (busybox build)
         uses: mlugg/setup-zig@v1
         with:
-          version: 0.13.0
+          version: 0.14.1
       - name: Setup msys2 (make/gcc/bzip2 for busybox)
         uses: msys2/setup-msys2@v2
         with:

@@ -31,8 +31,10 @@ sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
 # 固化 config（非交互应答全部默认）
 yes "" | make oldconfig HOSTCC=gcc >/dev/null 2>&1 || true
 
-# zig cc musl 默认静态；-fPIE -pie 生成 ET_DYN（vela 仅接受 PIE）
-make -j4 \
+# zig cc musl 默认静态；-fPIE -pie 生成 ET_DYN（vela 仅接受 PIE）。
+# -j1：多 zig 进程共享缓存目录在 Windows 上有竞争（FileNotFound），串行规避；
+# V=1：失败时日志可看到完整编译命令。
+make V=1 -j1 \
   CC="zig cc -target x86_64-linux-musl -fPIE -pie" \
   HOSTCC=gcc
 
