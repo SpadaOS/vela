@@ -152,6 +152,20 @@ fn run_elf(elf_path: &str, guest_argv: &[String]) -> Result<std::convert::Infall
 
     #[cfg(windows)]
     {
+        // 预切 FS：进入客户前把当前线程 FS 基址切到一张**已映射**的客户占位页，
+        // 让内核从进程一开始就保存/恢复「客户侧」基址（消除还原为陈旧宿主值
+        // 的可能）。占位页取堆前 4KiB（已 RW 且登记），初始全零——即便内核在
+        // arch_prctl 之前发生一次 fs 解引用也只是读到 0，不会 AV；arch_prctl
+        // (SET_FS) 后由 trampoline 切到真实 TLS 区。
+        let heap_start = proc.heap.map(|h| h.start);
+        if vela_sys::windows::fs_base_supported() {
+            if let Some(hs) = heap_start {
+                let _ = vela_sys::windows::set_thread_fs_base_now(hs);
+                if logx::enabled() {
+                    eprintln!("[vela] fs preset → {hs:#x}");
+                }
+            }
+        }
         let state = Box::new(GuestState { proc, host });
         let ptr = Box::into_raw(state);
         GUEST.store(ptr, Ordering::Relaxed);
@@ -162,13 +176,6 @@ fn run_elf(elf_path: &str, guest_argv: &[String]) -> Result<std::convert::Infall
         if let Err(e) = install_syscall_trap() {
             eprintln!("vela: failed to install exception trap: {e}");
             return Err(1);
-        }
-        // 预切 FS：进入客户前把当前线程 FS 基址切到客户 TLS 占位页（0x1000），
-        // 让内核从进程一开始就保存/恢复「客户侧」基址；arch_prctl(SET_FS) 后
-        // 由 trampoline 改成真实 TLS 区。占位页不映射，但在首次 arch_prctl 前
-        // musl 不会经 fs 解引用（crt1 先 SET_FS 再碰 TLS），故安全。
-        if vela_sys::windows::fs_base_supported() {
-            let _ = vela_sys::windows::set_thread_fs_base_now(0x1000);
         }
         // SAFETY: 客户映像、堆、栈均已映射且登记；本调用不返回
         unsafe { guest_start::enter_guest(entry, rsp) }
