@@ -16,7 +16,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --workspace --verbose
+      - name: Generate guest images (no prebuilt binaries, PLAN-0.0.2 T4.2)
+        run: |
+          cargo run -p vela-cli --bin vela-mkhello -- guest/hello
+          cargo run -p vela-cli --bin vela-mkguest -- torture guest/torture
+          cargo run -p vela-cli --bin vela-mkguest -- tls guest/tls
       - name: Run tests
         run: cargo test --workspace --verbose
-      - name: Run guest acceptance (spec 9.4)
-        run: cargo run -p vela-cli --bin vela -- run guest/hello
+      - name: Guest acceptance (spec 9.4, freshly generated images)
+        run: |
+          cargo run -p vela-cli --bin vela -- run guest/hello
+          cargo run -p vela-cli --bin vela -- run guest/torture
+      - name: Doctor report (informational)
+        run: cargo run -p vela-cli --bin vela -- doctor

@@ -4,11 +4,11 @@ version = 4
 
 [[package]]
 name = "vela-abi"
-version = "0.0.1"
+version = "0.0.2"
 
 [[package]]
 name = "vela-cli"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "vela-abi",
  "vela-fs",
@@ -19,11 +19,11 @@ dependencies = [
 
 [[package]]
 name = "vela-fs"
-version = "0.0.1"
+version = "0.0.2"
 
 [[package]]
 name = "vela-loader"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "vela-runtime",
  "vela-sys",
@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "vela-runtime"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "vela-abi",
  "vela-fs",
@@ -40,4 +40,4 @@ dependencies = [
 
 [[package]]
 name = "vela-sys"
-version = "0.0.1"
+version = "0.0.2"

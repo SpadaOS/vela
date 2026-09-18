@@ -56,6 +56,7 @@ fn real_main() -> i32 {
             0
         }
         Some("run") => cmd_run(&args[1..]),
+        Some("doctor") => cmd_doctor(),
         Some(other) => {
             eprintln!("vela: unknown command '{other}'");
             print_usage();
@@ -174,6 +175,41 @@ fn usage_err(msg: &str) -> i32 {
     eprintln!("vela: {msg}");
     print_usage();
     2
+}
+
+/// 环境自检（PLAN-0.0.2 T4.3）：排障入口，报告宿主能力与常见问题。
+fn cmd_doctor() -> i32 {
+    println!("vela doctor");
+    println!("  version      : {}", env!("CARGO_PKG_VERSION"));
+    println!("  host         : {} ({})", std::env::consts::OS, std::env::consts::ARCH);
+
+    // TLS 能力：musl/glibc 等依赖 FS 的程序的硬前提
+    #[cfg(windows)]
+    {
+        let fs_ok = vela_sys::windows::probe_fs_base_support();
+        println!("  FSGSBASE     : {}", if fs_ok { "available (guest TLS works)" } else { "UNAVAILABLE — TLS-dependent guests (musl/glibc) cannot run here" });
+        if !fs_ok {
+            println!("                 (typical on Hyper-V / cloud VMs / VBS; see docs/DESIGN.md TLS/FS)");
+        }
+    }
+
+    // 路径映射约定
+    println!("  path mapping : default /mnt/c -> C:\\; override with --root <dir> / --map <g>=<h>");
+
+    // 杀软提示（README 安全节）：进程内改可执行内存可能被拦截
+    println!("  antivirus    : if guests are blocked, exclude vela.exe (Vela patches syscall in-process; no packing/obfuscation)");
+
+    // guest 产物
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    for g in ["hello", "hello-musl", "torture", "tls", "file-io"] {
+        let p = std::path::Path::new(manifest).join(format!("../../guest/{g}"));
+        let mark = if p.exists() { "ok" } else { "missing (generators: vela-mkhello/vela-mkguest, see guest/README.md)" };
+        println!("  guest/{g:<9} : {mark}");
+    }
+
+    // 内存资源
+    println!("  limits       : --stack-mb/--heap-mb adjustable (default 8/8 MiB)");
+    0
 }
 
 /// 组装客户环境块：默认继承宿主全部环境变量，再应用 --env（K=V 覆盖/追加，K= 删除）。

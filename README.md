@@ -30,14 +30,15 @@ Linux x86_64 静态 PIE 二进制，拦截 `syscall` 指令，把 Linux 语义�
 
 ## 能跑什么、不能跑什么
 
-**能跑**（v0.0.1 实测）：
+**能跑**（v0.0.2 实测）：
 
 - 静态 musl C 程序 / 无 libc 汇编程序的 Linux x86_64 静态 PIE（`ET_DYN`、无 `PT_INTERP`）
-- 白名单 syscall：`write` / `writev` / `read` / `open` / `openat` / `close` /
-  `lseek` / `mmap`(匿名) / `mprotect` / `munmap` / `brk` / `uname` /
-  `arch_prctl`(TLS) / `getrandom` / `clock_gettime` / `gettimeofday` / `getpid` 等
-- 客户 TLS 真正可用（wrfsbase + trampoline，见 [docs/DESIGN.md](docs/DESIGN.md)）
-- 未实现 syscall 返回 Linux 风格 `-ENOSYS`
+- 文件系统：open/openat、read/write/writev、stat/fstat/lstat/newfstatat、
+  lseek、getdents64、getcwd/chdir、fcntl 最小集、mmap(匿名)/mprotect/munmap/brk
+- 进程环境：argv/envp 传递（默认继承宿主）、auxv 完整、getuid 系
+- 杂项：uname、arch_prctl(TLS)、getrandom、clock_gettime/gettimeofday、getpid、
+  ioctl(TIOCGWINSZ stub)；未实现 syscall 返回 Linux 风格 `-ENOSYS`
+- 完整兼容矩阵见 [docs/SYSCALLS.md](docs/SYSCALLS.md)
 
 **不能跑**：
 
@@ -61,10 +62,18 @@ cargo build -p vela-cli --release
 .\target\release\vela.exe run guest\hello
 # hello from linux elf
 
-# 静态 musl C hello（863KB，未修改源码）
+# 静态 musl C hello（文件 IO 全链路验收见 guest\file-io）
 .\target\release\vela.exe run guest\hello-musl
 # hello from musl
+
+# 常用选项
+.\target\release\vela.exe run --root <dir> guest\prog   # 把宿主目录挂为客户根 /
+.\target\release\vela.exe run --map /data=E:\data guest\prog
+.\target\release\vela.exe run --env K=V --uid 1000 --stack-mb 8 --heap-mb 8 guest\prog
+.\target\release\vela.exe doctor                        # 环境自检（FSGSBASE 等）
 ```
+
+环境自检：`vela doctor` 报告 FSGSBASE/路径映射/guest 产物状态。
 
 日志：`VELA_LOG=1` 或 `-v` 在 stderr 打印 syscall 记录；默认安静，只让客户
 stdout 出来。退出码：客户 `exit` 的码；文件缺失 127；ELF 格式错误 1。
@@ -127,9 +136,12 @@ Linux 程序与 `vela.exe` 同进程、同权限，可访问用户能访问的�
 
 ## 路线
 
-- v0.x：补全 musl 常用 syscall（fstat/stat）、busybox 静态子集
+- v0.0.2（当前）：musl 文件 IO 全链路（stat 家族/getdents64/fcntl）、路径映射
+  表（--root/--map）、envp/auxv、健壮性（errno 传播/strace 日志/崩溃规范化）
+- v0.x：busybox 静态子集、mmap 文件映射、信号 stub 补全
 - v1：SpadaOS Host 填满（map/file/time/thread/futex 五组）、外部 X server 通路
-- 设计细节与决策记录见 [docs/DESIGN.md](docs/DESIGN.md)
+- 设计细节与决策记录见 [docs/DESIGN.md](docs/DESIGN.md)，版本计划见
+  [docs/plans/](docs/plans/)
 
 ## 许可
 
