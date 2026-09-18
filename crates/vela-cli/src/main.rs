@@ -14,10 +14,12 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use vela_loader as loader;
 use vela_runtime::GuestProcess;
 
-#[cfg(windows)]
-use vela_sys::windows::{add_guest_exec_range, install_syscall_trap, set_console_utf8, set_trap_fn, WindowsHost};
 #[cfg(target_os = "linux")]
 use vela_sys::linux_dev::LinuxDevHost;
+#[cfg(windows)]
+use vela_sys::windows::{
+    add_guest_exec_range, install_syscall_trap, set_console_utf8, set_trap_fn, WindowsHost,
+};
 
 #[cfg(windows)]
 type PlatformHost = WindowsHost;
@@ -111,22 +113,30 @@ fn cmd_run(rest: &[String]) -> i32 {
         match a {
             "-v" => opts.verbose = true,
             "--root" => {
-                let Some(v) = rest.get(i + 1) else { return usage_err("--root 需要参数") };
+                let Some(v) = rest.get(i + 1) else {
+                    return usage_err("--root 需要参数");
+                };
                 opts.root = Some(v.clone());
                 i += 1;
             }
             "--map" => {
-                let Some(v) = rest.get(i + 1) else { return usage_err("--map 需要参数") };
+                let Some(v) = rest.get(i + 1) else {
+                    return usage_err("--map 需要参数");
+                };
                 opts.maps.push(v.clone());
                 i += 1;
             }
             "--env" => {
-                let Some(v) = rest.get(i + 1) else { return usage_err("--env 需要参数") };
+                let Some(v) = rest.get(i + 1) else {
+                    return usage_err("--env 需要参数");
+                };
                 opts.envs.push(v.clone());
                 i += 1;
             }
             "--uid" | "--gid" | "--stack-mb" | "--heap-mb" => {
-                let Some(v) = rest.get(i + 1) else { return usage_err(&format!("{a} 需要参数")) };
+                let Some(v) = rest.get(i + 1) else {
+                    return usage_err(&format!("{a} 需要参数"));
+                };
                 let n: u64 = match v.parse() {
                     Ok(n) => n,
                     Err(_) => return usage_err(&format!("{a} 需要非负整数")),
@@ -181,13 +191,24 @@ fn usage_err(msg: &str) -> i32 {
 fn cmd_doctor() -> i32 {
     println!("vela doctor");
     println!("  version      : {}", env!("CARGO_PKG_VERSION"));
-    println!("  host         : {} ({})", std::env::consts::OS, std::env::consts::ARCH);
+    println!(
+        "  host         : {} ({})",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
 
     // TLS 能力：musl/glibc 等依赖 FS 的程序的硬前提
     #[cfg(windows)]
     {
         let fs_ok = vela_sys::windows::probe_fs_base_support();
-        println!("  FSGSBASE     : {}", if fs_ok { "available (guest TLS works)" } else { "UNAVAILABLE — TLS-dependent guests (musl/glibc) cannot run here" });
+        println!(
+            "  FSGSBASE     : {}",
+            if fs_ok {
+                "available (guest TLS works)"
+            } else {
+                "UNAVAILABLE — TLS-dependent guests (musl/glibc) cannot run here"
+            }
+        );
         if !fs_ok {
             println!("                 (typical on Hyper-V / cloud VMs / VBS; see docs/DESIGN.md TLS/FS)");
         }
@@ -201,10 +222,14 @@ fn cmd_doctor() -> i32 {
 
     // guest 产物
     let manifest = env!("CARGO_MANIFEST_DIR");
-    for g in ["hello", "hello-musl", "torture", "tls", "file-io"] {
-        let p = std::path::Path::new(manifest).join(format!("../../guest/{g}"));
-        let mark = if p.exists() { "ok" } else { "missing (generators: vela-mkhello/vela-mkguest, see guest/README.md)" };
-        println!("  guest/{g:<9} : {mark}");
+    for g in ["hello", "hello-musl", "torture", "tls", "file-io", "bench"] {
+        let p = std::path::Path::new(manifest).join(format!("../../guest/bin/{g}"));
+        let mark = if p.exists() {
+            "ok"
+        } else {
+            "missing (generators: vela-mkhello/vela-mkguest, see guest/README.md)"
+        };
+        println!("  guest/bin/{g:<9} : {mark}");
     }
 
     // 内存资源
@@ -233,7 +258,11 @@ fn build_envp(envs: &[String]) -> Vec<String> {
     list.into_iter().map(|(k, v)| format!("{k}={v}")).collect()
 }
 
-fn run_elf(elf_path: &str, guest_argv: &[String], opts: &RunOpts) -> Result<std::convert::Infallible, i32> {
+fn run_elf(
+    elf_path: &str,
+    guest_argv: &[String],
+    opts: &RunOpts,
+) -> Result<std::convert::Infallible, i32> {
     let bytes = match std::fs::read(elf_path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -294,19 +323,23 @@ fn run_elf(elf_path: &str, guest_argv: &[String], opts: &RunOpts) -> Result<std:
         proc.gid = g;
     }
     // 堆是 brk 的后端，失败即无法继续（T3.4：warn-继续改为 fatal）
-    if proc.init_heap(&host, 0, opts.heap_mb * 1024 * 1024).is_err() {
+    if proc
+        .init_heap(&host, 0, opts.heap_mb * 1024 * 1024)
+        .is_err()
+    {
         eprintln!("vela: heap init failed");
         return Err(1);
     }
 
     let envp = build_envp(&opts.envs);
-    let (rsp, stack_range) = match guest_start::build_stack(&host, &proc.load, guest_argv, &envp, opts.stack_mb) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("vela: stack setup failed: {e}");
-            return Err(1);
-        }
-    };
+    let (rsp, stack_range) =
+        match guest_start::build_stack(&host, &proc.load, guest_argv, &envp, opts.stack_mb) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("vela: stack setup failed: {e}");
+                return Err(1);
+            }
+        };
     proc.mem.add(stack_range);
 
     let entry = proc.load.entry;
@@ -356,7 +389,12 @@ fn run_elf(elf_path: &str, guest_argv: &[String], opts: &RunOpts) -> Result<std:
 
 /// VEH → dispatch 的桥接（规格 5.3 方法 C）。与客户同线程执行。
 #[cfg(windows)]
-unsafe extern "system" fn trap(nr: u64, args: &[u64; 6], rip: u64, ctx: &mut vela_sys::windows::Context) -> i64 {
+unsafe extern "system" fn trap(
+    nr: u64,
+    args: &[u64; 6],
+    rip: u64,
+    ctx: &mut vela_sys::windows::Context,
+) -> i64 {
     let p = GUEST.load(Ordering::Relaxed);
     if p.is_null() {
         return -(vela_abi::ENOSYS as i64);
@@ -382,7 +420,11 @@ unsafe extern "system" fn trap(nr: u64, args: &[u64; 6], rip: u64, ctx: &mut vel
     }
     let r = vela_runtime::dispatch(&mut st.proc, &st.host, nr, *args);
     if logx::enabled() {
-        eprintln!("[vela] {} = {r} ({:#x})", vela_abi::syscall_name(nr), r as u64);
+        eprintln!(
+            "[vela] {} = {r} ({:#x})",
+            vela_abi::syscall_name(nr),
+            r as u64
+        );
     }
     // 模拟硬件 syscall 固定副作用：Rax=返回值、Rcx=返回地址、R11=RFLAGS、Rip+=2
     ctx.rax = r as u64;

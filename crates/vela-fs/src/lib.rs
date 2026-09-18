@@ -28,7 +28,8 @@ impl FsMap {
     /// v0 兼容映射：`/mnt/c` → `C:\`。
     pub fn legacy() -> FsMap {
         let mut m = FsMap { maps: Vec::new() };
-        m.add("/mnt/c", std::path::Path::new(r"C:\")).expect("legacy map is valid");
+        m.add("/mnt/c", std::path::Path::new(r"C:\"))
+            .expect("legacy map is valid");
         m
     }
 
@@ -45,10 +46,17 @@ impl FsMap {
         if !host_dir.is_absolute() {
             return Err("host dir must be absolute".to_string());
         }
-        let guest = if comps.is_empty() { String::new() } else { format!("/{}", comps.join("/")) };
+        let guest = if comps.is_empty() {
+            String::new()
+        } else {
+            format!("/{}", comps.join("/"))
+        };
         // 长前缀优先：插入后按长度降序排（根 "/" 空串兜底在最后）
-        self.maps.push(Map { guest, host: host_dir.to_path_buf() });
-        self.maps.sort_by(|a, b| b.guest.len().cmp(&a.guest.len()));
+        self.maps.push(Map {
+            guest,
+            host: host_dir.to_path_buf(),
+        });
+        self.maps.sort_by_key(|m| std::cmp::Reverse(m.guest.len()));
         Ok(())
     }
 
@@ -89,8 +97,7 @@ impl FsMap {
             if norm == g {
                 return Some(m.host.clone());
             }
-            if norm.starts_with(g) {
-                let rest = &norm[g.len()..];
+            if let Some(rest) = norm.strip_prefix(g) {
                 if rest.starts_with('/') {
                     let mut out = m.host.clone();
                     for c in rest.split('/').filter(|c| !c.is_empty()) {
@@ -152,7 +159,10 @@ mod tests {
 
     #[test]
     fn mnt_c_prefix() {
-        assert_eq!(translate("/mnt/c/Users/foo"), Some(PathBuf::from(r"C:\Users\foo")));
+        assert_eq!(
+            translate("/mnt/c/Users/foo"),
+            Some(PathBuf::from(r"C:\Users\foo"))
+        );
         assert_eq!(translate("/mnt/c"), Some(PathBuf::from(r"C:\")));
         assert_eq!(translate("/mnt/c/"), Some(PathBuf::from(r"C:\")));
     }
@@ -171,17 +181,32 @@ mod tests {
 
     #[test]
     fn normalizes_dots_and_slashes() {
-        assert_eq!(translate("/mnt/c/./Users/./foo"), Some(PathBuf::from(r"C:\Users\foo")));
-        assert_eq!(translate("/mnt/c//Users///foo"), Some(PathBuf::from(r"C:\Users\foo")));
-        assert_eq!(translate("\\mnt\\c\\Users\\foo"), Some(PathBuf::from(r"C:\Users\foo")));
+        assert_eq!(
+            translate("/mnt/c/./Users/./foo"),
+            Some(PathBuf::from(r"C:\Users\foo"))
+        );
+        assert_eq!(
+            translate("/mnt/c//Users///foo"),
+            Some(PathBuf::from(r"C:\Users\foo"))
+        );
+        assert_eq!(
+            translate("\\mnt\\c\\Users\\foo"),
+            Some(PathBuf::from(r"C:\Users\foo"))
+        );
     }
 
     #[test]
     fn root_map_maps_everything() {
         let m = FsMap::root(std::path::Path::new(r"E:\rootfs"));
-        assert_eq!(m.translate("/bin/sh"), Some(PathBuf::from(r"E:\rootfs\bin\sh")));
+        assert_eq!(
+            m.translate("/bin/sh"),
+            Some(PathBuf::from(r"E:\rootfs\bin\sh"))
+        );
         assert_eq!(m.translate("/"), Some(PathBuf::from(r"E:\rootfs")));
-        assert_eq!(m.translate("/etc/passwd"), Some(PathBuf::from(r"E:\rootfs\etc\passwd")));
+        assert_eq!(
+            m.translate("/etc/passwd"),
+            Some(PathBuf::from(r"E:\rootfs\etc\passwd"))
+        );
     }
 
     #[test]
@@ -189,8 +214,14 @@ mod tests {
         let mut m = FsMap::root(std::path::Path::new(r"E:\rootfs"));
         m.add("/tmp", std::path::Path::new(r"C:\Temp")).unwrap();
         assert_eq!(m.translate("/tmp/x"), Some(PathBuf::from(r"C:\Temp\x")));
-        assert_eq!(m.translate("/tmpx/y"), Some(PathBuf::from(r"E:\rootfs\tmpx\y")));
-        assert_eq!(m.translate("/bin/ls"), Some(PathBuf::from(r"E:\rootfs\bin\ls")));
+        assert_eq!(
+            m.translate("/tmpx/y"),
+            Some(PathBuf::from(r"E:\rootfs\tmpx\y"))
+        );
+        assert_eq!(
+            m.translate("/bin/ls"),
+            Some(PathBuf::from(r"E:\rootfs\bin\ls"))
+        );
     }
 
     #[test]
@@ -204,7 +235,13 @@ mod tests {
     fn multi_map_add() {
         let mut m = FsMap::legacy();
         m.add("/data", std::path::Path::new(r"E:\data")).unwrap();
-        assert_eq!(m.translate("/data/a.txt"), Some(PathBuf::from(r"E:\data\a.txt")));
-        assert_eq!(m.translate("/mnt/c/Windows"), Some(PathBuf::from(r"C:\Windows")));
+        assert_eq!(
+            m.translate("/data/a.txt"),
+            Some(PathBuf::from(r"E:\data\a.txt"))
+        );
+        assert_eq!(
+            m.translate("/mnt/c/Windows"),
+            Some(PathBuf::from(r"C:\Windows"))
+        );
     }
 }

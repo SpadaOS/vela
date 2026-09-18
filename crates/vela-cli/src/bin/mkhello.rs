@@ -60,7 +60,7 @@ pub fn build_min_hello() -> Vec<u8> {
     let ph = 0x40;
     e[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
     e[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes()); // p_flags = R|X
-    // p_offset(8)=0 / p_vaddr(16)=0 / p_paddr(24)=0：全零
+                                                            // p_offset(8)=0 / p_vaddr(16)=0 / p_paddr(24)=0：全零
     e[ph + 32..ph + 40].copy_from_slice(&(total as u64).to_le_bytes()); // p_filesz
     e[ph + 40..ph + 48].copy_from_slice(&(total as u64).to_le_bytes()); // p_memsz
     e[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align

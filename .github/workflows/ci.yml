@@ -14,18 +14,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format check (PLAN-0.0.3 T3.5)
+        run: cargo fmt --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace -- -D warnings
       - name: Build
         run: cargo build --workspace --verbose
       - name: Generate guest images (no prebuilt binaries, PLAN-0.0.2 T4.2)
         run: |
-          cargo run -p vela-cli --bin vela-mkhello -- guest/hello
-          cargo run -p vela-cli --bin vela-mkguest -- torture guest/torture
-          cargo run -p vela-cli --bin vela-mkguest -- tls guest/tls
+          cargo run -p vela-cli --bin vela-mkhello -- guest/bin/hello
+          cargo run -p vela-cli --bin vela-mkguest -- torture guest/bin/torture
+          cargo run -p vela-cli --bin vela-mkguest -- tls guest/bin/tls
+          cargo run -p vela-cli --bin vela-mkguest -- bench guest/bin/bench
       - name: Run tests
         run: cargo test --workspace --verbose
       - name: Guest acceptance (spec 9.4, freshly generated images)
         run: |
-          cargo run -p vela-cli --bin vela -- run guest/hello
-          cargo run -p vela-cli --bin vela -- run guest/torture
+          cargo run -p vela-cli --bin vela -- run guest/bin/hello
+          cargo run -p vela-cli --bin vela -- run guest/bin/torture
       - name: Doctor report (informational)
         run: cargo run -p vela-cli --bin vela -- doctor

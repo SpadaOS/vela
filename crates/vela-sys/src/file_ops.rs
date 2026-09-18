@@ -2,7 +2,10 @@
 
 use std::time::Instant;
 
-use crate::{HostDir, HostDirEntry, HostError, HostFile, HostFileKind, HostOpen, HostPath, HostStat, StdioHandles};
+use crate::{
+    HostDir, HostDirEntry, HostError, HostFile, HostFileKind, HostOpen, HostPath, HostStat,
+    StdioHandles,
+};
 
 pub(crate) fn io_err(e: &std::io::Error) -> HostError {
     match e.kind() {
@@ -25,13 +28,13 @@ pub(crate) fn io_err(e: &std::io::Error) -> HostError {
 #[cfg(windows)]
 pub(crate) fn os_to_errno(code: i32) -> i32 {
     match code {
-        4 => 24,    // ERROR_TOO_MANY_OPEN_FILES → EMFILE
+        4 => 24,       // ERROR_TOO_MANY_OPEN_FILES → EMFILE
         32 | 33 => 11, // SHARING_VIOLATION / LOCK_VIOLATION → EAGAIN
-        36 => 36,   // ERROR_FILENAME_EXCED_RANGE → ENAMETOOLONG
-        112 => 28,  // ERROR_DISK_FULL → ENOSPC
-        145 => 39,  // ERROR_DIR_NOT_EMPTY → ENOTEMPTY
-        206 => 36,  // ERROR_META_EXPANSION_TOO_LONG → ENAMETOOLONG
-        _ => 22,    // 未知 → EINVAL（注释见上）
+        36 => 36,      // ERROR_FILENAME_EXCED_RANGE → ENAMETOOLONG
+        112 => 28,     // ERROR_DISK_FULL → ENOSPC
+        145 => 39,     // ERROR_DIR_NOT_EMPTY → ENOTEMPTY
+        206 => 36,     // ERROR_META_EXPANSION_TOO_LONG → ENAMETOOLONG
+        _ => 22,       // 未知 → EINVAL（注释见上）
     }
 }
 
@@ -62,7 +65,10 @@ pub(crate) fn open(path: &HostPath, opt: HostOpen) -> Result<HostFile, HostError
         o.truncate(true);
     }
     let f = o.open(&path.0).map_err(|e| io_err(&e))?;
-    Ok(HostFile(HostFileKind::Disk { file: f, path: path.0.clone() }))
+    Ok(HostFile(HostFileKind::Disk {
+        file: f,
+        path: path.0.clone(),
+    }))
 }
 
 /// 目录快照遍历：一次读全目录，按名称排序（确定性，getdents64 输出可测）。
@@ -87,7 +93,11 @@ pub(crate) fn mkdir(path: &HostPath) -> Result<(), HostError> {
 }
 
 pub(crate) fn remove(path: &HostPath, dir: bool) -> Result<(), HostError> {
-    let r = if dir { std::fs::remove_dir(&path.0) } else { std::fs::remove_file(&path.0) };
+    let r = if dir {
+        std::fs::remove_dir(&path.0)
+    } else {
+        std::fs::remove_file(&path.0)
+    };
     r.map_err(|e| io_err(&e))
 }
 
@@ -113,7 +123,10 @@ pub(crate) fn dup_file(f: &HostFile) -> Result<HostFile, HostError> {
     match &f.0 {
         HostFileKind::Disk { file, path } => {
             let nf = file.try_clone().map_err(|e| io_err(&e))?;
-            Ok(HostFile(HostFileKind::Disk { file: nf, path: path.clone() }))
+            Ok(HostFile(HostFileKind::Disk {
+                file: nf,
+                path: path.clone(),
+            }))
         }
         _ => Ok(HostFile(f.0.clone_kind())),
     }
@@ -131,9 +144,18 @@ pub(crate) fn read(f: &HostFile, buf: &mut [u8]) -> Result<usize, HostError> {
 pub(crate) fn write(f: &HostFile, buf: &[u8]) -> Result<usize, HostError> {
     use std::io::Write;
     match &f.0 {
-        HostFileKind::StdOut => std::io::stdout().write_all(buf).map(|_| buf.len()).map_err(|e| io_err(&e)),
-        HostFileKind::StdErr => std::io::stderr().write_all(buf).map(|_| buf.len()).map_err(|e| io_err(&e)),
-        HostFileKind::Disk { file, .. } => (&*file).write_all(buf).map(|_| buf.len()).map_err(|e| io_err(&e)),
+        HostFileKind::StdOut => std::io::stdout()
+            .write_all(buf)
+            .map(|_| buf.len())
+            .map_err(|e| io_err(&e)),
+        HostFileKind::StdErr => std::io::stderr()
+            .write_all(buf)
+            .map(|_| buf.len())
+            .map_err(|e| io_err(&e)),
+        HostFileKind::Disk { file, .. } => (&*file)
+            .write_all(buf)
+            .map(|_| buf.len())
+            .map_err(|e| io_err(&e)),
         HostFileKind::StdIn => Err(HostError::Access),
     }
 }
@@ -160,7 +182,9 @@ pub(crate) fn stat_path(path: &HostPath) -> Result<HostStat, HostError> {
 pub(crate) fn stat_file(f: &HostFile) -> Result<HostStat, HostError> {
     match &f.0 {
         // stdio 语义为字符设备，无宿主文件元数据
-        HostFileKind::StdIn | HostFileKind::StdOut | HostFileKind::StdErr => Ok(HostStat::char_device()),
+        HostFileKind::StdIn | HostFileKind::StdOut | HostFileKind::StdErr => {
+            Ok(HostStat::char_device())
+        }
         HostFileKind::Disk { file, path } => {
             let md = file.metadata().map_err(|e| io_err(&e))?;
             Ok(host_stat_from(&md, Some(path)))
@@ -230,7 +254,11 @@ fn platform_meta(md: &std::fs::Metadata, _path: Option<&std::path::Path>) -> (u3
 fn platform_meta(md: &std::fs::Metadata, path: Option<&std::path::Path>) -> (u32, u64, u64, u64) {
     let ino = path.map(path_ino).unwrap_or(0);
     let ro = md.permissions().readonly();
-    let mode = if md.is_dir() { 0o0040000 | 0o755 } else { 0o0100000 | if ro { 0o444 } else { 0o644 } };
+    let mode = if md.is_dir() {
+        0o0040000 | 0o755
+    } else {
+        0o0100000 | if ro { 0o444 } else { 0o644 }
+    };
     (mode, 1, ino, 0)
 }
 

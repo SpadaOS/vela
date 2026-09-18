@@ -62,7 +62,10 @@ pub enum HostFileKind {
     StdOut,
     StdErr,
     /// 打开时记录宿主路径：fstat 需要稳定的 ino（路径哈希），std::fs::File 不携带路径。
-    Disk { file: std::fs::File, path: PathBuf },
+    Disk {
+        file: std::fs::File,
+        path: PathBuf,
+    },
 }
 
 impl HostFileKind {
@@ -99,7 +102,10 @@ pub struct HostDir {
 impl HostDir {
     /// 测试与宿主实现共用构造。
     pub fn from_parts(path: PathBuf, entries: Vec<HostDirEntry>) -> HostDir {
-        HostDir { path, queue: std::sync::Mutex::new(entries.into()) }
+        HostDir {
+            path,
+            queue: std::sync::Mutex::new(entries.into()),
+        }
     }
 
     /// 宿主目录路径（openat dirfd 相对路径解析用）。
@@ -200,16 +206,37 @@ impl std::fmt::Display for HostError {
 
 impl std::error::Error for HostError {}
 
-// ---------------------------------------------------------------- Host trait
+// ---------------------------------------------------------------- Host trait 五组（SpadaOS 就绪）
 
-pub trait Host: Send + Sync + 'static {
+// HOST.md 契约按 SpadaOS 内核能力分五组：map / file / time / thread / futex。
+// 每组一个 supertrait，SpadaOS 实现者可逐组填实；`Host` 为集合 trait，
+// runtime 只见 `&dyn Host`（规格 2.4：宿主差异全部收敛在本 crate）。
+
+/// 组 1 map：客户地址空间管理。
+///
+/// # Safety（组级约定）
+/// - `map` 返回的内存归客户使用，调用方必须经 MemRegistry 登记后访问；
+/// - `protect`/`unmap` 的 [addr, addr+len) 必须来自本宿主 `map` 的返回区间；
+/// - `unmap` 后不得再访问该区间。
+pub trait HostMem: Send + Sync + 'static {
     /// 分配匿名内存。anon=false 在 v0 未实现。返回的内存保证零填充。
     /// Windows 实现初始保护一律 RW（拷贝/patch 之后由 protect 收敛，规格 5.2）。
-    unsafe fn map(&self, hint: usize, len: usize, prot: HostProt, anon: bool) -> Result<usize, HostError>;
+    unsafe fn map(
+        &self,
+        hint: usize,
+        len: usize,
+        prot: HostProt,
+        anon: bool,
+    ) -> Result<usize, HostError>;
+
     unsafe fn protect(&self, addr: usize, len: usize, prot: HostProt) -> Result<(), HostError>;
+
     /// 仅能整块释放 reserve 基址（Windows 限制，规格 5.2 表）。
     unsafe fn unmap(&self, addr: usize, len: usize) -> Result<(), HostError>;
+}
 
+/// 组 2 file：文件系统与 stdio。
+pub trait HostFileOps: Send + Sync + 'static {
     fn open(&self, path: &HostPath, opt: HostOpen) -> Result<HostFile, HostError>;
     /// 打开目录做快照遍历（O_DIRECTORY 语义）。
     fn open_dir(&self, path: &HostPath) -> Result<HostDir, HostError>;
@@ -230,13 +257,19 @@ pub trait Host: Send + Sync + 'static {
     /// 对已打开句柄取元数据（fstat 语义）；stdio 为字符设备。
     fn stat_file(&self, f: &HostFile) -> Result<HostStat, HostError>;
     fn close(&self, f: HostFile) -> Result<(), HostError>;
-
     fn stdio(&self) -> StdioHandles;
+}
 
+/// 组 3 time：时间与熵（宿主环境信息；RNG 并入本组，见 PLAN-0.0.3 决策点 3）。
+pub trait HostTime: Send + Sync + 'static {
     fn monotonic_ns(&self) -> u64;
     fn realtime(&self) -> (i64, u32);
     fn random(&self, buf: &mut [u8]) -> Result<(), HostError>;
+}
 
+/// 组 4 thread 的 TLS 面 + 组 5 futex 预留：SpadaOS 侧对应 TLS 寄存器切换与
+/// 等待队列能力。v0.x 仅 set_fs_base 可用；thread_create/futex 为桩。
+pub trait HostTls: Send + Sync + 'static {
     /// 设置当前线程 FS 基址（客户 TLS，对应 arch_prctl(ARCH_SET_FS)）。
     /// 默认不支持；Windows 实现用 wrfsbase（需 CPU+OS 的 FSGSBASE 支持）。
     /// 不支持时 runtime 仅记录 fs_base 并照常返回 0（规格 5.1 允许）。
@@ -244,16 +277,28 @@ pub trait Host: Send + Sync + 'static {
         let _ = v;
         Err(HostError::Unimplemented)
     }
+}
 
+/// 集合 trait：五组能力 + 线程生命周期（thread/futex 组，v0 桩）。
+pub trait Host: HostMem + HostFileOps + HostTime + HostTls {
     fn thread_exit(&self, code: i32) -> !;
     fn process_exit(&self, code: i32) -> !;
 
-    // v0 stub（规格 5.2）
-    fn thread_create(&self, entry: extern "C" fn(*mut u8), arg: *mut u8) -> Result<HostTid, HostError> {
+    // 组 4/5 桩（规格 5.2 / 13）
+    fn thread_create(
+        &self,
+        entry: extern "C" fn(*mut u8),
+        arg: *mut u8,
+    ) -> Result<HostTid, HostError> {
         let _ = (entry, arg);
         Err(HostError::Unimplemented)
     }
-    fn futex_wait(&self, addr: *const u32, expected: u32, timeout: Option<Duration>) -> Result<(), HostError> {
+    fn futex_wait(
+        &self,
+        addr: *const u32,
+        expected: u32,
+        timeout: Option<Duration>,
+    ) -> Result<(), HostError> {
         let _ = (addr, expected, timeout);
         Err(HostError::Unimplemented)
     }
@@ -268,8 +313,8 @@ pub trait Host: Send + Sync + 'static {
 /// 通用文件/时间操作（基于 std，跨 Windows 与 linux_dev 复用）。
 pub(crate) mod file_ops;
 
+#[cfg(target_os = "linux")]
+pub mod linux_dev;
 pub mod spadaos;
 #[cfg(windows)]
 pub mod windows;
-#[cfg(target_os = "linux")]
-pub mod linux_dev;

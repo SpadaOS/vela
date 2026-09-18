@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::file_ops;
-use crate::{Host, HostDir, HostError, HostFile, HostOpen, HostPath, HostProt, HostStat, StdioHandles};
+use crate::{
+    Host, HostDir, HostError, HostFile, HostFileOps, HostMem, HostOpen, HostPath, HostProt,
+    HostStat, HostTime, HostTls, StdioHandles,
+};
 
 // ---------------------------------------------------------------- Win32 FFI
 
@@ -26,8 +29,18 @@ const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
 
 #[link(name = "kernel32")]
 extern "system" {
-    fn VirtualAlloc(lpAddress: *mut c_void, dwSize: usize, flAllocationType: u32, flProtect: u32) -> *mut c_void;
-    fn VirtualProtect(lpAddress: *mut c_void, dwSize: usize, flNewProtect: u32, lpflOldProtect: *mut u32) -> i32;
+    fn VirtualAlloc(
+        lpAddress: *mut c_void,
+        dwSize: usize,
+        flAllocationType: u32,
+        flProtect: u32,
+    ) -> *mut c_void;
+    fn VirtualProtect(
+        lpAddress: *mut c_void,
+        dwSize: usize,
+        flNewProtect: u32,
+        lpflOldProtect: *mut u32,
+    ) -> i32;
     fn VirtualFree(lpAddress: *mut c_void, dwSize: usize, dwFreeType: u32) -> i32;
     fn SetConsoleOutputCP(wCodePageID: u32) -> i32;
     fn AddVectoredExceptionHandler(
@@ -112,7 +125,8 @@ pub struct ExceptionPointers {
 /// VEH 回调注入的业务函数：nr、args、rip、可变 CONTEXT → syscall 返回值。
 /// 回调负责写回 Rax、模拟 syscall 副作用（Rip+=2、Rcx、R11），
 /// 需要改变控制流（如 FS trampoline）时可直接改写 ctx.rip。
-pub type TrapFn = unsafe extern "system" fn(nr: u64, args: &[u64; 6], rip: u64, ctx: &mut Context) -> i64;
+pub type TrapFn =
+    unsafe extern "system" fn(nr: u64, args: &[u64; 6], rip: u64, ctx: &mut Context) -> i64;
 
 const MAX_GUEST_RANGES: usize = 32;
 /// start==0 视为空槽（客户基址来自 VirtualAlloc，永远非 0）。
@@ -195,7 +209,7 @@ unsafe extern "system" fn veh_handler(ep: *mut ExceptionPointers) -> i32 {
             eprintln!(
                 "[vela] AV in guest rip={:#x} addr={:#x} op={} rax={:#x} rcx={:#x} rdx={:#x} bytes={}{}",
                 ctx.rip,
-                rec.info[1] as usize,
+                { rec.info[1] },
                 rec.info[0],
                 ctx.rax,
                 ctx.rcx,
@@ -218,7 +232,7 @@ unsafe extern "system" fn veh_handler(ep: *mut ExceptionPointers) -> i32 {
     let rip = ctx.rip as usize;
     // FS commit stub：预切后的 ud2+ret，直接跳过 ud2 让 ret 返回调用者。
     // 必须在 guest range 过滤之前判断（stub 位于 vela.exe 自身代码段）。
-    let commit_stub = vela_fs_commit_stub as usize;
+    let commit_stub = vela_fs_commit_stub as *const () as usize;
     if rip >= commit_stub && rip < commit_stub + 4 {
         ctx.rip = rip as u64 + 2;
         return EXCEPTION_CONTINUE_EXECUTION;
@@ -420,7 +434,9 @@ pub fn set_thread_fs_base_now(v: u64) -> Result<(), HostError> {
     }
     #[cfg(target_arch = "x86_64")]
     // SAFETY: 已探测确认 FSGSBASE 可用；VELA 自身不依赖 FS
-    unsafe { core::arch::asm!("wrfsbase {0}", in(reg) v) };
+    unsafe {
+        core::arch::asm!("wrfsbase {0}", in(reg) v)
+    };
     #[cfg(not(target_arch = "x86_64"))]
     let _ = v;
     Ok(())
@@ -432,7 +448,9 @@ pub fn set_thread_fs_base_now(v: u64) -> Result<(), HostError> {
 pub fn commit_fs_base_after_preset() {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: vela_fs_commit_stub 只含 ud2 与 ret；UD2 由已注册的 probe 处理器吸收
-    unsafe { vela_fs_commit_stub() };
+    unsafe {
+        vela_fs_commit_stub()
+    };
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -455,7 +473,9 @@ pub struct WindowsHost {
 
 impl WindowsHost {
     pub fn new() -> Self {
-        WindowsHost { start: Instant::now() }
+        WindowsHost {
+            start: Instant::now(),
+        }
     }
 }
 
@@ -477,8 +497,14 @@ fn protect_flag(p: HostProt) -> Result<u32, HostError> {
     })
 }
 
-impl Host for WindowsHost {
-    unsafe fn map(&self, hint: usize, len: usize, _prot: HostProt, anon: bool) -> Result<usize, HostError> {
+impl HostMem for WindowsHost {
+    unsafe fn map(
+        &self,
+        hint: usize,
+        len: usize,
+        _prot: HostProt,
+        anon: bool,
+    ) -> Result<usize, HostError> {
         if !anon {
             return Err(HostError::Unimplemented); // v0 仅匿名映射（规格 2.1）
         }
@@ -522,7 +548,9 @@ impl Host for WindowsHost {
             Ok(())
         }
     }
+}
 
+impl HostFileOps for WindowsHost {
     fn open(&self, path: &HostPath, opt: HostOpen) -> Result<HostFile, HostError> {
         file_ops::open(path, opt)
     }
@@ -565,6 +593,9 @@ impl Host for WindowsHost {
     fn stdio(&self) -> StdioHandles {
         file_ops::stdio()
     }
+}
+
+impl HostTime for WindowsHost {
     fn monotonic_ns(&self) -> u64 {
         file_ops::monotonic_ns(&self.start)
     }
@@ -584,6 +615,9 @@ impl Host for WindowsHost {
             Ok(())
         }
     }
+}
+
+impl HostTls for WindowsHost {
     fn set_fs_base(&self, _v: u64) -> Result<(), HostError> {
         // 仅报告能力；真正的 FS 切换由 CLI 的 trampoline 在异常返回后完成
         // （处理器内 wrfsbase 会被 NtContinue 还原，见本模块 FS 注释）。
@@ -593,6 +627,9 @@ impl Host for WindowsHost {
             Err(HostError::Unimplemented)
         }
     }
+}
+
+impl Host for WindowsHost {
     fn thread_exit(&self, code: i32) -> ! {
         // v0 单线程模型：线程退出即进程退出（规格 2.1）
         std::process::exit(code)

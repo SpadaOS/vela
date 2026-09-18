@@ -17,3 +17,7 @@ version = "0.0.2"
 # 低内存机器：关闭增量编译，减少磁盘/内存占用
 [profile.dev]
 incremental = false
+
+# 统一 lint 策略（PLAN-0.0.3 T3.4）：CI 以 -D warnings 收紧
+[workspace.lints.clippy]
+missing_safety_doc = "allow" # unsafe 契约用组级/行内 SAFETY 注释表达（见 HOST.md / HostMem）

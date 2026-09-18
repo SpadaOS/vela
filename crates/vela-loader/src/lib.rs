@@ -39,8 +39,14 @@ impl fmt::Display for LoadError {
             LoadError::WrongClass => write!(f, "not a 64-bit ELF (ELFCLASS64 required)"),
             LoadError::WrongEndian => write!(f, "not little-endian ELF (ELFDATA2LSB required)"),
             LoadError::WrongMachine => write!(f, "not x86_64 ELF (EM_X86_64 required)"),
-            LoadError::WrongType => write!(f, "non-PIE or unsupported e_type (v0 requires ET_DYN static PIE)"),
-            LoadError::DynamicBinary => write!(f, "dynamic binaries not supported in v0 (PT_INTERP present)"),
+            LoadError::WrongType => write!(
+                f,
+                "non-PIE or unsupported e_type (v0 requires ET_DYN static PIE)"
+            ),
+            LoadError::DynamicBinary => write!(
+                f,
+                "dynamic binaries not supported in v0 (PT_INTERP present)"
+            ),
             LoadError::NoLoadSegments => write!(f, "no PT_LOAD segments"),
             LoadError::BadLayout(m) => write!(f, "bad ELF layout: {m}"),
             LoadError::TooLarge => write!(f, "load span exceeds 1 GiB sanity limit"),
@@ -168,7 +174,13 @@ pub fn parse(bytes: &[u8]) -> Result<ElfInfo, LoadError> {
         if vaddr.checked_add(memsz).is_none() {
             return Err(LoadError::BadLayout("p_vaddr+p_memsz overflow"));
         }
-        loads.push(RawLoadSeg { offset, vaddr, filesz, memsz, flags });
+        loads.push(RawLoadSeg {
+            offset,
+            vaddr,
+            filesz,
+            memsz,
+            flags,
+        });
     }
     if has_interp {
         return Err(LoadError::DynamicBinary);
@@ -176,7 +188,13 @@ pub fn parse(bytes: &[u8]) -> Result<ElfInfo, LoadError> {
     if loads.is_empty() {
         return Err(LoadError::NoLoadSegments);
     }
-    Ok(ElfInfo { entry: e_entry, phoff: e_phoff, phentsize: e_phentsize, phnum: e_phnum, loads })
+    Ok(ElfInfo {
+        entry: e_entry,
+        phoff: e_phoff,
+        phentsize: e_phentsize,
+        phnum: e_phnum,
+        loads,
+    })
 }
 
 // ---------------------------------------------------------------- patch
@@ -209,7 +227,13 @@ pub fn patch_syscalls(code: &mut [u8]) -> usize {
 /// 5. 按段收敛保护位（W^X，不长期 RWX）
 pub fn load(bytes: &[u8], host: &dyn Host, hint: u64) -> Result<LoadedImage, LoadError> {
     let info = parse(bytes)?;
-    let lo = info.loads.iter().map(|s| s.vaddr).min().ok_or(LoadError::NoLoadSegments)? & !(PAGE - 1);
+    let lo = info
+        .loads
+        .iter()
+        .map(|s| s.vaddr)
+        .min()
+        .ok_or(LoadError::NoLoadSegments)?
+        & !(PAGE - 1);
     let hi = info
         .loads
         .iter()
@@ -224,7 +248,8 @@ pub fn load(bytes: &[u8], host: &dyn Host, hint: u64) -> Result<LoadedImage, Loa
     }
 
     // SAFETY: span>0；host.map 契约保证零填充可写内存
-    let base = unsafe { host.map(hint as usize, span, HostProt::READ | HostProt::WRITE, true)? } as u64;
+    let base =
+        unsafe { host.map(hint as usize, span, HostProt::READ | HostProt::WRITE, true)? } as u64;
     let bias = base - lo;
 
     let mut segments = Vec::with_capacity(info.loads.len());
@@ -252,8 +277,8 @@ pub fn load(bytes: &[u8], host: &dyn Host, hint: u64) -> Result<LoadedImage, Loa
             prot_bits |= 4;
             // patch 仅覆盖文件内容范围；bss 零页无指令
             // SAFETY: dst..dst+filesz 是本函数映射的可写内存
-            let mut code = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, s.filesz as usize) };
-            patch_syscalls(&mut code);
+            let code = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, s.filesz as usize) };
+            patch_syscalls(code);
             exec_ranges.push((bias + s.vaddr, bias + s.vaddr + s.memsz));
         }
         segments.push(Segment {
@@ -292,6 +317,9 @@ pub fn load(bytes: &[u8], host: &dyn Host, hint: u64) -> Result<LoadedImage, Loa
         phentsize: info.phentsize,
         segments,
         exec_ranges,
-        span: MemRange { start: base, len: span as u64 },
+        span: MemRange {
+            start: base,
+            len: span as u64,
+        },
     })
 }

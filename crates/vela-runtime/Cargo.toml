@@ -8,3 +8,6 @@ license.workspace = true
 vela-abi = { path = "../vela-abi" }
 vela-sys = { path = "../vela-sys" }
 vela-fs = { path = "../vela-fs" }
+
+[lints]
+workspace = true

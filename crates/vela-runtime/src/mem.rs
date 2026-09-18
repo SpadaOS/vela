@@ -79,7 +79,10 @@ impl MemRegistry {
             return true;
         }
         // 情况 2：start 之前最后一个区间延伸越过 start
-        self.ranges.range(..start).next_back().is_some_and(|(_, r)| r.start + r.len > start)
+        self.ranges
+            .range(..start)
+            .next_back()
+            .is_some_and(|(_, r)| r.start + r.len > start)
     }
 
     /// 移除完全被 [start, start+len) 覆盖的登记项并返回它们。
@@ -92,7 +95,10 @@ impl MemRegistry {
             .filter(|(_, r)| r.start >= start && r.start + r.len <= end)
             .map(|(k, _)| *k)
             .collect();
-        fully.into_iter().filter_map(|k| self.ranges.remove(&k)).collect()
+        fully
+            .into_iter()
+            .filter_map(|k| self.ranges.remove(&k))
+            .collect()
     }
 }
 
@@ -103,7 +109,10 @@ mod tests {
     #[test]
     fn contains_checks_full_coverage() {
         let mut m = MemRegistry::default();
-        m.add(MemRange { start: 0x1000, len: 0x2000 });
+        m.add(MemRange {
+            start: 0x1000,
+            len: 0x2000,
+        });
         assert!(m.contains(0x1000, 1));
         assert!(m.contains(0x1000, 0x2000));
         assert!(m.contains(0x1FFF, 0x1000));
@@ -117,7 +126,10 @@ mod tests {
     #[test]
     fn overlaps_detects_any_intersection() {
         let mut m = MemRegistry::default();
-        m.add(MemRange { start: 0x1000, len: 0x1000 });
+        m.add(MemRange {
+            start: 0x1000,
+            len: 0x1000,
+        });
         assert!(m.overlaps(0x1800, 0x100));
         assert!(m.overlaps(0x0800, 0x900)); // 头部相交
         assert!(m.overlaps(0x1800, 0x1000)); // 尾部相交
@@ -129,11 +141,23 @@ mod tests {
     #[test]
     fn remove_only_fully_covered() {
         let mut m = MemRegistry::default();
-        m.add(MemRange { start: 0x1000, len: 0x1000 });
-        m.add(MemRange { start: 0x3000, len: 0x1000 });
+        m.add(MemRange {
+            start: 0x1000,
+            len: 0x1000,
+        });
+        m.add(MemRange {
+            start: 0x3000,
+            len: 0x1000,
+        });
         // 只完全覆盖第一个
         let r = m.remove_fully_covered(0x0, 0x2000);
-        assert_eq!(r, vec![MemRange { start: 0x1000, len: 0x1000 }]);
+        assert_eq!(
+            r,
+            vec![MemRange {
+                start: 0x1000,
+                len: 0x1000
+            }]
+        );
         assert!(m.contains(0x3000, 1));
         // 部分覆盖不删除
         let r = m.remove_fully_covered(0x3000, 0x800);

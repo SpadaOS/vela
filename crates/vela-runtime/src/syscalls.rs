@@ -2,9 +2,11 @@
 //! 未实现的 syscall 一律返回 `-ENOSYS`（规格 0 成功标准 5）。
 
 use vela_abi as abi;
-use vela_sys::{Host, HostDir, HostError, HostFile, HostFileKind, HostOpen, HostPath, HostProt, HostStat};
+use vela_sys::{Host, HostError, HostFile, HostFileKind, HostOpen, HostPath, HostProt, HostStat};
 
-use crate::{read_cstr, read_guest, read_guest_mut, write_guest, GuestFd, GuestProcess, host_err_to_errno};
+use crate::{
+    host_err_to_errno, read_cstr, read_guest, read_guest_mut, write_guest, GuestFd, GuestProcess,
+};
 
 const PAGE: u64 = 4096;
 
@@ -45,15 +47,32 @@ pub fn dispatch(proc: &mut GuestProcess, host: &dyn Host, nr: u64, a: [u64; 6]) 
         abi::SYS_ACCESS => sys_access(proc, host, a[0], a[1]),
         abi::SYS_FACCESSAT => sys_faccessat(proc, host, a),
         abi::SYS_DUP => sys_dup(proc, host, a[0]),
-        abi::SYS_DUP2 | abi::SYS_DUP3 => sys_dup2(proc, host, a[0], a[1], a[2], nr == abi::SYS_DUP3),
-        abi::SYS_FSYNC | abi::SYS_FDATASYNC => sys_fsync(proc, host, a[0], nr == abi::SYS_FDATASYNC),
+        abi::SYS_DUP2 | abi::SYS_DUP3 => {
+            sys_dup2(proc, host, a[0], a[1], a[2], nr == abi::SYS_DUP3)
+        }
+        abi::SYS_FSYNC | abi::SYS_FDATASYNC => {
+            sys_fsync(proc, host, a[0], nr == abi::SYS_FDATASYNC)
+        }
         abi::SYS_MKDIR => sys_mkdir(proc, host, abi::AT_FDCWD, a[0]),
         abi::SYS_MKDIRAT => sys_mkdir(proc, host, a[0] as u32 as i32, a[1]),
         abi::SYS_RMDIR => sys_unlink_path(proc, host, abi::AT_FDCWD, a[0], true),
         abi::SYS_UNLINK => sys_unlink_path(proc, host, abi::AT_FDCWD, a[0], false),
-        abi::SYS_UNLINKAT => sys_unlink_path(proc, host, a[0] as u32 as i32, a[1], a[2] & abi::AT_REMOVEDIR != 0),
+        abi::SYS_UNLINKAT => sys_unlink_path(
+            proc,
+            host,
+            a[0] as u32 as i32,
+            a[1],
+            a[2] & abi::AT_REMOVEDIR != 0,
+        ),
         abi::SYS_RENAME => sys_rename(proc, host, abi::AT_FDCWD, a[0], abi::AT_FDCWD, a[1]),
-        abi::SYS_RENAMEAT => sys_rename(proc, host, a[0] as u32 as i32, a[1], a[2] as u32 as i32, a[3]),
+        abi::SYS_RENAMEAT => sys_rename(
+            proc,
+            host,
+            a[0] as u32 as i32,
+            a[1],
+            a[2] as u32 as i32,
+            a[3],
+        ),
         abi::SYS_STATX => sys_statx(proc, host, a),
         abi::SYS_GETRUSAGE => sys_getrusage(proc, a[1]),
         // 诚实 stub：信号投递未实现（NONGOALS），但 musl/busybox 启动路径
@@ -79,7 +98,10 @@ fn sys_write(proc: &GuestProcess, host: &dyn Host, fd_raw: u64, buf: u64, len: u
                 return 0;
             }
             match read_guest(proc, buf, len as usize) {
-                Ok(data) => host.write(f, data).map(|n| n as i64).unwrap_or_else(|e| -(host_err_to_errno(&e) as i64)),
+                Ok(data) => host
+                    .write(f, data)
+                    .map(|n| n as i64)
+                    .unwrap_or_else(|e| -(host_err_to_errno(&e) as i64)),
                 Err(e) => -(e as i64),
             }
         }
@@ -100,7 +122,10 @@ fn sys_read(proc: &mut GuestProcess, host: &dyn Host, fd_raw: u64, buf: u64, len
             Err(e) => -(e as i64),
         },
         Some(GuestFd::Host(f)) => match read_guest_mut(proc, buf, len as usize) {
-            Ok(dst) => host.read(f, dst).map(|n| n as i64).unwrap_or_else(|e| -(host_err_to_errno(&e) as i64)),
+            Ok(dst) => host
+                .read(f, dst)
+                .map(|n| n as i64)
+                .unwrap_or_else(|e| -(host_err_to_errno(&e) as i64)),
             Err(e) => -(e as i64),
         },
     }
@@ -113,15 +138,15 @@ fn write_zeros(proc: &GuestProcess, addr: u64, len: usize) -> Result<(), i32> {
 fn sys_writev(proc: &GuestProcess, host: &dyn Host, fd_raw: u64, iov: u64, iovcnt_raw: u64) -> i64 {
     let fd = fd_raw as u32 as i32;
     let iovcnt = iovcnt_raw as u32 as i32;
-    if iovcnt < 0 || iovcnt > 1024 {
+    if !(0..=1024).contains(&iovcnt) {
         return -(abi::EINVAL as i64);
     }
     if iovcnt == 0 {
         return 0;
     }
     match proc.fds.get(fd) {
-        None | Some(GuestFd::Reserved) => return -(abi::EBADF as i64),
-        Some(GuestFd::HostDir(_)) => return -(abi::EBADF as i64),
+        None | Some(GuestFd::Reserved) => -(abi::EBADF as i64),
+        Some(GuestFd::HostDir(_)) => -(abi::EBADF as i64),
         Some(GuestFd::Null) | Some(GuestFd::Zero) => {
             // /dev/null 语义：校验可读后返回总长
             let mut total = 0i64;
@@ -131,7 +156,7 @@ fn sys_writev(proc: &GuestProcess, host: &dyn Host, fd_raw: u64, iov: u64, iovcn
                     Err(e) => return -(e as i64),
                 }
             }
-            return total;
+            total
         }
         Some(GuestFd::Host(f)) => {
             let mut total = 0i64;
@@ -175,7 +200,13 @@ fn sys_openat(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 {
 }
 
 /// open/openat 公共路径解析与打开（flags 为 Linux 客户侧标志）。
-fn open_common(proc: &mut GuestProcess, host: &dyn Host, dirfd: i32, path_ptr: u64, flags: u64) -> i64 {
+fn open_common(
+    proc: &mut GuestProcess,
+    host: &dyn Host,
+    dirfd: i32,
+    path_ptr: u64,
+    flags: u64,
+) -> i64 {
     let path = match read_cstr(proc, path_ptr) {
         Ok(p) => p,
         Err(e) => return -(e as i64),
@@ -212,12 +243,12 @@ fn open_common(proc: &mut GuestProcess, host: &dyn Host, dirfd: i32, path_ptr: u
     };
     let acc = flags & 0b11;
     let opt = HostOpen {
-        read: acc == abi::O_RDONLY as u64 || acc == abi::O_RDWR as u64,
-        write: acc != abi::O_RDONLY as u64,
-        create: flags & abi::O_CREAT as u64 != 0,
-        excl: flags & abi::O_EXCL as u64 != 0,
-        truncate: flags & abi::O_TRUNC as u64 != 0,
-        append: flags & abi::O_APPEND as u64 != 0,
+        read: acc == abi::O_RDONLY || acc == abi::O_RDWR,
+        write: acc != abi::O_RDONLY,
+        create: flags & abi::O_CREAT != 0,
+        excl: flags & abi::O_EXCL != 0,
+        truncate: flags & abi::O_TRUNC != 0,
+        append: flags & abi::O_APPEND != 0,
     };
     let flag_bits = flags as u32;
     if flags & abi::O_DIRECTORY != 0 {
@@ -300,8 +331,15 @@ fn sys_chdir(proc: &mut GuestProcess, host: &dyn Host, path_ptr: u64) -> i64 {
     }
     // 规范化客户侧 cwd：组件折叠（"." 去除）；目标必为已翻译合法路径
     let joined = resolve_rel(proc, &path);
-    let comps: Vec<&str> = joined.split('/').filter(|c| !c.is_empty() && *c != ".").collect();
-    proc.cwd = if comps.is_empty() { "/".to_string() } else { format!("/{}", comps.join("/")) };
+    let comps: Vec<&str> = joined
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    proc.cwd = if comps.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", comps.join("/"))
+    };
     0
 }
 
@@ -359,8 +397,12 @@ fn fill_stat(proc: &GuestProcess, r: Result<HostStat, HostError>, buf: u64) -> i
         Ok(hs) => {
             let st = host_stat_to_linux(&hs, proc.uid, proc.gid);
             // SAFETY: Stat 为 repr(C) 纯数值 POD，144 字节（vela-abi const 断言锁死）
-            let bytes =
-                unsafe { std::slice::from_raw_parts((&st as *const abi::Stat) as *const u8, std::mem::size_of::<abi::Stat>()) };
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    (&st as *const abi::Stat) as *const u8,
+                    std::mem::size_of::<abi::Stat>(),
+                )
+            };
             match write_guest(proc, buf, bytes) {
                 Ok(()) => 0,
                 Err(e) => -(e as i64),
@@ -410,7 +452,13 @@ fn sys_close(proc: &mut GuestProcess, host: &dyn Host, fd_raw: u64) -> i64 {
 /// getdents64(fd, dirp, count)：按 linux_dirent64 填充客户缓冲，填满即停。
 /// 返回已填字节数；0 = 目录读完；count 不足以放一条 → EINVAL。
 /// linux_dirent64 { u64 d_ino; i64 d_off; u16 d_reclen; u8 d_type; char d_name[] }
-fn sys_getdents64(proc: &mut GuestProcess, host: &dyn Host, fd_raw: u64, buf: u64, count: u64) -> i64 {
+fn sys_getdents64(
+    proc: &mut GuestProcess,
+    _host: &dyn Host,
+    fd_raw: u64,
+    buf: u64,
+    count: u64,
+) -> i64 {
     let fd = fd_raw as u32 as i32;
     let dir = match proc.fds.get(fd) {
         None | Some(GuestFd::Reserved) => return -(abi::EBADF as i64),
@@ -472,7 +520,8 @@ fn sys_fcntl(proc: &mut GuestProcess, host: &dyn Host, fd_raw: u64, cmd: u64, ar
         abi::F_SETFL => {
             let mask = (abi::O_APPEND | abi::O_NONBLOCK | abi::O_RDWR | abi::O_WRONLY) as u32;
             let new_status = (arg as u32) & mask;
-            proc.fds.update_flags(fd, |v| (v & !(0x1_FFFF << 8)) | (new_status << 8));
+            proc.fds
+                .update_flags(fd, |v| (v & !(0x1_FFFF << 8)) | (new_status << 8));
             0
         }
         abi::F_DUPFD | abi::F_DUPFD_CLOEXEC => {
@@ -505,7 +554,15 @@ fn sys_ioctl(proc: &GuestProcess, _host: &dyn Host, fd_raw: u64, cmd: u64, arg: 
 
 /// pread64/pwrite64：单线程模型下 seek→io→seek-back 等价于定位读写
 /// （HostFile 单所有权，契约见 PLAN-0.0.3 T2.3）。
-fn positioned(proc: &mut GuestProcess, host: &dyn Host, fd_raw: u64, buf: u64, len: u64, off: u64, is_write: bool) -> i64 {
+fn positioned(
+    proc: &mut GuestProcess,
+    host: &dyn Host,
+    fd_raw: u64,
+    buf: u64,
+    len: u64,
+    off: u64,
+    is_write: bool,
+) -> i64 {
     let fd = fd_raw as u32 as i32;
     if !matches!(proc.fds.get(fd), Some(GuestFd::Host(_))) {
         return -(abi::ESPIPE as i64); // 非 Host fd（含目录/伪设备）不支持定位
@@ -530,9 +587,10 @@ fn positioned(proc: &mut GuestProcess, host: &dyn Host, fd_raw: u64, buf: u64, l
     let r = if is_write {
         match read_guest(proc, buf, len as usize) {
             Ok(data) => match proc.fds.get(fd) {
-                Some(GuestFd::Host(f)) => {
-                    host.write(f, data).map(|n| n as i64).unwrap_or_else(|e| -(host_err_to_errno(&e) as i64))
-                }
+                Some(GuestFd::Host(f)) => host
+                    .write(f, data)
+                    .map(|n| n as i64)
+                    .unwrap_or_else(|e| -(host_err_to_errno(&e) as i64)),
                 _ => unreachable!(),
             },
             Err(e) => -(e as i64),
@@ -540,9 +598,10 @@ fn positioned(proc: &mut GuestProcess, host: &dyn Host, fd_raw: u64, buf: u64, l
     } else {
         match read_guest_mut(proc, buf, len as usize) {
             Ok(dst) => match proc.fds.get(fd) {
-                Some(GuestFd::Host(f)) => {
-                    host.read(f, dst).map(|n| n as i64).unwrap_or_else(|e| -(host_err_to_errno(&e) as i64))
-                }
+                Some(GuestFd::Host(f)) => host
+                    .read(f, dst)
+                    .map(|n| n as i64)
+                    .unwrap_or_else(|e| -(host_err_to_errno(&e) as i64)),
                 _ => unreachable!(),
             },
             Err(e) => -(e as i64),
@@ -555,18 +614,34 @@ fn positioned(proc: &mut GuestProcess, host: &dyn Host, fd_raw: u64, buf: u64, l
     r
 }
 
-fn sys_pread64(proc: &mut GuestProcess, host: &dyn Host, fd: u64, buf: u64, len: u64, off: u64) -> i64 {
+fn sys_pread64(
+    proc: &mut GuestProcess,
+    host: &dyn Host,
+    fd: u64,
+    buf: u64,
+    len: u64,
+    off: u64,
+) -> i64 {
     positioned(proc, host, fd, buf, len, off, false)
 }
 
-fn sys_pwrite64(proc: &mut GuestProcess, host: &dyn Host, fd: u64, buf: u64, len: u64, off: u64) -> i64 {
+fn sys_pwrite64(
+    proc: &mut GuestProcess,
+    host: &dyn Host,
+    fd: u64,
+    buf: u64,
+    len: u64,
+    off: u64,
+) -> i64 {
     positioned(proc, host, fd, buf, len, off, true)
 }
 
 fn sys_fsync(proc: &GuestProcess, host: &dyn Host, fd_raw: u64, data_only: bool) -> i64 {
     let fd = fd_raw as u32 as i32;
     match proc.fds.get(fd) {
-        Some(GuestFd::Host(f)) => host.sync_file(f, data_only).map_or_else(|e| -(host_err_to_errno(&e) as i64), |_| 0),
+        Some(GuestFd::Host(f)) => host
+            .sync_file(f, data_only)
+            .map_or_else(|e| -(host_err_to_errno(&e) as i64), |_| 0),
         Some(GuestFd::HostDir(_)) | Some(GuestFd::Null) | Some(GuestFd::Zero) => 0, // 无持久化语义
         _ => -(abi::EBADF as i64),
     }
@@ -580,7 +655,10 @@ fn resolve_path(proc: &GuestProcess, dirfd: i32, path: &str) -> Result<std::path
         return proc.fs.translate(path).ok_or(abi::ENOENT);
     }
     if dirfd == abi::AT_FDCWD {
-        return proc.fs.translate(&resolve_rel(proc, path)).ok_or(abi::ENOENT);
+        return proc
+            .fs
+            .translate(&resolve_rel(proc, path))
+            .ok_or(abi::ENOENT);
     }
     match proc.fds.get(dirfd) {
         Some(GuestFd::HostDir(d)) => {
@@ -605,23 +683,40 @@ fn sys_mkdir(proc: &mut GuestProcess, host: &dyn Host, dirfd: i32, path_ptr: u64
         Err(e) => return -(e as i64),
     };
     match resolve_path(proc, dirfd, &path) {
-        Ok(hp) => host.mkdir(&HostPath(hp)).map_or_else(|e| -(host_err_to_errno(&e) as i64), |_| 0),
+        Ok(hp) => host
+            .mkdir(&HostPath(hp))
+            .map_or_else(|e| -(host_err_to_errno(&e) as i64), |_| 0),
         Err(e) => -(e as i64),
     }
 }
 
-fn sys_unlink_path(proc: &mut GuestProcess, host: &dyn Host, dirfd: i32, path_ptr: u64, dir: bool) -> i64 {
+fn sys_unlink_path(
+    proc: &mut GuestProcess,
+    host: &dyn Host,
+    dirfd: i32,
+    path_ptr: u64,
+    dir: bool,
+) -> i64 {
     let path = match read_cstr(proc, path_ptr) {
         Ok(p) => p,
         Err(e) => return -(e as i64),
     };
     match resolve_path(proc, dirfd, &path) {
-        Ok(hp) => host.remove(&HostPath(hp), dir).map_or_else(|e| -(host_err_to_errno(&e) as i64), |_| 0),
+        Ok(hp) => host
+            .remove(&HostPath(hp), dir)
+            .map_or_else(|e| -(host_err_to_errno(&e) as i64), |_| 0),
         Err(e) => -(e as i64),
     }
 }
 
-fn sys_rename(proc: &mut GuestProcess, host: &dyn Host, old_fd: i32, old_ptr: u64, new_fd: i32, new_ptr: u64) -> i64 {
+fn sys_rename(
+    proc: &mut GuestProcess,
+    host: &dyn Host,
+    old_fd: i32,
+    old_ptr: u64,
+    new_fd: i32,
+    new_ptr: u64,
+) -> i64 {
     let old = match read_cstr(proc, old_ptr) {
         Ok(p) => p,
         Err(e) => return -(e as i64),
@@ -631,13 +726,15 @@ fn sys_rename(proc: &mut GuestProcess, host: &dyn Host, old_fd: i32, old_ptr: u6
         Err(e) => return -(e as i64),
     };
     let r = (|| -> Result<HostPath, i32> {
-        let o = resolve_path(proc, old_fd, &old)?;
+        let _o = resolve_path(proc, old_fd, &old)?;
         let n = resolve_path(proc, new_fd, &new)?;
         Ok(HostPath(n))
     })()
     .and_then(|np| resolve_path(proc, old_fd, &old).map(|op| (op, np)));
     match r {
-        Ok((op, HostPath(np))) => host.rename(&HostPath(op), &HostPath(np)).map_or_else(|e| -(host_err_to_errno(&e) as i64), |_| 0),
+        Ok((op, HostPath(np))) => host
+            .rename(&HostPath(op), &HostPath(np))
+            .map_or_else(|e| -(host_err_to_errno(&e) as i64), |_| 0),
         Err(e) => -(e as i64),
     }
 }
@@ -652,7 +749,13 @@ fn sys_faccessat(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 {
 
 /// access 语义：存在性 + 按宿主只读位判 W_OK；X_OK 对目录成立、对文件按执行位推断
 /// （Windows 权限位固定 0644/0755，故普通文件恒 X_OK——语义注释见 SYSCALLS.md）。
-fn access_common(proc: &mut GuestProcess, host: &dyn Host, dirfd: i32, path_ptr: u64, mode: u64) -> i64 {
+fn access_common(
+    proc: &mut GuestProcess,
+    host: &dyn Host,
+    dirfd: i32,
+    path_ptr: u64,
+    mode: u64,
+) -> i64 {
     let path = match read_cstr(proc, path_ptr) {
         Ok(p) => p,
         Err(e) => return -(e as i64),
@@ -679,7 +782,14 @@ fn sys_dup(proc: &mut GuestProcess, host: &dyn Host, oldfd_raw: u64) -> i64 {
 }
 
 /// dup2/dup3：目标 fd 已打开则先关闭；dup3 的 flags 仅接受 O_CLOEXEC。
-fn sys_dup2(proc: &mut GuestProcess, host: &dyn Host, oldfd_raw: u64, newfd_raw: u64, flags: u64, is_dup3: bool) -> i64 {
+fn sys_dup2(
+    proc: &mut GuestProcess,
+    host: &dyn Host,
+    oldfd_raw: u64,
+    newfd_raw: u64,
+    flags: u64,
+    is_dup3: bool,
+) -> i64 {
     let oldfd = oldfd_raw as u32 as i32;
     let newfd = newfd_raw as u32 as i32;
     if oldfd < 0 || newfd < 0 || proc.fds.get(oldfd).is_none() {
@@ -696,11 +806,23 @@ fn sys_dup2(proc: &mut GuestProcess, host: &dyn Host, oldfd_raw: u64, newfd_raw:
     }
     // 先移除目标（触发 host close）
     let _ = proc.fds.remove(newfd);
-    dup_impl(proc, host, oldfd, Some(newfd), is_dup3 && flags & abi::O_CLOEXEC != 0)
+    dup_impl(
+        proc,
+        host,
+        oldfd,
+        Some(newfd),
+        is_dup3 && flags & abi::O_CLOEXEC != 0,
+    )
 }
 
 /// dup 核心：复制 Host 句柄或伪设备标记，分配（或落到指定）fd。
-fn dup_impl(proc: &mut GuestProcess, host: &dyn Host, oldfd: i32, at: Option<i32>, cloexec: bool) -> i64 {
+fn dup_impl(
+    proc: &mut GuestProcess,
+    host: &dyn Host,
+    oldfd: i32,
+    at: Option<i32>,
+    cloexec: bool,
+) -> i64 {
     let new_entry = match proc.fds.get(oldfd) {
         Some(GuestFd::Host(f)) => match host.dup_file(f) {
             Ok(nf) => GuestFd::Host(nf),
@@ -728,7 +850,7 @@ fn dup_impl(proc: &mut GuestProcess, host: &dyn Host, oldfd: i32, at: Option<i32
 /// statx(332)：写入完整 128 字节 struct statx（mask = STATX_BASIC_STATS）。
 /// btime（创建时间）填 0——HostStat 无该字段时的诚实缺省。
 fn sys_statx(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 {
-    let (dirfd, path_ptr, buf, _flags, mask) = (a[0] as u32 as i32, a[1], a[2], a[3], a[4]);
+    let (dirfd, path_ptr, _buf, _flags, mask) = (a[0] as u32 as i32, a[1], a[2], a[3], a[4]);
     let _ = mask; // 全量填充，mask 请求子集由客户自行过滤
     let path = match read_cstr(proc, path_ptr) {
         Ok(p) => p,
@@ -802,7 +924,13 @@ fn sys_prlimit64(proc: &mut GuestProcess, old_buf: u64) -> i64 {
     }
 }
 
-fn sys_lseek(proc: &GuestProcess, host: &dyn Host, fd_raw: u64, off_raw: u64, whence_raw: u64) -> i64 {
+fn sys_lseek(
+    proc: &GuestProcess,
+    host: &dyn Host,
+    fd_raw: u64,
+    off_raw: u64,
+    whence_raw: u64,
+) -> i64 {
     let fd = fd_raw as u32 as i32;
     match proc.fds.get(fd) {
         Some(GuestFd::Host(f)) => host
@@ -831,7 +959,14 @@ fn sys_mmap(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 {
     }
     let hint = if fixed { addr as usize } else { 0 };
     // 先 RW 提交（host.map 契约），再收敛到请求保护位
-    let got = match unsafe { host.map(hint, len_up as usize, HostProt::READ | HostProt::WRITE, true) } {
+    let got = match unsafe {
+        host.map(
+            hint,
+            len_up as usize,
+            HostProt::READ | HostProt::WRITE,
+            true,
+        )
+    } {
         Ok(p) => p as u64,
         Err(e) => return -(host_err_to_errno(&e) as i64),
     };
@@ -843,18 +978,33 @@ fn sys_mmap(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 {
     if prot.bits() != (HostProt::READ | HostProt::WRITE).bits() {
         let _ = unsafe { host.protect(got as usize, len_up as usize, prot) };
     }
-    proc.mem.add(crate::mem::MemRange { start: got, len: len_up });
+    proc.mem.add(crate::mem::MemRange {
+        start: got,
+        len: len_up,
+    });
     got as i64
 }
 
-fn sys_mprotect(proc: &mut GuestProcess, host: &dyn Host, addr: u64, len: u64, linux_prot: u64) -> i64 {
+fn sys_mprotect(
+    proc: &mut GuestProcess,
+    host: &dyn Host,
+    addr: u64,
+    len: u64,
+    linux_prot: u64,
+) -> i64 {
     if len == 0 {
         return 0;
     }
     if !proc.mem.contains(addr, len) {
         return -(abi::ENOMEM as i64);
     }
-    match unsafe { host.protect(addr as usize, len as usize, HostProt::from_bits(linux_prot as u32)) } {
+    match unsafe {
+        host.protect(
+            addr as usize,
+            len as usize,
+            HostProt::from_bits(linux_prot as u32),
+        )
+    } {
         Ok(()) => 0,
         Err(e) => -(host_err_to_errno(&e) as i64),
     }

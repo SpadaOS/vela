@@ -27,3 +27,6 @@ vela-fs = { path = "../vela-fs" }
 
 [dev-dependencies]
 vela-sys = { path = "../vela-sys" }
+
+[lints]
+workspace = true

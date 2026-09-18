@@ -22,8 +22,16 @@ fn run_hello_prints_and_exits_zero() {
     assert!(gen.status.success(), "mkhello failed: {gen:?}");
 
     let out = vela().arg("run").arg(&elf).output().expect("spawn vela");
-    assert!(out.status.success(), "exit={:?} stderr={}", out.status.code(), String::from_utf8_lossy(&out.stderr));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello from linux elf\n");
+    assert!(
+        out.status.success(),
+        "exit={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hello from linux elf\n"
+    );
 }
 
 #[test]
@@ -44,7 +52,10 @@ fn verbose_log_goes_to_stderr() {
     assert!(err.contains("= 21"), "log missing ret: {err}");
     assert!(err.contains("exit("), "log missing: {err}");
     // 客户 stdout 不被日志污染（规格 12）
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello from linux elf\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hello from linux elf\n"
+    );
 }
 
 #[test]
@@ -61,7 +72,11 @@ fn rejects_pe_binary() {
 
 #[test]
 fn missing_file_exits_127() {
-    let out = vela().arg("run").arg("Z:/definitely/not/here.elf").output().expect("spawn vela");
+    let out = vela()
+        .arg("run")
+        .arg("Z:/definitely/not/here.elf")
+        .output()
+        .expect("spawn vela");
     assert_eq!(out.status.code(), Some(127));
 }
 
@@ -137,8 +152,7 @@ fn run_musl_hello() {
         eprintln!("skip: FSGSBASE unavailable on this machine; guest TLS cannot be switched (musl needs TLS)");
         return;
     }
-    let elf = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../guest/hello-musl");
+    let elf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../guest/bin/hello-musl");
     if !elf.exists() {
         eprintln!("skip: guest/hello-musl not built (see guest/README.md)");
         return;
@@ -172,8 +186,7 @@ fn run_file_io_guest() {
         eprintln!("skip: FSGSBASE unavailable on this machine; musl guest needs TLS");
         return;
     }
-    let elf = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../guest/file-io");
+    let elf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../guest/bin/file-io");
     if !elf.exists() {
         eprintln!("skip: guest/file-io not built (see guest/src/file-io.c)");
         return;

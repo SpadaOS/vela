@@ -7,7 +7,8 @@ use vela_abi as abi;
 use vela_runtime::mem::{LoadedImage, MemRange, Segment};
 use vela_runtime::{dispatch, GuestFd, GuestProcess};
 use vela_sys::{
-    Host, HostDir, HostDirEntry, HostError, HostFile, HostFileKind, HostOpen, HostPath, HostProt, HostStat, StdioHandles,
+    Host, HostDir, HostDirEntry, HostError, HostFile, HostFileKind, HostFileOps, HostMem, HostOpen,
+    HostPath, HostProt, HostStat, HostTime, HostTls, StdioHandles,
 };
 
 // ---------------------------------------------------------------- MockHost
@@ -19,7 +20,10 @@ struct MockHost {
 
 impl MockHost {
     fn new() -> Self {
-        MockHost { out: Mutex::new(Vec::new()), allocs: Mutex::new(std::collections::HashMap::new()) }
+        MockHost {
+            out: Mutex::new(Vec::new()),
+            allocs: Mutex::new(std::collections::HashMap::new()),
+        }
     }
 
     fn out(&self) -> Vec<u8> {
@@ -27,9 +31,16 @@ impl MockHost {
     }
 }
 
-impl Host for MockHost {
-    unsafe fn map(&self, _hint: usize, len: usize, _prot: HostProt, _anon: bool) -> Result<usize, HostError> {
-        let layout = std::alloc::Layout::from_size_align(len.max(1), 16).map_err(|_| HostError::Invalid)?;
+impl HostMem for MockHost {
+    unsafe fn map(
+        &self,
+        _hint: usize,
+        len: usize,
+        _prot: HostProt,
+        _anon: bool,
+    ) -> Result<usize, HostError> {
+        let layout =
+            std::alloc::Layout::from_size_align(len.max(1), 16).map_err(|_| HostError::Invalid)?;
         // SAFETY: 布局非零大小；测试专用
         let p = unsafe { std::alloc::alloc_zeroed(layout) };
         if p.is_null() {
@@ -48,6 +59,9 @@ impl Host for MockHost {
         }
         Ok(())
     }
+}
+
+impl HostFileOps for MockHost {
     fn open(&self, _p: &HostPath, _o: HostOpen) -> Result<HostFile, HostError> {
         Err(HostError::Unimplemented)
     }
@@ -131,6 +145,9 @@ impl Host for MockHost {
             stderr: HostFile(HostFileKind::StdErr),
         }
     }
+}
+
+impl HostTime for MockHost {
     fn monotonic_ns(&self) -> u64 {
         42
     }
@@ -141,6 +158,11 @@ impl Host for MockHost {
         buf.fill(0xA5);
         Ok(())
     }
+}
+
+impl HostTls for MockHost {}
+
+impl Host for MockHost {
     fn thread_exit(&self, code: i32) -> ! {
         std::process::exit(code)
     }
@@ -161,9 +183,18 @@ fn setup(len: usize) -> (MockHost, GuestProcess, usize) {
         phdr: 0x4000_0040,
         phnum: 1,
         phentsize: 56,
-        segments: vec![Segment { vaddr: 0x4000_0000, host_addr: addr, file_size: len as u64, mem_size: len as u64, prot: 5 }],
+        segments: vec![Segment {
+            vaddr: 0x4000_0000,
+            host_addr: addr,
+            file_size: len as u64,
+            mem_size: len as u64,
+            prot: 5,
+        }],
         exec_ranges: vec![],
-        span: MemRange { start: addr as u64, len: len as u64 },
+        span: MemRange {
+            start: addr as u64,
+            len: len as u64,
+        },
     };
     let mut proc = GuestProcess::new(1000, img);
     proc.attach_stdio(&host);
@@ -179,7 +210,12 @@ fn write_syscall_forwards_to_host() {
     unsafe {
         std::ptr::copy_nonoverlapping(b"hello".as_ptr(), (addr + 0x100) as *mut u8, 5);
     }
-    let r = dispatch(&mut proc, &host, abi::SYS_WRITE, [1, (addr + 0x100) as u64, 5, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_WRITE,
+        [1, (addr + 0x100) as u64, 5, 0, 0, 0],
+    );
     assert_eq!(r, 5);
     assert_eq!(host.out(), b"hello");
 }
@@ -187,7 +223,12 @@ fn write_syscall_forwards_to_host() {
 #[test]
 fn write_outside_mappings_gives_efault() {
     let (host, mut proc, _addr) = setup(4096);
-    let r = dispatch(&mut proc, &host, abi::SYS_WRITE, [1, u64::MAX - 4096, 8, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_WRITE,
+        [1, u64::MAX - 4096, 8, 0, 0, 0],
+    );
     assert_eq!(r, -(abi::EFAULT as i64));
 }
 
@@ -204,7 +245,12 @@ fn writev_concatenates() {
         std::ptr::write((addr + 0x40) as *mut u64, (addr + 0x20) as u64);
         std::ptr::write((addr + 0x48) as *mut u64, 3);
     }
-    let r = dispatch(&mut proc, &host, abi::SYS_WRITEV, [1, (addr + 0x30) as u64, 2, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_WRITEV,
+        [1, (addr + 0x30) as u64, 2, 0, 0, 0],
+    );
     assert_eq!(r, 5);
     assert_eq!(host.out(), b"ABCDE");
 }
@@ -215,10 +261,20 @@ fn brk_grows_within_heap() {
     let heap = proc.init_heap(&host, 0, 8192).unwrap();
     let r0 = dispatch(&mut proc, &host, abi::SYS_BRK, [0, 0, 0, 0, 0, 0]);
     assert_eq!(r0, heap as i64);
-    let r1 = dispatch(&mut proc, &host, abi::SYS_BRK, [(heap + 0x100) as u64, 0, 0, 0, 0, 0]);
+    let r1 = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_BRK,
+        [(heap + 0x100) as u64, 0, 0, 0, 0, 0],
+    );
     assert_eq!(r1, (heap + 0x100) as i64);
     // 越界增长失败，返回当前断点
-    let r2 = dispatch(&mut proc, &host, abi::SYS_BRK, [(heap + 0x10000) as u64, 0, 0, 0, 0, 0]);
+    let r2 = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_BRK,
+        [(heap + 0x10000) as u64, 0, 0, 0, 0, 0],
+    );
     assert_eq!(r2, (heap + 0x100) as i64);
 }
 
@@ -226,7 +282,12 @@ fn brk_grows_within_heap() {
 fn mmap_anonymous_registers_mapping() {
     let (host, mut proc, _addr) = setup(4096);
     let flags = (abi::MAP_PRIVATE | abi::MAP_ANONYMOUS) as u64;
-    let r = dispatch(&mut proc, &host, abi::SYS_MMAP, [0, 8192, 3, flags, (-1i64) as u64, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_MMAP,
+        [0, 8192, 3, flags, (-1i64) as u64, 0],
+    );
     assert!(r > 0);
     let mapped = r as u64;
     assert!(proc.mem.contains(mapped, 8192));
@@ -242,14 +303,24 @@ fn mmap_anonymous_registers_mapping() {
 #[test]
 fn mmap_rejects_file_backed() {
     let (host, mut proc, _addr) = setup(4096);
-    let r = dispatch(&mut proc, &host, abi::SYS_MMAP, [0, 4096, 3, abi::MAP_PRIVATE as u64, 5, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_MMAP,
+        [0, 4096, 3, abi::MAP_PRIVATE as u64, 5, 0],
+    );
     assert_eq!(r, -(abi::ENOSYS as i64));
 }
 
 #[test]
 fn uname_fills_linux_fields() {
     let (host, mut proc, addr) = setup(4096);
-    let r = dispatch(&mut proc, &host, abi::SYS_UNAME, [addr as u64, 0, 0, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_UNAME,
+        [addr as u64, 0, 0, 0, 0, 0],
+    );
     assert_eq!(r, 0);
     // SAFETY: addr 为 mock 分配的可读内存
     let sysname = unsafe { std::slice::from_raw_parts(addr as *const u8, 5) };
@@ -261,22 +332,42 @@ fn uname_fills_linux_fields() {
 #[test]
 fn arch_prctl_set_get_fs() {
     let (host, mut proc, addr) = setup(4096);
-    let r = dispatch(&mut proc, &host, abi::SYS_ARCH_PRCTL, [abi::ARCH_SET_FS, 0x1234_5678, 0, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_ARCH_PRCTL,
+        [abi::ARCH_SET_FS, 0x1234_5678, 0, 0, 0, 0],
+    );
     assert_eq!(r, 0);
     assert_eq!(proc.fs_base, 0x1234_5678);
-    let r = dispatch(&mut proc, &host, abi::SYS_ARCH_PRCTL, [abi::ARCH_GET_FS, (addr + 0x80) as u64, 0, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_ARCH_PRCTL,
+        [abi::ARCH_GET_FS, (addr + 0x80) as u64, 0, 0, 0, 0],
+    );
     assert_eq!(r, 0);
     // SAFETY: addr+0x80 为 mock 分配的可读内存
     let v = unsafe { std::ptr::read_unaligned((addr + 0x80) as *const u64) };
     assert_eq!(v, 0x1234_5678);
-    let bad = dispatch(&mut proc, &host, abi::SYS_ARCH_PRCTL, [0x9999, 0, 0, 0, 0, 0]);
+    let bad = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_ARCH_PRCTL,
+        [0x9999, 0, 0, 0, 0, 0],
+    );
     assert_eq!(bad, -(abi::EINVAL as i64));
 }
 
 #[test]
 fn getrandom_fills_buffer() {
     let (host, mut proc, addr) = setup(4096);
-    let r = dispatch(&mut proc, &host, abi::SYS_GETRANDOM, [(addr + 0x100) as u64, 16, 0, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_GETRANDOM,
+        [(addr + 0x100) as u64, 16, 0, 0, 0, 0],
+    );
     assert_eq!(r, 16);
     // SAFETY: addr+0x100 为 mock 分配的可读内存
     let b = unsafe { std::slice::from_raw_parts((addr + 0x100) as *const u8, 16) };
@@ -318,7 +409,12 @@ fn fstat_fills_linux_stat_layout() {
 #[test]
 fn fstat_bad_fd_is_ebadf() {
     let (host, mut proc, addr) = setup(4096);
-    let r = dispatch(&mut proc, &host, abi::SYS_FSTAT, [99, (addr + 0x100) as u64, 0, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_FSTAT,
+        [99, (addr + 0x100) as u64, 0, 0, 0, 0],
+    );
     assert_eq!(r, -(abi::EBADF as i64));
 }
 
@@ -327,7 +423,12 @@ fn fstat_null_fd_is_char_device() {
     let (host, mut proc, addr) = setup(4096);
     let fd = proc.fds.alloc_fd(GuestFd::Null);
     let buf = (addr + 0x100) as u64;
-    let r = dispatch(&mut proc, &host, abi::SYS_FSTAT, [fd as u64, buf, 0, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_FSTAT,
+        [fd as u64, buf, 0, 0, 0, 0],
+    );
     assert_eq!(r, 0);
     // SAFETY: buf 为 mock 分配的可写内存
     let st = unsafe { std::ptr::read_unaligned(buf as *const abi::Stat) };
@@ -345,7 +446,12 @@ fn newfstatat_empty_path_with_at_empty_path_falls_back_to_fstat() {
         std::ptr::copy_nonoverlapping(b"\0".as_ptr(), p as *mut u8, 1);
     }
     let buf = (addr + 0x100) as u64;
-    let r = dispatch(&mut proc, &host, abi::SYS_NEWFSTATAT, [1, p, buf, abi::AT_EMPTY_PATH, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_NEWFSTATAT,
+        [1, p, buf, abi::AT_EMPTY_PATH, 0, 0],
+    );
     assert_eq!(r, 0);
     // SAFETY: buf 为 mock 分配的可写内存
     let st = unsafe { std::ptr::read_unaligned(buf as *const abi::Stat) };
@@ -364,12 +470,22 @@ fn stat_on_translatable_path_fills_dir_stat() {
         let s = b"/mnt/c/Windows\0";
         std::ptr::copy_nonoverlapping(s.as_ptr(), p as *mut u8, s.len());
     }
-    let r = dispatch(&mut proc, &host, abi::SYS_STAT, [p, (addr + 0x100) as u64, 0, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_STAT,
+        [p, (addr + 0x100) as u64, 0, 0, 0, 0],
+    );
     assert_eq!(r, 0);
     // SAFETY: buf 为 mock 分配的可写内存
     let st = unsafe { std::ptr::read_unaligned((addr + 0x100) as *const abi::Stat) };
     assert_eq!(st.st_mode & abi::S_IFMT, abi::S_IFDIR);
-    let r = dispatch(&mut proc, &host, abi::SYS_LSTAT, [p, (addr + 0x100) as u64, 0, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_LSTAT,
+        [p, (addr + 0x100) as u64, 0, 0, 0, 0],
+    );
     assert_eq!(r, 0);
 }
 
@@ -382,7 +498,12 @@ fn stat_untranslatable_path_is_enoent() {
         let s = b"/nonexistent-prefix/file\0";
         std::ptr::copy_nonoverlapping(s.as_ptr(), p as *mut u8, s.len());
     }
-    let r = dispatch(&mut proc, &host, abi::SYS_STAT, [p, (addr + 0x100) as u64, 0, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_STAT,
+        [p, (addr + 0x100) as u64, 0, 0, 0, 0],
+    );
     assert_eq!(r, -(abi::ENOENT as i64));
 }
 
@@ -463,8 +584,16 @@ fn make_dir_fd(proc: &mut GuestProcess) -> i32 {
     let dir = HostDir::from_parts(
         std::path::PathBuf::from(r"C:\tmpdir"),
         vec![
-            HostDirEntry { name: "a.txt".into(), is_dir: false, ino: 100 },
-            HostDirEntry { name: "sub".into(), is_dir: true, ino: 200 },
+            HostDirEntry {
+                name: "a.txt".into(),
+                is_dir: false,
+                ino: 100,
+            },
+            HostDirEntry {
+                name: "sub".into(),
+                is_dir: true,
+                ino: 200,
+            },
         ],
     );
     proc.fds.alloc_fd(GuestFd::HostDir(dir))
@@ -476,7 +605,12 @@ fn getdents64_fills_dirent64_entries() {
     let fd = make_dir_fd(&mut proc);
     let buf = (addr + 0x100) as u64;
     // a.txt: reclen=(19+5+1+7)&!7=32；sub: (19+3+1+7)&!7=24 → 共 56
-    let r = dispatch(&mut proc, &host, abi::SYS_GETDENTS64, [fd as u64, buf, 4096, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_GETDENTS64,
+        [fd as u64, buf, 4096, 0, 0, 0],
+    );
     assert_eq!(r, 56);
     // SAFETY: buf 为 mock 分配的可写内存
     let d_ino = unsafe { std::ptr::read_unaligned(buf as *const u64) };
@@ -491,7 +625,12 @@ fn getdents64_fills_dirent64_entries() {
     let d_type2 = unsafe { std::ptr::read_unaligned((second + 18) as *const u8) };
     assert_eq!(d_type2, abi::DT_DIR);
     // 读完后再次调用返回 0
-    let r2 = dispatch(&mut proc, &host, abi::SYS_GETDENTS64, [fd as u64, buf, 4096, 0, 0, 0]);
+    let r2 = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_GETDENTS64,
+        [fd as u64, buf, 4096, 0, 0, 0],
+    );
     assert_eq!(r2, 0);
 }
 
@@ -501,11 +640,26 @@ fn getdents64_partial_reads_resume() {
     let fd = make_dir_fd(&mut proc);
     let buf = (addr + 0x100) as u64;
     // count=32：第一次填 a.txt(32)，第二次填 sub(24)，第三次 0
-    let r1 = dispatch(&mut proc, &host, abi::SYS_GETDENTS64, [fd as u64, buf, 32, 0, 0, 0]);
+    let r1 = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_GETDENTS64,
+        [fd as u64, buf, 32, 0, 0, 0],
+    );
     assert_eq!(r1, 32);
-    let r2 = dispatch(&mut proc, &host, abi::SYS_GETDENTS64, [fd as u64, buf, 32, 0, 0, 0]);
+    let r2 = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_GETDENTS64,
+        [fd as u64, buf, 32, 0, 0, 0],
+    );
     assert_eq!(r2, 24);
-    let r3 = dispatch(&mut proc, &host, abi::SYS_GETDENTS64, [fd as u64, buf, 32, 0, 0, 0]);
+    let r3 = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_GETDENTS64,
+        [fd as u64, buf, 32, 0, 0, 0],
+    );
     assert_eq!(r3, 0);
     // 第二条应是 sub
     let d_ino = unsafe { std::ptr::read_unaligned(buf as *const u64) };
@@ -517,16 +671,31 @@ fn getdents64_count_too_small_is_einval() {
     let (host, mut proc, addr) = setup(4096);
     let fd = make_dir_fd(&mut proc);
     let buf = (addr + 0x100) as u64;
-    let r = dispatch(&mut proc, &host, abi::SYS_GETDENTS64, [fd as u64, buf, 8, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_GETDENTS64,
+        [fd as u64, buf, 8, 0, 0, 0],
+    );
     assert_eq!(r, -(abi::EINVAL as i64));
 }
 
 #[test]
 fn getdents64_non_dir_fd_is_enotdir() {
     let (host, mut proc, addr) = setup(4096);
-    let r = dispatch(&mut proc, &host, abi::SYS_GETDENTS64, [1, (addr + 0x100) as u64, 4096, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_GETDENTS64,
+        [1, (addr + 0x100) as u64, 4096, 0, 0, 0],
+    );
     assert_eq!(r, -(abi::ENOTDIR as i64));
-    let r = dispatch(&mut proc, &host, abi::SYS_GETDENTS64, [99, (addr + 0x100) as u64, 4096, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_GETDENTS64,
+        [99, (addr + 0x100) as u64, 4096, 0, 0, 0],
+    );
     assert_eq!(r, -(abi::EBADF as i64));
 }
 
@@ -537,20 +706,50 @@ fn fcntl_flags_roundtrip() {
     let (host, mut proc, _addr) = setup(4096);
     let fd = proc.fds.alloc_fd(GuestFd::Null);
     // F_SETFL(O_APPEND) → F_GETFL 返回 O_APPEND
-    let r = dispatch(&mut proc, &host, abi::SYS_FCNTL, [fd as u64, abi::F_SETFL, abi::O_APPEND, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_FCNTL,
+        [fd as u64, abi::F_SETFL, abi::O_APPEND, 0, 0, 0],
+    );
     assert_eq!(r, 0);
-    let r = dispatch(&mut proc, &host, abi::SYS_FCNTL, [fd as u64, abi::F_GETFL, 0, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_FCNTL,
+        [fd as u64, abi::F_GETFL, 0, 0, 0, 0],
+    );
     assert_eq!(r, abi::O_APPEND as i64);
     // F_SETFD(FD_CLOEXEC) → F_GETFD 返回 1
-    let r = dispatch(&mut proc, &host, abi::SYS_FCNTL, [fd as u64, abi::F_SETFD, abi::FD_CLOEXEC, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_FCNTL,
+        [fd as u64, abi::F_SETFD, abi::FD_CLOEXEC, 0, 0, 0],
+    );
     assert_eq!(r, 0);
-    let r = dispatch(&mut proc, &host, abi::SYS_FCNTL, [fd as u64, abi::F_GETFD, 0, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_FCNTL,
+        [fd as u64, abi::F_GETFD, 0, 0, 0, 0],
+    );
     assert_eq!(r, 1);
     // 坏 fd
-    let r = dispatch(&mut proc, &host, abi::SYS_FCNTL, [77, abi::F_GETFL, 0, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_FCNTL,
+        [77, abi::F_GETFL, 0, 0, 0, 0],
+    );
     assert_eq!(r, -(abi::EBADF as i64));
     // 未知 cmd
-    let r = dispatch(&mut proc, &host, abi::SYS_FCNTL, [fd as u64, 99, 0, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_FCNTL,
+        [fd as u64, 99, 0, 0, 0, 0],
+    );
     assert_eq!(r, -(abi::EINVAL as i64));
 }
 
@@ -558,16 +757,31 @@ fn fcntl_flags_roundtrip() {
 fn ioctl_tiocgwinsz_returns_winsize() {
     let (host, mut proc, addr) = setup(4096);
     let buf = (addr + 0x100) as u64;
-    let r = dispatch(&mut proc, &host, abi::SYS_IOCTL, [1, abi::TIOCGWINSZ, buf, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_IOCTL,
+        [1, abi::TIOCGWINSZ, buf, 0, 0, 0],
+    );
     assert_eq!(r, 0);
     // SAFETY: buf 为 mock 分配的可写内存
     let row = unsafe { std::ptr::read_unaligned(buf as *const u16) };
     let col = unsafe { std::ptr::read_unaligned((buf + 2) as *const u16) };
     assert_eq!((row, col), (25, 80));
     // TCGETS 诚实返回 ENOTTY；坏 fd 返回 EBADF
-    let r = dispatch(&mut proc, &host, abi::SYS_IOCTL, [1, abi::TCGETS, buf, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_IOCTL,
+        [1, abi::TCGETS, buf, 0, 0, 0],
+    );
     assert_eq!(r, -(abi::ENOTTY as i64));
-    let r = dispatch(&mut proc, &host, abi::SYS_IOCTL, [99, abi::TIOCGWINSZ, buf, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_IOCTL,
+        [99, abi::TIOCGWINSZ, buf, 0, 0, 0],
+    );
     assert_eq!(r, -(abi::EBADF as i64));
 }
 
@@ -584,7 +798,12 @@ fn openat_dirfd_relative_rejects_escape_and_bad_fd() {
         std::ptr::copy_nonoverlapping(s.as_ptr(), p as *mut u8, s.len());
     }
     // 目录 fd 相对路径含 ".." → EINVAL（逃逸防护）
-    let r = dispatch(&mut proc, &host, abi::SYS_OPENAT, [fd as u64, p, abi::O_RDONLY as u64, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_OPENAT,
+        [fd as u64, p, abi::O_RDONLY as u64, 0, 0, 0],
+    );
     assert_eq!(r, -(abi::EINVAL as i64));
     // 相对路径 + 坏 dirfd → EBADF
     // SAFETY: p 为 mock 分配的可写内存
@@ -592,11 +811,21 @@ fn openat_dirfd_relative_rejects_escape_and_bad_fd() {
         let s = b"child\0";
         std::ptr::copy_nonoverlapping(s.as_ptr(), p as *mut u8, s.len());
     }
-    let r = dispatch(&mut proc, &host, abi::SYS_OPENAT, [99, p, abi::O_RDONLY as u64, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_OPENAT,
+        [99, p, abi::O_RDONLY as u64, 0, 0, 0],
+    );
     assert_eq!(r, -(abi::EBADF as i64));
     // 相对路径 + 非目录 fd（Null）→ EBADF
     let nullfd = proc.fds.alloc_fd(GuestFd::Null);
-    let r = dispatch(&mut proc, &host, abi::SYS_OPENAT, [nullfd as u64, p, abi::O_RDONLY as u64, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_OPENAT,
+        [nullfd as u64, p, abi::O_RDONLY as u64, 0, 0, 0],
+    );
     assert_eq!(r, -(abi::EBADF as i64));
 }
 
@@ -620,7 +849,12 @@ fn dup_and_dup2_semantics() {
     let r = dispatch(&mut proc, &host, abi::SYS_DUP, [99, 0, 0, 0, 0, 0]);
     assert_eq!(r, -(abi::EBADF as i64));
     // fcntl F_DUPFD_CLOEXEC → 最小可用 fd（3 被 dup 占用，落在 4）
-    let r = dispatch(&mut proc, &host, abi::SYS_FCNTL, [1, abi::F_DUPFD_CLOEXEC, 0, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_FCNTL,
+        [1, abi::F_DUPFD_CLOEXEC, 0, 0, 0, 0],
+    );
     assert_eq!(r, 4);
     assert!(matches!(proc.fds.get(4), Some(GuestFd::Host(_))));
 }
@@ -635,7 +869,19 @@ fn statx_fills_basic_layout() {
         std::ptr::copy_nonoverlapping(s.as_ptr(), p as *mut u8, s.len());
     }
     let buf = (addr + 0x100) as u64;
-    let r = dispatch(&mut proc, &host, abi::SYS_STATX, [abi::AT_FDCWD as u64, p, buf, 0, abi::STATX_BASIC_STATS as u64, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_STATX,
+        [
+            abi::AT_FDCWD as u64,
+            p,
+            buf,
+            0,
+            abi::STATX_BASIC_STATS as u64,
+            0,
+        ],
+    );
     assert_eq!(r, 0);
     // SAFETY: buf 为 mock 分配的可写内存
     let mask = unsafe { std::ptr::read_unaligned(buf as *const u32) };
@@ -652,15 +898,29 @@ fn statx_fills_basic_layout() {
 fn honest_stubs_and_errors() {
     let (host, mut proc, addr) = setup(4096);
     // 信号类诚实 stub：记录返回 0
-    for nr in [abi::SYS_RT_SIGACTION, abi::SYS_RT_SIGPROCMASK, abi::SYS_MADVISE] {
+    for nr in [
+        abi::SYS_RT_SIGACTION,
+        abi::SYS_RT_SIGPROCMASK,
+        abi::SYS_MADVISE,
+    ] {
         let r = dispatch(&mut proc, &host, nr, [0, 0, 0, 0, 0, 0]);
         assert_eq!(r, 0, "nr={nr}");
     }
     // getrusage 填零结构
-    let r = dispatch(&mut proc, &host, abi::SYS_GETRUSAGE, [0, (addr + 0x100) as u64, 0, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_GETRUSAGE,
+        [0, (addr + 0x100) as u64, 0, 0, 0, 0],
+    );
     assert_eq!(r, 0);
     // prlimit64 上报 RLIM_INFINITY
-    let r = dispatch(&mut proc, &host, abi::SYS_PRLIMIT64, [0, 0, 0, (addr + 0x180) as u64, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_PRLIMIT64,
+        [0, 0, 0, (addr + 0x180) as u64, 0, 0],
+    );
     assert_eq!(r, 0);
     // SAFETY: mock 分配内存
     let lim = unsafe { std::ptr::read_unaligned((addr + 0x180) as *const u64) };
@@ -673,11 +933,25 @@ fn honest_stubs_and_errors() {
 #[test]
 fn clock_gettime_monotonic_variants() {
     let (host, mut proc, addr) = setup(4096);
-    for clk in [abi::CLOCK_MONOTONIC, abi::CLOCK_MONOTONIC_RAW, abi::CLOCK_BOOTTIME] {
-        let r = dispatch(&mut proc, &host, abi::SYS_CLOCK_GETTIME, [clk, (addr + 0x100) as u64, 0, 0, 0, 0]);
+    for clk in [
+        abi::CLOCK_MONOTONIC,
+        abi::CLOCK_MONOTONIC_RAW,
+        abi::CLOCK_BOOTTIME,
+    ] {
+        let r = dispatch(
+            &mut proc,
+            &host,
+            abi::SYS_CLOCK_GETTIME,
+            [clk, (addr + 0x100) as u64, 0, 0, 0, 0],
+        );
         assert_eq!(r, 0, "clk={clk}");
     }
-    let r = dispatch(&mut proc, &host, abi::SYS_CLOCK_GETTIME, [99, (addr + 0x100) as u64, 0, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_CLOCK_GETTIME,
+        [99, (addr + 0x100) as u64, 0, 0, 0, 0],
+    );
     assert_eq!(r, -(abi::EINVAL as i64));
 }
 
@@ -685,7 +959,12 @@ fn clock_gettime_monotonic_variants() {
 fn ioctl_is_not_tty() {
     let (host, mut proc, _addr) = setup(4096);
     // TCGETS 诚实返回 ENOTTY（不是终端）；未知 cmd 同样
-    let r = dispatch(&mut proc, &host, abi::SYS_IOCTL, [1, abi::TCGETS, 0, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_IOCTL,
+        [1, abi::TCGETS, 0, 0, 0, 0],
+    );
     assert_eq!(r, -(abi::ENOTTY as i64));
     let r = dispatch(&mut proc, &host, abi::SYS_IOCTL, [1, 0xDEAD, 0, 0, 0, 0]);
     assert_eq!(r, -(abi::ENOTTY as i64));

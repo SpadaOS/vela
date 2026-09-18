@@ -55,8 +55,15 @@ pub fn build_stack(
     }
 
     // SAFETY: host.map 契约保证零填充可写内存
-    let base = unsafe { host.map(0, stack_size as usize, HostProt::READ | HostProt::WRITE, true) }
-        .map_err(|e: HostError| format!("map stack: {e}"))? as u64;
+    let base = unsafe {
+        host.map(
+            0,
+            stack_size as usize,
+            HostProt::READ | HostProt::WRITE,
+            true,
+        )
+    }
+    .map_err(|e: HostError| format!("map stack: {e}"))? as u64;
     let top = base + stack_size;
 
     // —— 自顶向下布局：
@@ -139,5 +146,11 @@ pub fn build_stack(
         std::ptr::copy_nonoverlapping(buf.as_ptr(), rsp as *mut u8, buf.len());
     }
 
-    Ok((rsp, MemRange { start: base, len: stack_size }))
+    Ok((
+        rsp,
+        MemRange {
+            start: base,
+            len: stack_size,
+        },
+    ))
 }

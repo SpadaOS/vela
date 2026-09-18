@@ -10,7 +10,7 @@ pub use syscalls::dispatch;
 use std::collections::BTreeMap;
 
 use vela_abi as abi;
-use vela_sys::{Host, HostDir, HostFile, HostError, HostProt};
+use vela_sys::{Host, HostDir, HostError, HostFile, HostProt};
 
 use crate::mem::MemRegistry;
 
@@ -46,7 +46,10 @@ impl FdTable {
         t.insert(1, GuestFd::Host(s.stdout));
         t.insert(2, GuestFd::Host(s.stderr));
         // Linux stdio 以 O_RDWR 打开字符设备
-        let mut f = FdTable { table: t, flags: BTreeMap::new() };
+        let mut f = FdTable {
+            table: t,
+            flags: BTreeMap::new(),
+        };
         for fd in 0..3 {
             f.flags.insert(fd, (abi::O_RDWR as u32) << 8);
         }
@@ -146,8 +149,18 @@ impl GuestProcess {
     /// 预留连续堆区域并把断点置于区域起点（规格 5.4 brk 说明）。
     pub fn init_heap(&mut self, host: &dyn Host, hint: u64, size: u64) -> Result<u64, HostError> {
         // SAFETY: host.map 契约保证返回零填充可写内存
-        let addr = unsafe { host.map(hint as usize, size as usize, HostProt::READ | HostProt::WRITE, true) }? as u64;
-        let r = MemRange { start: addr, len: size };
+        let addr = unsafe {
+            host.map(
+                hint as usize,
+                size as usize,
+                HostProt::READ | HostProt::WRITE,
+                true,
+            )
+        }? as u64;
+        let r = MemRange {
+            start: addr,
+            len: size,
+        };
         self.heap = Some(r);
         self.mem.add(r);
         self.brk_start = addr;

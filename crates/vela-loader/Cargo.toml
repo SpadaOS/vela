@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 vela-sys = { path = "../vela-sys" }
 vela-runtime = { path = "../vela-runtime" }
+
+[lints]
+workspace = true

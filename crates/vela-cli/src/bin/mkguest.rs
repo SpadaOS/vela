@@ -44,7 +44,10 @@ struct Code {
 
 impl Code {
     fn new() -> Self {
-        Code { buf: Vec::new(), fix: Vec::new() }
+        Code {
+            buf: Vec::new(),
+            fix: Vec::new(),
+        }
     }
     fn e(&mut self, b: &[u8]) {
         self.buf.extend_from_slice(b);
@@ -126,7 +129,7 @@ impl Code {
         self.e(&[0xC7, 0x05]); // mov dword [rip+d], imm32
         let at = self.buf.len();
         self.e(&[0, 0, 0, 0]); // disp32 占位
-        // 注意：imm32 在 disp32 之后，rip 相对位移以整条指令结束处为基准
+                               // 注意：imm32 在 disp32 之后，rip 相对位移以整条指令结束处为基准
         let end = self.buf.len() + 4;
         self.e(&v.to_le_bytes());
         self.fix.push((at, end, sym, off));
@@ -166,7 +169,10 @@ struct Data {
 
 impl Data {
     fn new() -> Self {
-        Data { blob: Vec::new(), syms: Vec::new() }
+        Data {
+            blob: Vec::new(),
+            syms: Vec::new(),
+        }
     }
     fn sym(&mut self, name: &'static str, bytes: &[u8]) {
         let off = self.blob.len();
@@ -177,7 +183,11 @@ impl Data {
         self.sym(name, &vec![0u8; n]);
     }
     fn off(&self, name: &str) -> usize {
-        self.syms.iter().find(|(n, _)| *n == name).map(|(_, o)| *o).expect("sym")
+        self.syms
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, o)| *o)
+            .expect("sym")
     }
     fn patch_u64(&mut self, name: &str, off: usize, v: u64) {
         let base = self.off(name);
@@ -333,9 +343,6 @@ fn build_torture() -> Vec<u8> {
 
     frame(c, d)
 }
-
-/// "mmap ?t? ok\n"，?0 = fs:[0x40] 存取往返，?1 = GET_FS 回读 == tls_area。
-/// 需要 FSGSBASE；不支持时 fs 基址为 0 → fs 写会崩溃（视为诚实的失败）。
 
 /// bench guest（PLAN-0.0.3 T1.1）：纯翻译 syscall 吞吐基准。
 /// 循环 N 次 getpid(39)（无内存/路径/IO 参与，纯 VEH→dispatch→返回往返），
