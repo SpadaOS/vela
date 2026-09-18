@@ -966,6 +966,19 @@ fn sys_mmap(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 {
     let len_up = (len + PAGE - 1) & !(PAGE - 1);
     let fixed = flags & abi::MAP_FIXED as u64 != 0 && addr != 0;
     if fixed && proc.mem.overlaps(addr, len_up) {
+        // Linux 语义：MAP_FIXED 替换既有映射。vela 无法部分释放 Windows 预留块；
+        // 但 musl mallocng 依赖"把 brk 新增页用 MAP_FIXED 匿名映射转为可 munmap
+        // 映射"（donate）。整个区间落在单个 Reserve 块内时就地接受并收敛保护位
+        // （内容语义差异：Linux 替换为匿名零页，vela 保留原页——musl 只对未写入
+        // 的 brk 尾页这样做，可接受并记录于 SYSCALLS.md）。
+        if proc.mem.contains(addr, len_up)
+            && proc.mem.containing(addr, len_up).map(|r| r.kind)
+                == Some(crate::mem::MemKind::Reserve)
+        {
+            let prot = HostProt::from_bits(linux_prot as u32);
+            let _ = unsafe { host.protect(addr as usize, len_up as usize, prot) };
+            return addr as i64;
+        }
         return -(abi::ENOMEM as i64);
     }
     let hint = if fixed { addr as usize } else { 0 };

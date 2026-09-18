@@ -81,6 +81,8 @@ fn print_usage() {
     eprintln!("  --stack-mb <n>     客户栈大小 MiB（默认 8，1-512）");
     eprintln!("  --heap-mb <n>      客户堆大小 MiB（默认 8，1-1024）");
     eprintln!("  -v                 syscall 日志到 stderr（或 VELA_LOG=1）");
+    eprintln!("  --soft-tls         实验开关：FSGSBASE 缺失环境下软件模拟客户 fs 段");
+    eprintln!("                     访问（诊断/CI 可用，性能不承诺）");
     eprintln!("env:   VELA_LOG=1 或 -v 打印 syscall 日志到 stderr");
 }
 
@@ -95,6 +97,7 @@ struct RunOpts {
     stack_mb: u64,
     heap_mb: u64,
     interp: Option<String>,
+    soft_tls: bool,
 }
 
 fn cmd_run(rest: &[String]) -> i32 {
@@ -108,6 +111,7 @@ fn cmd_run(rest: &[String]) -> i32 {
         stack_mb: 8,
         heap_mb: 8,
         interp: None,
+        soft_tls: false,
     };
     let mut pos: Vec<String> = Vec::new();
     let mut i = 0;
@@ -143,6 +147,9 @@ fn cmd_run(rest: &[String]) -> i32 {
                 };
                 opts.interp = Some(v.clone());
                 i += 1;
+            }
+            "--soft-tls" => {
+                opts.soft_tls = true;
             }
             "--uid" | "--gid" | "--stack-mb" | "--heap-mb" => {
                 let Some(v) = rest.get(i + 1) else {
@@ -439,6 +446,13 @@ fn run_elf(
 
     #[cfg(windows)]
     {
+        // --soft-tls：FSGSBASE 缺失环境的实验回退（PLAN-0.0.4 T4.1/T4.2）
+        if opts.soft_tls {
+            vela_sys::windows::enable_soft_tls();
+            eprintln!(
+                "[vela] soft-tls enabled: fs-prefixed guest accesses will be emulated (slow; diagnostics/CI only)"
+            );
+        }
         let state = Box::new(GuestState { proc, host });
         let ptr = Box::into_raw(state);
         GUEST.store(ptr, Ordering::Relaxed);
@@ -492,6 +506,10 @@ unsafe extern "system" fn trap(
     }
     // SAFETY: GUEST 在进入客户前设置一次；VEH 与客户代码同线程
     let st = unsafe { &mut *p };
+    // soft-tls：同步客户 TLS 基址到 VEH 模拟器（arch_prctl 记录后即生效）
+    if st.proc.fs_base != 0 {
+        vela_sys::windows::set_soft_tls_base(st.proc.fs_base);
+    }
     if logx::enabled() {
         if vela_sys::windows::stub_hit() {
             eprintln!("[vela] stub HIT ✓");

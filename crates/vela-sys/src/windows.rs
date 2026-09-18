@@ -227,6 +227,17 @@ unsafe extern "system" fn veh_handler(ep: *mut ExceptionPointers) -> i32 {
         // SAFETY: 同上
         let ctx = unsafe { &mut *ep.context_record };
         if guest_range_containing(ctx.rip as usize).is_some() {
+            // soft-tls（--soft-tls）：fs 前缀 mov 的软件模拟（T4.1）。
+            // 重入防护：模拟自身的访存再 AV（TLS 区未映射）不允许递归。
+            if SOFT_TLS_ENABLED.load(Ordering::Relaxed) == 1
+                && IN_SOFT_EMULATE.swap(1, Ordering::SeqCst) == 0
+            {
+                let emulated = unsafe { emulate_fs_mov(ctx) };
+                IN_SOFT_EMULATE.store(0, Ordering::SeqCst);
+                if emulated {
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
             // SAFETY: rip 在客户映射内（已确认），读 16 字节仅用于诊断
             let bytes = unsafe { std::slice::from_raw_parts(ctx.rip as *const u8, 16) };
             let hb: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
@@ -311,6 +322,226 @@ unsafe extern "system" fn veh_handler(ep: *mut ExceptionPointers) -> i32 {
 pub fn set_console_utf8() {
     // SAFETY: 无参数约束
     unsafe { SetConsoleOutputCP(65001) };
+}
+
+// ------------------------------------------------------- Soft TLS（--soft-tls）
+//
+// FSGSBASE 缺失的环境（Hyper-V/云 VM/VBS，PLAN-0.0.4 T4.1/T4.2）：客户的
+// arch_prctl(SET_FS) 只记录基址、FS 段寄存器无法真实切换，客户任何 fs 前缀
+// 访问都会 AV。--soft-tls 开启后，VEH 对客户段内 fs 前缀的 mov 指令做软件
+// 模拟：以记录的客户 TLS 基址计算有效地址、代为读写内存、Rip 前进。
+// 覆盖 musl 实际发射的有限形态（mov r, fs:[mem] / mov fs:[mem], r）；
+// 未覆盖形态仍按致命路径退出并输出指令字节。诊断/CI 可用，性能不承诺。
+
+static SOFT_TLS_ENABLED: AtomicU32 = AtomicU32::new(0);
+/// 客户侧 TLS 基址（proc.fs_base 由 CLI 在每次 syscall 陷阱时同步）。
+static SOFT_TLS_BASE: AtomicU64 = AtomicU64::new(0);
+/// 模拟重入防护：模拟自身的读写若再触发 AV（TLS 区未映射等），不允许递归。
+static IN_SOFT_EMULATE: AtomicU32 = AtomicU32::new(0);
+static SOFT_TLS_WARNED: AtomicU32 = AtomicU32::new(0);
+
+pub fn enable_soft_tls() {
+    SOFT_TLS_ENABLED.store(1, Ordering::Relaxed);
+}
+
+pub fn set_soft_tls_base(v: u64) {
+    SOFT_TLS_BASE.store(v, Ordering::Relaxed);
+}
+
+/// fs 前缀 mov 的解码结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FsMov {
+    /// 指令总长（Rip 前进量）。
+    len: usize,
+    /// true = 读内存入寄存器（8b），false = 写寄存器入内存（89）。
+    load: bool,
+    /// REX.R/B 扩展后的寄存器编号（0..15）。
+    reg: usize,
+    /// 内存操作数描述（不含 FS 基址）：RIP 相对时 effective = rip_next + disp，
+    /// 否则 effective = base + idx*scale + disp（各分量可为 0）。
+    rip_rel: bool,
+    base: usize,
+    idx: usize,
+    scale: usize,
+    disp: i64,
+}
+
+/// 解码 `64 [REX] 8b/89 modrm [sib] [disp]`。不认识/非内存形态返回 None。
+fn decode_fs_mov(b: &[u8]) -> Option<FsMov> {
+    if b.first() != Some(&0x64) {
+        return None;
+    }
+    let mut i = 1;
+    let mut rex = 0u8;
+    if i < b.len() && b[i] & 0xF0 == 0x40 {
+        rex = b[i];
+        i += 1;
+    }
+    let rex_w = rex & 0x08 != 0;
+    if !rex_w {
+        return None; // 仅 64 位操作数（musl 只发 64 位 TLS 访问）
+    }
+    if i >= b.len() {
+        return None;
+    }
+    let op = b[i];
+    i += 1;
+    let (load, reg_ext) = match op {
+        0x8b => (true, (rex & 0x04) != 0),
+        0x89 => (false, (rex & 0x04) != 0),
+        _ => return None,
+    };
+    if i >= b.len() {
+        return None;
+    }
+    let modrm = b[i];
+    i += 1;
+    let mode = modrm >> 6;
+    let reg = (((modrm >> 3) & 7) as usize) | if reg_ext { 8 } else { 0 };
+    let mut rm = (modrm & 7) as usize;
+    if rex & 0x01 != 0 {
+        rm |= 8;
+    }
+    let mut m = FsMov {
+        len: i,
+        load,
+        reg,
+        rip_rel: false,
+        base: 0,
+        idx: usize::MAX, // usize::MAX = 无变址
+        scale: 1,
+        disp: 0,
+    };
+    match mode {
+        3 => return None, // 寄存器对寄存器，不会 AV
+        0 => {
+            if rm == 5 {
+                // RIP 相对
+                if i + 4 > b.len() {
+                    return None;
+                }
+                m.rip_rel = true;
+                m.disp = i32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) as i64;
+                i += 4;
+            } else {
+                if rm == 4 {
+                    // SIB
+                    if i >= b.len() {
+                        return None;
+                    }
+                    let sib = b[i];
+                    i += 1;
+                    m.scale = 1 << (sib >> 6);
+                    m.idx = (((sib >> 3) & 7) as usize) | if rex & 0x02 != 0 { 8 } else { 0 };
+                    let base = (sib & 7) as usize | if rex & 0x01 != 0 { 8 } else { 0 };
+                    if base == 5 {
+                        // 无基址，disp32 绝对（fs:0 形态）
+                        if i + 4 > b.len() {
+                            return None;
+                        }
+                        m.disp = i32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) as i64;
+                        i += 4;
+                        m.idx = usize::MAX; // 绝对形态忽略变址（musl 不发射）
+                    } else {
+                        m.base = base;
+                    }
+                } else {
+                    m.base = rm;
+                }
+            }
+        }
+        1 => {
+            if i >= b.len() {
+                return None;
+            }
+            m.disp = b[i] as i8 as i64;
+            i += 1;
+            if rm == 4 {
+                // mod=01 SIB：取 SIB + disp8（含基址）
+                if i >= b.len() {
+                    return None;
+                }
+                let sib = b[i];
+                i += 1;
+                m.scale = 1 << (sib >> 6);
+                m.idx = (((sib >> 3) & 7) as usize) | if rex & 0x02 != 0 { 8 } else { 0 };
+                m.base = (sib & 7) as usize | if rex & 0x01 != 0 { 8 } else { 0 };
+            }
+        }
+        2 => {
+            if i + 4 > b.len() {
+                return None;
+            }
+            m.disp = i32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) as i64;
+            i += 4;
+            if rm == 4 {
+                if i >= b.len() {
+                    return None;
+                }
+                let sib = b[i];
+                i += 1;
+                m.scale = 1 << (sib >> 6);
+                m.idx = (((sib >> 3) & 7) as usize) | if rex & 0x02 != 0 { 8 } else { 0 };
+                m.base = (sib & 7) as usize | if rex & 0x01 != 0 { 8 } else { 0 };
+            }
+        }
+        _ => return None,
+    }
+    m.len = i;
+    Some(m)
+}
+
+/// ctx 中编号 0..15 的 64 位寄存器（rax..r15，与 Context 字段顺序一致）。
+unsafe fn ctx_reg(ctx: &mut Context, idx: usize) -> u64 {
+    // SAFETY: rax..r15 在 Context 中连续排列（repr(C)，偏移 0x78..0xF0）
+    let base = std::ptr::addr_of_mut!(ctx.rax);
+    unsafe { *(base.add(idx)) }
+}
+
+/// soft-tls 模拟：成功时写回寄存器/内存并前进 Rip，返回 true。
+unsafe fn emulate_fs_mov(ctx: &mut Context) -> bool {
+    let rip = ctx.rip as usize;
+    // SAFETY: rip 在客户映射内（调用方已用 exec range 确认）
+    let bytes = unsafe { std::slice::from_raw_parts(rip as *const u8, 16) };
+    let Some(m) = decode_fs_mov(bytes) else {
+        return false;
+    };
+    let fs = SOFT_TLS_BASE.load(Ordering::Relaxed);
+    if fs == 0 {
+        return false; // arch_prctl(SET_FS) 尚未发生：不是可模拟的 TLS 访问
+    }
+    let rip_next = (rip + m.len) as u64;
+    let effective: u64 = if m.rip_rel {
+        (rip_next as i64).wrapping_add(m.disp) as u64
+    } else {
+        let mut a: i64 = m.disp;
+        if m.base != 0 {
+            a = a.wrapping_add(unsafe { ctx_reg(ctx, m.base) } as i64);
+        }
+        if m.idx != usize::MAX {
+            a = a
+                .wrapping_add((unsafe { ctx_reg(ctx, m.idx) }.wrapping_mul(m.scale as u64)) as i64);
+        }
+        (fs as i64).wrapping_add(a) as u64
+    };
+    if SOFT_TLS_WARNED.swap(1, Ordering::Relaxed) == 0 {
+        eprintln!(
+            "[vela] soft-tls: emulating fs-prefixed access at {:#x} (slow path; diagnostics/CI only, no performance promise)",
+            rip
+        );
+    }
+    // SAFETY: TLS 区由客户自行映射；地址无效时嵌套 AV 由重入防护兜底
+    if m.load {
+        let v = unsafe { (effective as *const u64).read_unaligned() };
+        unsafe {
+            *(std::ptr::addr_of_mut!(ctx.rax).add(m.reg)) = v;
+        }
+    } else {
+        let v = unsafe { ctx_reg(ctx, m.reg) };
+        unsafe { (effective as *mut u64).write_unaligned(v) };
+    }
+    ctx.rip = rip_next;
+    true
 }
 
 // ------------------------------------------------------- FS 基址（客户 TLS）
@@ -762,6 +993,58 @@ impl Host for WindowsHost {
     }
     fn process_exit(&self, code: i32) -> ! {
         std::process::exit(code)
+    }
+}
+
+#[cfg(test)]
+mod soft_tls_tests {
+    //! decode_fs_mov 覆盖 musl 实际发射的形态（T4.1）。
+    use super::*;
+
+    #[test]
+    fn decodes_fs0_sib_absolute() {
+        // mov rcx, fs:[0]（本次 hello-dyn 崩溃形态）
+        let m = decode_fs_mov(&[0x64, 0x48, 0x8b, 0x0c, 0x25, 0x00, 0x00, 0x00, 0x00]).unwrap();
+        assert!(m.load);
+        assert_eq!(m.reg, 1); // rcx
+        assert!(!m.rip_rel);
+        assert_eq!(m.base, 0);
+        assert_eq!(m.disp, 0);
+        assert_eq!(m.len, 9);
+        // mov rax, fs:[0]
+        let m = decode_fs_mov(&[0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00]).unwrap();
+        assert_eq!(m.reg, 0);
+        assert_eq!(m.len, 9);
+    }
+
+    #[test]
+    fn decodes_rip_relative_and_write() {
+        // mov rax, fs:[rip+0x10]：64 48 8b 05 10 00 00 00
+        let m = decode_fs_mov(&[0x64, 0x48, 0x8b, 0x05, 0x10, 0x00, 0x00, 0x00]).unwrap();
+        assert!(m.rip_rel);
+        assert_eq!(m.reg, 0);
+        assert_eq!(m.len, 8);
+        // mov fs:[0], rax（写）：64 48 89 04 25 00 00 00 00
+        let m = decode_fs_mov(&[0x64, 0x48, 0x89, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00]).unwrap();
+        assert!(!m.load);
+        assert_eq!(m.reg, 0);
+        // r8 目标（REX.R）：64 4c 8b 04 25 00 00 00 00 → reg=8
+        let m = decode_fs_mov(&[0x64, 0x4c, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00]).unwrap();
+        assert_eq!(m.reg, 8);
+    }
+
+    #[test]
+    fn rejects_unsupported_forms() {
+        // 非 fs 前缀
+        assert!(decode_fs_mov(&[0x48, 0x8b, 0x0c, 0x25]).is_none());
+        // fs 前缀但 32 位操作数（无 REX.W）
+        assert!(decode_fs_mov(&[0x64, 0x8b, 0x0c, 0x25]).is_none());
+        // fs 前缀但非 mov（lea 8d）
+        assert!(decode_fs_mov(&[0x64, 0x48, 0x8d, 0x05, 0, 0, 0, 0]).is_none());
+        // 寄存器对寄存器（mod=3）
+        assert!(decode_fs_mov(&[0x64, 0x48, 0x8b, 0xc8]).is_none());
+        // 截断
+        assert!(decode_fs_mov(&[0x64, 0x48, 0x8b]).is_none());
     }
 }
 
