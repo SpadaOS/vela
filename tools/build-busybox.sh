@@ -6,6 +6,9 @@ set -euo pipefail
 
 BB_VER=1.36.1
 WS="${GITHUB_WORKSPACE:-$(pwd)}"
+# msys2：GITHUB_WORKSPACE 是 Windows 形式（D:\a\vela\vela），直接拼进 tar/mv
+# 参数会被 msys2 转换搅坏（D\:\a\vela\vela），先显式转成 POSIX 形式
+WS="$(cygpath -u "$WS")"
 BB_SRC="$WS/.busybox-src"
 
 command -v make >/dev/null || { echo "make not in PATH"; exit 1; }
