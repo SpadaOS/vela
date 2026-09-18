@@ -15,8 +15,7 @@ command -v make >/dev/null || { echo "make not in PATH"; exit 1; }
 command -v gcc >/dev/null || { echo "gcc not in PATH (HOSTCC)"; exit 1; }
 command -v zig >/dev/null || { echo "zig not in PATH"; exit 1; }
 
-# 诊断：zig 对 msys2 参数/路径转换高度敏感；MSYS 转换只对含 / 的参数发生，
-# 本构建的 zig 命令行全是相对路径，排除转换干扰（CI 曾现 FileNotFound）
+# zig 命令行全是相对路径，排除 msys2 参数/环境变量转换的干扰面
 export MSYS2_ARG_CONV_EXCL="*"
 export MSYS2_ENV_CONV_EXCL="*"
 
@@ -42,34 +41,12 @@ rm -rf include/config
 make silentoldconfig HOSTCC=gcc
 test -f include/autoconf.h || { echo "FATAL: include/autoconf.h not generated"; exit 1; }
 
-# ---- 二分诊断：make 调用下 zig 瞬间 FileNotFound，定位致命 flag ----
-B="zig cc -target x86_64-linux-musl"
-echo "BISECT trivial-repeat:"; echo 'int main(void){return 0;}' > diag_t.c
-$B -c -o diag_t.o diag_t.c && echo "  t0 plain OK" || echo "  t0 plain FAIL"
-echo "BISECT v1 full flags:"
-$B -fPIE -pie -Wp,-MD,applets/.applets.o.d -Iinclude -Ilibbb -include include/autoconf.h \
-   -D_GNU_SOURCE -DNDEBUG -DBB_VER='"1.36.1"' -Wold-style-definition \
-   -DKBUILD_BASENAME='"applets"' -DKBUILD_MODNAME='"applets"' \
-   -c -o applets/bisect1.o applets/applets.c && echo "  v1 OK" || echo "  v1 FAIL"
-echo "BISECT v2 no -Wp:"
-$B -fPIE -pie -Iinclude -Ilibbb -include include/autoconf.h \
-   -D_GNU_SOURCE -DNDEBUG -DBB_VER='"1.36.1"' -Wold-style-definition \
-   -DKBUILD_BASENAME='"applets"' -DKBUILD_MODNAME='"applets"' \
-   -c -o applets/bisect2.o applets/applets.c && echo "  v2 OK" || echo "  v2 FAIL"
-echo "BISECT v3 no pie:"
-$B -fPIE -Wp,-MD,applets/.applets.o.d -Iinclude -Ilibbb -include include/autoconf.h \
-   -D_GNU_SOURCE -DNDEBUG -DBB_VER='"1.36.1"' -Wold-style-definition \
-   -DKBUILD_BASENAME='"applets"' -DKBUILD_MODNAME='"applets"' \
-   -c -o applets/bisect3.o applets/applets.c && echo "  v3 OK" || echo "  v3 FAIL"
-echo "BISECT v4 no -include:"
-$B -fPIE -pie -Wp,-MD,applets/.applets.o.d -Iinclude -Ilibbb \
-   -D_GNU_SOURCE -DNDEBUG -DBB_VER='"1.36.1"' -Wold-style-definition \
-   -DKBUILD_BASENAME='"applets"' -DKBUILD_MODNAME='"applets"' \
-   -c -o applets/bisect4.o applets/applets.c && echo "  v4 OK" || echo "  v4 FAIL"
-echo "BISECT v5 plain applets.c:"
-$B -c -o applets/bisect5.o applets/applets.c && echo "  v5 OK" || echo "  v5 FAIL"
-ls -l applets/*.o 2>/dev/null || echo "BISECT: no objects produced"
-# ---- 二分诊断结束 ----
+# zig 0.13 Windows 下 -Wp,-MD,<depfile> 会瞬间 FileNotFound（zig 的 dep-file
+# 缓存 bug，见 CI 二分日志：含 -Wp 必失败、去之立过）。CI 为一次性构建，
+# 依赖追踪无意义：剥离 depfile 参数并禁用 fixdep 后处理（宿主 gcc 工具链
+# 的 depfile 在 Makefile.host 单独定义，不受影响）。
+sed -i 's/-Wp,-MD,\$(depfile) //' scripts/Makefile.lib
+sed -i 's|scripts/basic/fixdep|: fixdep-disabled|' scripts/Makefile.build
 
 # zig cc musl 默认静态；-fPIE -pie 生成 ET_DYN（vela 仅接受 PIE）。
 # -j1：规避多 zig 进程共享缓存的 Windows 竞争；V=1：失败时日志有完整命令。
