@@ -38,6 +38,7 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           update: false
+          path-type: inherit
           install: make gcc
       - name: Build busybox subset (musl static via zig)
         shell: msys2 {0}
