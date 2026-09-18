@@ -34,5 +34,7 @@ jobs:
         run: |
           cargo run -p vela-cli --bin vela -- run guest/bin/hello
           cargo run -p vela-cli --bin vela -- run guest/bin/torture
+          cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/hello-dyn
+          cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/fs-exec
       - name: Doctor report (informational)
         run: cargo run -p vela-cli --bin vela -- doctor

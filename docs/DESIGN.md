@@ -62,6 +62,56 @@ vela.exe (PE)
   本机（裸机 Server 2022）musl hello 300+ 次零失败。
 - `SYS_SET_TID_ADDRESS` 在 x86_64 上是 **218**（初版误写 249，musl 启动会调用）。
 
+## 动态加载（0.0.4）
+
+musl 的动态执行不依赖 Vela 做重定位——`ld-musl-x86_64.so.1` 自身就是完整的
+ELF 加载器。Vela 只做两件事：
+
+1. **双映像装载**：客户 ELF 与解释器各自按静态 PIE 流程装载（各自
+   span/bias，syscall patch 与保护位收敛不变）。解释器路径来自客户 ELF 的
+   `PT_INTERP`，白名单 `ld-musl*`（其余诚实拒绝，不做通用 glibc 动态链接）。
+2. **内核式 auxv**：`AT_BASE`=解释器 bias、`AT_PHDR/AT_ENTRY/AT_EXECFN`=
+   客户侧，入口跳解释器 `_dlstart`。ld-musl 以 `AT_BASE` 推导自身基址、
+   自我重定位、经 `arch_prctl(SET_FS)`/`set_tid_address` 建立线程环境，
+   再按 `AT_PHDR` 重定位主程序并跳 `AT_ENTRY`。
+
+文件映射支撑：ldso 自身的 `__map_file`（读 ELF）与 mallocng 的 brk 页
+MAP_FIXED carve 都落在 M1 的文件映射 + Reserve 内就地覆盖语义上（见
+SYSCALLS.md mmap 行）。解释器解析顺序：`--interp` 显式指定 > fs 映射翻译
+> guest ELF 同目录同名文件回退。
+
+## execve 重载（0.0.4）
+
+vela 无 fork，进程内重载是 execve 的唯一诚实路径。重载在 CLI 的 trap 层
+编排（loader 与栈构建都在该 crate；runtime 保持与 loader 单向依赖）：
+
+1. 新映像先装载（失败返回 -errno，旧映像继续——Linux execve 失败语义）。
+2. 成功后：清 exec-range 表 → 旧地址空间解除登记 → CLOEXEC fd 关闭
+   （管道等跨重载保留）→ 重建堆/栈/auxv → TLS 状态清零（新程序需重新
+   arch_prctl）→ 改写 CONTEXT 的 rip/rsp，返回后即运行新程序入口。
+- **已知限制（如实记录）**：Windows 上旧 Reserve 块解除登记但不
+  VirtualFree——实测对含 musl donate PROT_NONE 页的堆块 free/decommit
+  会让进程在内核路径死亡（不经过 VEH、无诊断）。地址空间保留至进程退出。
+- `pipe2` 与 fd 继承使重载有意义：非 CLOEXEC fd（如管道端）跨 execve 存活，
+  `guest/bin/fs-exec` 端到端验证（pipe → dup2 → execve 自身 → fd 3 读取）。
+
+## 软 TLS（--soft-tls，0.0.4 实验）
+
+FSGSBASE 缺失（Hyper-V/云 VM/VBS）时 FS 基址无法切换，客户的 fs 前缀访问
+必然 AV。`--soft-tls` 开启后 VEH 在 AV 分支软件模拟客户段内的 fs 前缀 mov：
+
+- 解码 `64 [REX] 8b/89 modrm [sib] [disp]`：覆盖 musl 实际发射的全部形态
+  （fs:0 SIB 绝对、RIP 相对、base+idx+disp、读写双向、r8-r15）；
+- 有效地址 = 记录的客户 TLS 基址（arch_prctl 的 SET_FS 值，trap 时同步）
+  加偏移，代为读写内存后 Rip 前进；
+- 重入防护（模拟自身的访存再 AV 直接判死）、一次性慢速警告；
+- 未覆盖形态仍走致命路径并输出指令字节，便于扩表。
+
+价值：CI（Hyper-V runner）与云 VM 上的 musl 验收从"跳过"变"软跑通"
+（`--soft-tls guest/bin/hello-dyn` 端到端输出问候并干净退出）。性能不承诺：
+每次 fs 访问 = 一次异常往返，诊断/CI 可用，生产不可用。
+
+
 ## 依赖方向
 
 ```
@@ -80,6 +130,7 @@ vela-cli → vela-loader → vela-runtime → vela-fs
 ## 已知 v0 简化
 
 - `munmap` 只移除完全被覆盖的登记项（Windows 不能部分 VirtualFree）。
-- `mmap` 仅匿名私有；`MAP_FIXED` 冲突返回 -ENOMEM。
-- fstat/stat 未实现（-ENOSYS），musl 静态 hello 不需要。
+- `mmap` 仅 MAP_PRIVATE；Reserve 块内的 MAP_FIXED 就地覆盖保留原页内容
+  （Linux 为匿名零页；musl 仅对未写入的 brk 尾页这样做）。
+- execve 重载不释放旧 Reserve 块（Windows 内核路径致死，见 execve 节）。
 - VEH 处理器在客户栈上执行（见上文 red zone 风险）。

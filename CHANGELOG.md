@@ -2,6 +2,62 @@
 
 本项目的所有显著变更记录于此（Keep a Changelog 格式）。
 
+## [0.0.4] - 2026-09-19
+
+主题：动态程序之门 —— 文件映射 mmap、动态链接、execve 重载、软 TLS
+（计划见 docs/plans/PLAN-0.0.4.md）。
+
+### Added
+
+- **mmap 文件映射（M1）**：`HostMem::map_file/unmap_view`（Windows 用
+  `CreateFileMappingW` + `MapViewOfFileEx`，可写视图走 `PAGE_WRITECOPY`
+  COW，写入永不回写宿主文件）；`mmap(9)` 支持 MAP_PRIVATE + fd，MAP_FIXED
+  落在已登记 Reserve 内就地覆盖（musl ldso 的 PROT_NONE 预留 carve 模式），
+  非对齐/非固定地址退化为匿名映射 + 读入（EOF 后零填充）；`MemRegistry`
+  登记项带类型（Reserve/FileView），`munmap` 按类型选释放原语；
+  `mprotect` 对文件视图剥离 WRITE 位（防止 VirtualProtect 关闭 COW）；
+  `msync(26)` 校验后 no-op（MAP_PRIVATE 无回写）
+- **动态链接（M2）**：loader 解锁 `PT_INTERP`（白名单 `ld-musl*`，其余
+  诚实拒绝）；双映像装载（客户 ELF + 解释器），`AT_BASE`=解释器 bias、
+  `AT_PHDR/AT_ENTRY/AT_EXECFN`=客户侧（Linux 内核 auxv 约定），入口跳
+  `_dlstart`，重定位全部交给 ld-musl；CLI `--interp` 选项 + 解析链
+  （显式 > fs 翻译 > guest ELF 同目录回退）；验收 guest
+  `guest/bin/hello-dyn`（zig cc 动态 musl）+ `ld-musl-x86_64.so.1`
+  （musl 1.2.5 源码构建，见 guest/README.md）
+- **execve 进程内重载（M3）**：`execve(59)` 由 CLI 层编排——新映像装载
+  成功后卸载旧地址空间、重建堆/栈/auxv、重注册 exec ranges、改写
+  rip/rsp；失败返回 -errno 原映像继续；路径解析支持 POSIX 绝对/cwd 相对/
+  宿主风格 argv[0]；解释器解析复用运行时链
+- **pipe2(293) + fd 跨 execve**：进程内环形缓冲 fd 对（64 KiB）；读端
+  EOF/EAGAIN、写端 EPIPE；`fstat` = S_IFIFO；dup 共享缓冲；
+  `close_cloexec` 按 FD_CLOEXEC 记账关闭，其余 fd 跨重载保留
+- **wait 族（M3）**：`wait4(61)` 恒 -ECHILD（无 fork，诚实）；
+  `getppid(110)` 返回宿主 pid 派生的稳定值
+- **软 TLS（M4，实验）**：`--soft-tls` 开关——FSGSBASE 缺失环境下 VEH
+  对客户段内 fs 前缀 mov 做软件模拟（ModRM/SIB 解码覆盖 musl 发射的
+  全部形态：fs:0 SIB 绝对、RIP 相对、base+idx+disp、读写双向）；重入
+  防护 + 一次性慢速警告；未覆盖形态保持致命路径并输出指令字节；
+  VEH 对客户段内特权指令（#GP）也输出 rip/字节诊断
+- **诊断**：strace 日志增加 rip；`vela doctor` 增补 guest 清单
+
+### Changed
+
+- `mmap` 兼容矩阵升级：MAP_PRIVATE 文件映射、Reserve 内 MAP_FIXED 覆盖
+  （内容语义差异记录于 SYSCALLS.md）
+- CI 生成 guest 增加 fs-exec；验收运行增加动态 musl 与 execve 链路
+- 已知限制（如实记录）：execve 重载时旧 Reserve 块解除登记但不
+  VirtualFree（含 donate NOACCESS 页的块会内核致死且不经 VEH），地址
+  空间保留至进程退出
+
+### 验收口径达成（PLAN-0.0.4 §0）
+
+1. MAP_PRIVATE 文件映射读一致、COW 不回写宿主文件（Windows 宿主测试）
+2. `vela run --soft-tls guest/bin/hello-dyn` 输出问候并干净退出
+3. execve 重载语义 + CLOEXEC 关闭 + fd 保留（fs-exec 端到端）
+4. pipe2 随 execve 落地且使 fd 继承有意义
+5. `--soft-tls` 让 FSGSBASE 缺失环境（本机/云 VM）从"跳过"变"软跑通"
+6. 82 测试全绿、fmt/clippy -D warnings 干净
+
 ## [0.0.3] - 2026-09-19
 
 主题：性能、广度、SpadaOS 就绪（计划见 docs/plans/PLAN-0.0.3.md）。

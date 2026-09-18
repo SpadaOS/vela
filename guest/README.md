@@ -68,9 +68,35 @@ Linux/WSL 上等价命令：`musl-gcc -static-pie -O2 -o guest/hello-musl guest/
 静态 musl C 程序，验收 `open/write/lseek/read/fstat/stat/fcntl/opendir
 (getdents64)/getcwd` 全链路（源码 `src/file-io.c`，编译命令同上）。在
 `/mnt/c/Windows/Temp` 内创建、回读、遍历并清理验收文件；全链路通过输出
-`file-io all ok`。依赖 TLS（musl），仅 FSGSBASE 机器可跑；集成测试自动跳过。
+`file-io all ok`。依赖 TLS（musl），仅 FSGSBASE 机器可跑（或配
+`vela run --soft-tls`）；集成测试自动跳过。
+
+## `hello-dyn`（0.0.4 M2 出口，动态 musl 链接验收）
+
+**动态** musl C 程序（PT_INTERP 指向 `/lib/ld-musl-x86_64.so.1`）：
+
+```powershell
+zig cc -target x86_64-linux-musl -dynamic -fPIE -pie -O2 -o guest/bin/hello-dyn guest/src/hello-musl.c
+```
+
+配套解释器 `guest/bin/ld-musl-x86_64.so.1`（vela 按"guest ELF 同目录同名
+文件"回退解析；也可 `--interp <host-path>` 或 `--map /lib=<host-dir>` 显式
+指定）。解释器从 musl 1.2.5 源码构建（musl 1.2.5 源码 + zig libc.a 对象，
+`-Wl,--whole-archive -Wl,-e,_dlstart` 重链接；zig 自带的 musl 树不含
+dynlink.c，需从 musl.libc.org 补齐同版本源码）。
+
+运行：`vela run --soft-tls guest/bin/hello-dyn` → 输出 `hello from musl`
+并干净退出。`--soft-tls` 在 FSGSBASE 缺失的机器（Hyper-V/云 VM）上必须
+开启，见 docs/DESIGN.md「软 TLS」。
+
+## `fs-exec`（0.0.4 M3 出口，pipe2 + execve 重载验收）
+
+静态 musl C 程序（`src/fs-exec.c`，编译命令同 hello-musl）：pipe2 建管道 →
+写消息 → dup2 读端到 fd 3 → **execve 自身**（进程内重载）；第二阶段从
+fd 3 读出消息，验证 fd 跨 execve 保留。通过输出
+`fs-exec ok: pipe-across-execve`。musl 依赖 TLS，本机验证用 `--soft-tls`。
 
 ## 禁止
 
 - 用 MinGW 编出来的 PE 当测试（规格 8.3）
-- 动态链接的 hello（有 PT_INTERP，v0 拒绝加载）
+- glibc 动态链接的 hello（非 musl 解释器，v0.0.4 诚实拒绝）
