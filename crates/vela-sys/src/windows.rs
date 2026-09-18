@@ -384,6 +384,20 @@ pub fn read_fs_base() -> Option<u64> {
     None
 }
 
+/// 直接设置当前线程 FS 基址（用户态 wrfsbase，无内核还原问题；
+/// 仅用于进入客户前的预切场景，VEH 处理器内请勿调用）。
+pub fn set_thread_fs_base_now(v: u64) -> Result<(), HostError> {
+    if !fs_base_supported() {
+        return Err(HostError::Unimplemented);
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: 已探测确认 FSGSBASE 可用；VELA 自身不依赖 FS
+    unsafe { core::arch::asm!("wrfsbase {0}", in(reg) v) };
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = v;
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct WindowsHost {
     start: Instant,

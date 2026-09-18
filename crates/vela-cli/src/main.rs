@@ -163,6 +163,13 @@ fn run_elf(elf_path: &str, guest_argv: &[String]) -> Result<std::convert::Infall
             eprintln!("vela: failed to install exception trap: {e}");
             return Err(1);
         }
+        // 预切 FS：进入客户前把当前线程 FS 基址切到客户 TLS 占位页（0x1000），
+        // 让内核从进程一开始就保存/恢复「客户侧」基址；arch_prctl(SET_FS) 后
+        // 由 trampoline 改成真实 TLS 区。占位页不映射，但在首次 arch_prctl 前
+        // musl 不会经 fs 解引用（crt1 先 SET_FS 再碰 TLS），故安全。
+        if vela_sys::windows::fs_base_supported() {
+            let _ = vela_sys::windows::set_thread_fs_base_now(0x1000);
+        }
         // SAFETY: 客户映像、堆、栈均已映射且登记；本调用不返回
         unsafe { guest_start::enter_guest(entry, rsp) }
     }
