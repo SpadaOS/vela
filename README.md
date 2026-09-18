@@ -42,7 +42,9 @@ Linux x86_64 静态 PIE 二进制，拦截 `syscall` 指令，把 Linux 语义�
 **不能跑**：
 
 - 动态链接（glibc / `ld-musl`）、Go 程序、GUI、socket、fork/exec、32 位 / ARM
-- 完整清单见 [docs/NONGOALS.md](docs/NONGOALS.md)
+- **TLS 依赖的程序在缺少 FSGSBASE 的环境无法运行**（典型：Hyper-V/云虚拟机，
+  其处理器兼容模式会裁剪该特性；无 TLS 的汇编程序不受影响）。完整清单见
+  [docs/NONGOALS.md](docs/NONGOALS.md)
 
 ## 快速开始
 

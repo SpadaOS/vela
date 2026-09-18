@@ -123,14 +123,18 @@ fn run_tls_guest() {
 }
 
 /// musl 静态 PIE C hello（规格 8.2 加分项）。
-/// 产物 guest/hello-musl 由 zig cc 交叉编译（见 guest/README.md）；不存在则跳过。
+/// 产物 guest/hello-musl 由 zig cc 交叉编译（见 guest/README.md）。
 ///
-/// 已知限制（见 docs/DESIGN.md「TLS/FS」）：Windows 内核在少数转换路径会把
-/// 用户 FS 基址还原为陈旧值。运行时已做预切 + trampoline + rdfsbase 自愈三重
-/// 防护，但极端时序下仍可能命中；表现为进程 0xC0000005（≤2% 实测概率）。
-/// 因此本测试允许重试，3 次全失败才判失败。
+/// 静态 musl 需要 TLS（arch_prctl SET_FS + FS 相对寻址），而 Vela 的 FS 切换
+/// 依赖 CPU+OS 的 FSGSBASE 支持（见 docs/DESIGN.md「TLS/FS」）。在不支持的
+/// 环境（典型：Hyper-V 虚拟机 CI runner）下 musl 无法运行，测试自动跳过；
+/// v0 门禁仍是无需 TLS 的汇编 hello。
 #[test]
 fn run_musl_hello() {
+    if !vela_sys::windows::fs_base_supported() {
+        eprintln!("skip: FSGSBASE unavailable on this machine; guest TLS cannot be switched (musl needs TLS)");
+        return;
+    }
     let elf = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../guest/hello-musl");
     if !elf.exists() {

@@ -166,7 +166,8 @@ unsafe extern "system" fn veh_handler(ep: *mut ExceptionPointers) -> i32 {
     // SAFETY: Windows 保证异常回调参数在回调期间有效
     let ep = unsafe { &*ep };
     let rec = unsafe { &*ep.exception_record };
-    // 诊断：客户区内的 AV 记录后放行（second-chance 会正常终止进程）
+    // 诊断：客户区内的 AV 记录后放行（second-chance 会正常终止进程）。
+    // 无条件打印：崩溃必须始终有解释（stderr 不污染客户 stdout）。
     if rec.exception_code == 0xC000_0005 {
         // SAFETY: 同上
         let ctx = unsafe { &mut *ep.context_record };
@@ -174,15 +175,23 @@ unsafe extern "system" fn veh_handler(ep: *mut ExceptionPointers) -> i32 {
             // SAFETY: rip 在客户映射内（已确认），读 16 字节仅用于诊断
             let bytes = unsafe { std::slice::from_raw_parts(ctx.rip as *const u8, 16) };
             let hb: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            // fs 段前缀（0x64）开头的 AV，且本机不支持 FSGSBASE：几乎必然是
+            // 客户 TLS 访问（fs 基址未能切换），给出明确原因而不是裸崩溃
+            let fs_hint = if !fs_base_supported() && bytes.first() == Some(&0x64) {
+                " [hint: FSGSBASE unavailable - guest TLS (fs) cannot be switched; TLS-dependent programs cannot run here]"
+            } else {
+                ""
+            };
             eprintln!(
-                "[vela] AV in guest rip={:#x} addr={:#x} op={} rax={:#x} rcx={:#x} rdx={:#x} bytes={}",
+                "[vela] AV in guest rip={:#x} addr={:#x} op={} rax={:#x} rcx={:#x} rdx={:#x} bytes={}{}",
                 ctx.rip,
                 rec.info[1] as usize,
                 rec.info[0],
                 ctx.rax,
                 ctx.rcx,
                 ctx.rdx,
-                hb.join(" ")
+                hb.join(" "),
+                fs_hint
             );
         }
         return EXCEPTION_CONTINUE_SEARCH;

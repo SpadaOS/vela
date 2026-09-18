@@ -176,7 +176,9 @@ fn run_elf(elf_path: &str, guest_argv: &[String]) -> Result<std::convert::Infall
                 // 基址，而非线程创建时保存的 0（CI 实测的崩溃根源）。
                 // 注意必须在 VEH 安装之后调用（commit stub 依赖 VEH 吸收 UD2）。
                 vela_sys::windows::commit_fs_base_after_preset();
-                eprintln!("[vela] fs preset → {hs:#x} (committed)");
+                if logx::enabled() {
+                    eprintln!("[vela] fs preset → {hs:#x} (committed)");
+                }
             }
         }
         // SAFETY: 客户映像、堆、栈均已映射且登记；本调用不返回
@@ -234,7 +236,9 @@ unsafe extern "system" fn trap(nr: u64, args: &[u64; 6], rip: u64, ctx: &mut vel
     } else if st.proc.fs_base != 0 {
         if let Some(cur) = vela_sys::windows::read_fs_base() {
             if cur != st.proc.fs_base {
-                eprintln!("[vela] fs heal: {cur:#x} → {:#x}", st.proc.fs_base);
+                if logx::enabled() {
+                    eprintln!("[vela] fs heal: {cur:#x} → {:#x}", st.proc.fs_base);
+                }
                 ctx.r10 = st.proc.fs_base;
                 ctx.rip = vela_sys::windows::set_fs_stub_addr() as u64;
             }

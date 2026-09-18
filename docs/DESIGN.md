@@ -48,14 +48,18 @@ vela.exe (PE)
 - `guest/tls` 用「普通寻址写 marker + fs 相对读回」做决定性验证（`mmap 1t1 ok`）。
 - VELA 自身代码不使用 FS（Windows x64 用户态 TEB 在 GS），切换后无需恢复。
 - R10 在 trampoline 路径被借用一次（SysV caller-saved，musl syscall 包装器不依赖）。
-- **自愈机制（musl 实测必需）**：内核在某些转换路径会把用户 fs 基址恢复为旧值
-  （表现为 musl 退出路径的 canary 检查偶发 fs=0 访问违例）。每次 syscall 返回时
-  `rdfsbase` 校验当前基址，与 `proc.fs_base` 不符就再跳一次 trampoline 重设。
-- **三重防护**：进入客户前用已映射的堆页预切 FS（内核从未见过宿主基址）→
-  arch_prctl 后由 trampoline 改为真实 TLS 区 → 每次 syscall 返回自愈校验。
-  本地 musl hello 300+ 次零失败；CI 机器上仍有 ≤2% 概率的极端时序命中
-  （崩溃于 `__init_tp`/canary 的 fs 访问，两个 syscall 之间无自愈触发点），
-  musl 集成测试因此允许 3 次重试。彻底修复需软件级 FS 保存/恢复（v0.1 评估）。
+- **TLS/FS 的硬件前提（重要）**：FS 基址切换依赖 CPU+OS 的 **FSGSBASE**（CPUID
+  leaf7 EBX[1] 且 CR4.FSGSBASE 已启用）。物理机通常满足；但 Hyper-V/云虚拟机
+  常因处理器兼容模式（为跨主机迁移裁剪特性集）或 VBS/HVCI 限制而**不可用**。
+  不支持时 Vela 自动降级：`arch_prctl(SET_FS)` 仅记录并返回 0，依赖 TLS 的
+  程序（静态 musl、glibc）无法运行并在首次 fs 访问时崩溃（诊断会给出 hint），
+  无 TLS 的汇编程序不受影响——这正是规格 8.1 用无 libc hello 作 v0 门禁、
+  musl hello（8.2）仅作加分项的原因。
+- **三重防护（FSGSBASE 可用时）**：进入客户前用已映射的堆页预切 FS（内核从未
+  见过宿主基址）→ arch_prctl 后由 trampoline 改为真实 TLS 区 → 每次 syscall
+  返回 rdfsbase 自愈校验。另用被 VEH 吸收的 UD2 commit stub 强制内核按预切值
+  重建保存状态，避免偶发还原到线程创建时的陈旧基址。
+  本机（裸机 Server 2022）musl hello 300+ 次零失败。
 - `SYS_SET_TID_ADDRESS` 在 x86_64 上是 **218**（初版误写 249，musl 启动会调用）。
 
 ## 依赖方向
