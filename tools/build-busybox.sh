@@ -53,8 +53,9 @@ sed -i 's|scripts/basic/fixdep|: fixdep-disabled|' scripts/Makefile.build script
 # 源头中和；CI 无 binutils，跳过 strip（未 strip 静态二进制对 vela 无影响）
 sed -i 's|^SORT_SECTION=.*|SORT_SECTION=""|' scripts/trylink
 sed -i 's|^SORT_COMMON=.*|SORT_COMMON=""|' scripts/trylink
-sed -i 's|echo "-Wl,--warn-common -Wl,-Map,\$EXE.map -Wl,--verbose"|echo "-Wl,-Map,\$EXE.map"|' scripts/trylink
+sed -i 's|echo "-Wl,--warn-common -Wl,-Map,\$EXE.map -Wl,--verbose"|echo ""|' scripts/trylink
 sed -i '/-Wl,--warn-common/d' scripts/trylink
+sed -i '/-Wl,-Map,/d' scripts/trylink
 
 # zig cc musl 默认静态；-fPIE -pie 生成 ET_DYN（vela 仅接受 PIE）。
 # -j1：规避多 zig 进程共享缓存的 Windows 竞争；V=1：失败时日志有完整命令。
