@@ -15,12 +15,30 @@ command -v make >/dev/null || { echo "make not in PATH"; exit 1; }
 command -v gcc >/dev/null || { echo "gcc not in PATH (HOSTCC)"; exit 1; }
 command -v zig >/dev/null || { echo "zig not in PATH"; exit 1; }
 
+# 诊断：zig 对 msys2 参数/路径转换高度敏感；MSYS 转换只对含 / 的参数发生，
+# 本构建的 zig 命令行全是相对路径，排除转换干扰（CI 曾现 FileNotFound）
+export MSYS2_ARG_CONV_EXCL="*"
+export MSYS2_ENV_CONV_EXCL="*"
+
 if [ ! -d "$BB_SRC" ]; then
   curl -sSL -o /tmp/bb.tar.bz2 "https://busybox.net/downloads/busybox-$BB_VER.tar.bz2"
   tar -xjf /tmp/bb.tar.bz2 -C "$WS"
   mv "$WS/busybox-$BB_VER" "$BB_SRC"
 fi
 cd "$BB_SRC"
+
+# ---- 诊断区（CI 曾在 <1.2s 内 FileNotFound，无命令回显） ----
+echo "DIAG zig: $(command -v zig) / $(zig version)"
+echo "DIAG pwd-posix: $(pwd)"
+echo "DIAG pwd-win: $(cmd //c cd 2>/dev/null || true)"
+echo 'int main(void){return 0;}' > diag_t.c
+if zig cc -target x86_64-linux-musl -c -o diag_t.o diag_t.c; then
+  echo "DIAG trivial-compile OK"
+else
+  echo "DIAG trivial-compile FAIL rc=$?"
+fi
+ls -l diag_t.o 2>/dev/null || echo "DIAG diag_t.o missing"
+# ---- 诊断区结束 ----
 
 # 最小配置：allnoconfig（全部关闭）→ 白名单 applet + 静态
 make -s allnoconfig HOSTCC=gcc
@@ -32,8 +50,7 @@ sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
 yes "" | make oldconfig HOSTCC=gcc >/dev/null 2>&1 || true
 
 # zig cc musl 默认静态；-fPIE -pie 生成 ET_DYN（vela 仅接受 PIE）。
-# -j1：多 zig 进程共享缓存目录在 Windows 上有竞争（FileNotFound），串行规避；
-# V=1：失败时日志可看到完整编译命令。
+# -j1：规避多 zig 进程共享缓存的 Windows 竞争；V=1：失败时日志有完整命令。
 make V=1 -j1 \
   CC="zig cc -target x86_64-linux-musl -fPIE -pie" \
   HOSTCC=gcc
