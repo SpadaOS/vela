@@ -1204,7 +1204,11 @@ fn sys_mmap(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 {
         {
             let prot = HostProt::from_bits(linux_prot as u32);
             let _ = unsafe {
-                host.protect(addr as usize, len_up as usize, HostProt::READ | HostProt::WRITE)
+                host.protect(
+                    addr as usize,
+                    len_up as usize,
+                    HostProt::READ | HostProt::WRITE,
+                )
             };
             // SAFETY: 区间已登记且此刻可写
             unsafe {
