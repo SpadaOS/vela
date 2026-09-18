@@ -1,0 +1,9 @@
+[package]
+name = "vela-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vela-sys = { path = "../vela-sys" }
+vela-runtime = { path = "../vela-runtime" }
