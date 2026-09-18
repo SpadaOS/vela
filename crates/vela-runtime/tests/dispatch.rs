@@ -579,6 +579,99 @@ fn msync_validates_and_noops() {
 }
 
 #[test]
+fn pipe2_write_then_read_roundtrip() {
+    let (host, mut proc, addr) = setup(4096);
+    // pipefd 数组写在客户内存（映像内）
+    let arr = addr as u64 + 0x800;
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_PIPE2,
+        [arr, 0 /* 无 flags */, 0, 0, 0, 0],
+    );
+    assert_eq!(r, 0);
+    // SAFETY: arr 在 mock 映像内
+    let out = unsafe { std::slice::from_raw_parts(arr as *const u8, 8) };
+    let rfd = i32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+    let wfd = i32::from_le_bytes([out[4], out[5], out[6], out[7]]);
+    // 写端写入
+    let w = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_WRITE,
+        [wfd as u64, addr as u64, 5, 0, 0, 0],
+    );
+    assert_eq!(w, 5);
+    // 读端读出
+    let g = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_READ,
+        [rfd as u64, addr as u64 + 0x100, 16, 0, 0, 0],
+    );
+    assert_eq!(g, 5);
+    // 写端关闭后读端 EOF
+    let c = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_CLOSE,
+        [wfd as u64, 0, 0, 0, 0, 0],
+    );
+    assert_eq!(c, 0);
+    let g2 = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_READ,
+        [rfd as u64, addr as u64 + 0x100, 16, 0, 0, 0],
+    );
+    assert_eq!(g2, 0);
+}
+
+#[test]
+fn pipe_write_after_read_close_gives_epipe() {
+    let (host, mut proc, addr) = setup(4096);
+    let arr = addr as u64 + 0x800;
+    assert_eq!(
+        dispatch(&mut proc, &host, abi::SYS_PIPE2, [arr, 0, 0, 0, 0, 0]),
+        0
+    );
+    // SAFETY: arr 在 mock 映像内
+    let out = unsafe { std::slice::from_raw_parts(arr as *const u8, 8) };
+    let rfd = i32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+    let wfd = i32::from_le_bytes([out[4], out[5], out[6], out[7]]);
+    let c = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_CLOSE,
+        [rfd as u64, 0, 0, 0, 0, 0],
+    );
+    assert_eq!(c, 0);
+    let w = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_WRITE,
+        [wfd as u64, addr as u64, 1, 0, 0, 0],
+    );
+    assert_eq!(w, -(abi::EPIPE as i64));
+}
+
+#[test]
+fn wait4_reports_echild_and_getppid_stable() {
+    let (host, mut proc, addr) = setup(4096);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_WAIT4,
+        [(-1i64) as u64, addr as u64, 0, 0, 0, 0],
+    );
+    assert_eq!(r, -(abi::ECHILD as i64));
+    let p1 = dispatch(&mut proc, &host, abi::SYS_GETPPID, [0, 0, 0, 0, 0, 0]);
+    let p2 = dispatch(&mut proc, &host, abi::SYS_GETPPID, [0, 0, 0, 0, 0, 0]);
+    assert_eq!(p1, p2);
+    assert!(p1 > 0);
+}
+
+#[test]
 fn uname_fills_linux_fields() {
     let (host, mut proc, addr) = setup(4096);
     let r = dispatch(

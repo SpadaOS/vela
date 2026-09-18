@@ -16,6 +16,9 @@ pub const SYS_MPROTECT: u64 = 10;
 pub const SYS_MUNMAP: u64 = 11;
 pub const SYS_MSYNC: u64 = 26;
 pub const SYS_BRK: u64 = 12;
+pub const SYS_EXECVE: u64 = 59;
+pub const SYS_WAIT4: u64 = 61;
+pub const SYS_GETPPID: u64 = 110;
 pub const SYS_RT_SIGACTION: u64 = 13;
 pub const SYS_RT_SIGPROCMASK: u64 = 14;
 pub const SYS_IOCTL: u64 = 16;
@@ -58,6 +61,7 @@ pub const SYS_GETDENTS64: u64 = 217;
 pub const SYS_SET_TID_ADDRESS: u64 = 218;
 pub const SYS_SET_ROBUST_LIST: u64 = 273;
 pub const SYS_DUP3: u64 = 292;
+pub const SYS_PIPE2: u64 = 293;
 pub const SYS_PRLIMIT64: u64 = 302;
 pub const SYS_CLOCK_GETTIME: u64 = 228;
 pub const SYS_GETRANDOM: u64 = 318;
@@ -79,6 +83,10 @@ pub const ENOTTY: i32 = 25;
 pub const ESPIPE: i32 = 29;
 pub const ENAMETOOLONG: i32 = 36;
 pub const ENOSYS: i32 = 38;
+pub const ECHILD: i32 = 10;
+pub const EPIPE: i32 = 32;
+pub const EAGAIN: i32 = 11;
+pub const ENOEXEC: i32 = 8;
 pub const ERANGE: i32 = 34;
 
 pub fn errno_result(e: i32) -> i64 {
@@ -163,6 +171,7 @@ pub const RLIM_INFINITY: u64 = u64::MAX;
 pub const S_IFMT: u32 = 0o170000;
 pub const S_IFCHR: u32 = 0o0020000;
 pub const S_IFDIR: u32 = 0o0040000;
+pub const S_IFIFO: u32 = 0o0010000;
 pub const S_IFREG: u32 = 0o0100000;
 pub const S_IFLNK: u32 = 0o0120000;
 
@@ -261,6 +270,10 @@ pub fn syscall_name(nr: u64) -> &'static str {
         SYS_MPROTECT => "mprotect",
         SYS_MUNMAP => "munmap",
         SYS_MSYNC => "msync",
+        SYS_EXECVE => "execve",
+        SYS_WAIT4 => "wait4",
+        SYS_GETPPID => "getppid",
+        SYS_PIPE2 => "pipe2",
         SYS_BRK => "brk",
         SYS_IOCTL => "ioctl",
         SYS_WRITEV => "writev",

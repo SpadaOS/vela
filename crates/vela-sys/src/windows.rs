@@ -17,6 +17,7 @@ use crate::{
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
 const MEM_RELEASE: u32 = 0x8000;
+const MEM_DECOMMIT: u32 = 0x4000;
 const PAGE_NOACCESS: u32 = 0x01;
 const PAGE_READONLY: u32 = 0x02;
 const PAGE_READWRITE: u32 = 0x04;
@@ -180,6 +181,17 @@ pub fn add_guest_exec_range(start: u64, end: u64) {
     eprintln!("[vela] warn: exec range table full ({MAX_GUEST_RANGES}), range {start:#x}-{end:#x} NOT registered");
 }
 
+/// 清空全部客户可执行范围（execve 重载前调用：旧映像即将卸载，
+/// 范围表是静态槽位，VEH 与本线程同步执行故可安全重置）。
+pub fn clear_guest_exec_ranges() {
+    for s in RANGE_START.iter() {
+        s.store(0, Ordering::Relaxed);
+    }
+    for e in RANGE_END.iter() {
+        e.store(0, Ordering::Relaxed);
+    }
+}
+
 /// 注册 syscall dispatch 回调。
 pub fn set_trap_fn(f: TrapFn) {
     TRAP_FN.store(f as usize, Ordering::Relaxed);
@@ -263,6 +275,17 @@ unsafe extern "system" fn veh_handler(ep: *mut ExceptionPointers) -> i32 {
             // second-chance 崩溃（0xC0000005 原始码）。这里以 Linux 语义规范化
             // 退出码 128+SIGSEGV(11)=139，stdio 经 atexit 正常冲刷。
             std::process::exit(139);
+        }
+        // 宿主侧 AV（vela 自身代码）：打印诊断后放行（second-chance 终止，
+        // 但崩溃始终有解释——spec 12）
+        {
+            let ctx = unsafe { &*ep.context_record };
+            eprintln!(
+                "[vela] host-side AV rip={:#x} addr={:#x} op={}",
+                ctx.rip,
+                { rec.info[1] },
+                rec.info[0]
+            );
         }
         return EXCEPTION_CONTINUE_SEARCH;
     }
@@ -900,6 +923,18 @@ impl HostMem for WindowsHost {
     unsafe fn unmap_view(&self, addr: usize) -> Result<(), HostError> {
         // SAFETY: addr 为 MapViewOfFileEx 返回的视图基址（MemRegistry 登记保证）
         if unsafe { UnmapViewOfFile(addr as *mut c_void) } == 0 {
+            Err(HostError::Invalid)
+        } else {
+            Ok(())
+        }
+    }
+
+    unsafe fn decommit(&self, addr: usize, len: usize) -> Result<(), HostError> {
+        if len == 0 {
+            return Ok(());
+        }
+        // SAFETY: addr..addr+len 属于本宿主分配的 reserve（调用方保证）
+        if unsafe { VirtualFree(addr as *mut c_void, len, MEM_DECOMMIT) } == 0 {
             Err(HostError::Invalid)
         } else {
             Ok(())

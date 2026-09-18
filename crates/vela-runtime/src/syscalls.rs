@@ -27,6 +27,9 @@ pub fn dispatch(proc: &mut GuestProcess, host: &dyn Host, nr: u64, a: [u64; 6]) 
         abi::SYS_MUNMAP => sys_munmap(proc, host, a[0], a[1]),
         abi::SYS_MSYNC => sys_msync(proc, a[0], a[1]),
         abi::SYS_BRK => sys_brk(proc, a[0]),
+        abi::SYS_PIPE2 => sys_pipe2(proc, a[0], a[1]),
+        abi::SYS_WAIT4 => sys_wait4(a[0], a[1], a[2]),
+        abi::SYS_GETPPID => sys_getppid(proc),
         abi::SYS_EXIT | abi::SYS_EXIT_GROUP => sys_exit(host, a[0]),
         abi::SYS_UNAME => sys_uname(proc, a[0]),
         abi::SYS_ARCH_PRCTL => sys_arch_prctl(proc, host, a[0], a[1]),
@@ -94,6 +97,25 @@ fn sys_write(proc: &GuestProcess, host: &dyn Host, fd_raw: u64, buf: u64, len: u
         Some(GuestFd::Null) | Some(GuestFd::Zero) => len as i64,
         Some(GuestFd::Reserved) => -(abi::EBADF as i64),
         Some(GuestFd::HostDir(_)) => -(abi::EBADF as i64), // 不能 write 目录
+        Some(GuestFd::PipeWrite(p)) => {
+            // 管道写（T3.2）：读端全关 → EPIPE；满 → -EAGAIN（无阻塞调度）
+            if !p.read_open.get() {
+                return -(abi::EPIPE as i64);
+            }
+            let mut b = p.buf.borrow_mut();
+            let room = p.capacity.saturating_sub(b.len());
+            if room == 0 {
+                return -(abi::EAGAIN as i64);
+            }
+            let data = match read_guest(proc, buf, (len as usize).min(room)) {
+                Ok(d) => d,
+                Err(e) => return -(e as i64),
+            };
+            let n = data.len();
+            b.extend_from_slice(data);
+            n as i64
+        }
+        Some(GuestFd::PipeRead(_)) => -(abi::EBADF as i64), // 读端不可写
         Some(GuestFd::Host(f)) => {
             if len == 0 {
                 return 0;
@@ -122,6 +144,25 @@ fn sys_read(proc: &mut GuestProcess, host: &dyn Host, fd_raw: u64, buf: u64, len
             Ok(()) => len as i64,
             Err(e) => -(e as i64),
         },
+        Some(GuestFd::PipeRead(p)) => {
+            // 管道读（T3.2）：空且写端开 → -EAGAIN（v0 无阻塞调度）；
+            // 空且写端关 → 0（EOF）
+            let mut b = p.buf.borrow_mut();
+            if b.is_empty() {
+                return if p.write_open.get() {
+                    -(abi::EAGAIN as i64)
+                } else {
+                    0
+                };
+            }
+            let n = (len as usize).min(b.len());
+            let data: Vec<u8> = b.drain(..n).collect();
+            match write_guest(proc, buf, data.as_slice()) {
+                Ok(()) => n as i64,
+                Err(e) => -(e as i64),
+            }
+        }
+        Some(GuestFd::PipeWrite(_)) => -(abi::EBADF as i64), // 写端不可读
         Some(GuestFd::Host(f)) => match read_guest_mut(proc, buf, len as usize) {
             Ok(dst) => host
                 .read(f, dst)
@@ -159,6 +200,39 @@ fn sys_writev(proc: &GuestProcess, host: &dyn Host, fd_raw: u64, iov: u64, iovcn
             }
             total
         }
+        Some(GuestFd::PipeWrite(p)) => {
+            // 管道 writev：逐 iov 追加，尊重容量（部分写）
+            if !p.read_open.get() {
+                return -(abi::EPIPE as i64);
+            }
+            let mut b = p.buf.borrow_mut();
+            let mut total = 0i64;
+            for i in 0..iovcnt as u64 {
+                let ent = match read_guest(proc, iov + i * 16, 16) {
+                    Ok(e) => e,
+                    Err(e) => return -(e as i64),
+                };
+                let (base, len) = (rd_u64(ent, 0), rd_u64(ent, 8));
+                if len == 0 {
+                    continue;
+                }
+                let room = p.capacity.saturating_sub(b.len());
+                if room == 0 {
+                    break;
+                }
+                let data = match read_guest(proc, base, (len as usize).min(room)) {
+                    Ok(d) => d,
+                    Err(e) => return -(e as i64),
+                };
+                b.extend_from_slice(data);
+                total += data.len() as i64;
+            }
+            if total == 0 && b.len() == p.capacity {
+                return -(abi::EAGAIN as i64);
+            }
+            total
+        }
+        Some(GuestFd::PipeRead(_)) => -(abi::EBADF as i64),
         Some(GuestFd::Host(f)) => {
             let mut total = 0i64;
             for i in 0..iovcnt as u64 {
@@ -365,6 +439,21 @@ fn sys_fstat(proc: &GuestProcess, host: &dyn Host, fd_raw: u64, statbuf: u64) ->
         Some(GuestFd::Null) | Some(GuestFd::Zero) => Ok(HostStat::char_device()),
         Some(GuestFd::Host(f)) => host.stat_file(f),
         Some(GuestFd::HostDir(d)) => host.stat_path(&HostPath(d.host_path().to_path_buf())),
+        Some(GuestFd::PipeRead(_) | GuestFd::PipeWrite(_)) => {
+            // FIFO 元数据（T3.2）：S_IFIFO | 0666，size 恒 0
+            Ok(HostStat {
+                size: 0,
+                is_dir: false,
+                is_readonly: false,
+                mtime_ns: 0,
+                mode: abi::S_IFIFO | 0o666,
+                nlink: 1,
+                ino: 2,
+                dev: 1,
+                atime_ns: 0,
+                ctime_ns: 0,
+            })
+        }
     };
     fill_stat(proc, r, statbuf)
 }
@@ -444,8 +533,57 @@ fn sys_close(proc: &mut GuestProcess, host: &dyn Host, fd_raw: u64) -> i64 {
             Ok(()) => 0,
             Err(e) => -(host_err_to_errno(&e) as i64),
         },
+        Some(GuestFd::PipeRead(p)) => {
+            p.read_open.set(false);
+            0
+        }
+        Some(GuestFd::PipeWrite(p)) => {
+            p.write_open.set(false);
+            0
+        }
         Some(_) => 0,
     }
+}
+
+// ---------------------------------------------------------------- 管道 / 进程族
+
+/// pipe2(293)（PLAN-0.0.4 T3.2）：进程内环形缓冲 fd 对（容量 64 KiB）。
+/// flags 仅接受 O_CLOEXEC（fd 记账）；非阻塞语义见 sys_read/sys_write。
+fn sys_pipe2(proc: &mut GuestProcess, pipefd: u64, flags: u64) -> i64 {
+    if flags & !(abi::O_CLOEXEC | abi::O_NONBLOCK) != 0 {
+        return -(abi::EINVAL as i64);
+    }
+    let p = std::rc::Rc::new(crate::Pipe {
+        capacity: crate::PIPE_CAPACITY,
+        read_open: std::cell::Cell::new(true),
+        write_open: std::cell::Cell::new(true),
+        ..Default::default()
+    });
+    let rfd = proc.fds.alloc_fd(GuestFd::PipeRead(std::rc::Rc::clone(&p)));
+    let wfd = proc.fds.alloc_fd(GuestFd::PipeWrite(p));
+    if flags & abi::O_CLOEXEC != 0 {
+        proc.fds.update_flags(rfd, |v| v | 1);
+        proc.fds.update_flags(wfd, |v| v | 1);
+    }
+    let mut out = [0u8; 8];
+    out[0..4].copy_from_slice(&(rfd as u32).to_le_bytes());
+    out[4..8].copy_from_slice(&(wfd as u32).to_le_bytes());
+    match write_guest(proc, pipefd, &out) {
+        Ok(()) => 0,
+        Err(e) => -(e as i64),
+    }
+}
+
+/// wait4(61)（T3.3）：vela 为单进程模型（无 fork），无子进程可等——
+/// 诚实返回 -ECHILD（与 Linux 无子进程时 wait4 的语义一致）。
+fn sys_wait4(_pid: u64, _status: u64, _opts: u64) -> i64 {
+    -(abi::ECHILD as i64)
+}
+
+/// getppid(110)（T3.3）：返回宿主进程 id 与客户 pid 的组合哈希，保证
+/// 同一 vela 进程内稳定且非 0（真实父进程不存在——诚实近似）。
+fn sys_getppid(proc: &GuestProcess) -> i64 {
+    (std::process::id() ^ proc.pid.wrapping_mul(0x9E37_79B9)) as i64
 }
 
 // ---------------------------------------------------------------- 目录遍历
@@ -829,6 +967,9 @@ fn dup_impl(
             Ok(nf) => GuestFd::Host(nf),
             Err(e) => return -(host_err_to_errno(&e) as i64),
         },
+        // 管道端复制共享同一缓冲（引用计数）
+        Some(GuestFd::PipeRead(p)) => GuestFd::PipeRead(std::rc::Rc::clone(p)),
+        Some(GuestFd::PipeWrite(p)) => GuestFd::PipeWrite(std::rc::Rc::clone(p)),
         Some(GuestFd::Null) => GuestFd::Null,
         Some(GuestFd::Zero) => GuestFd::Zero,
         _ => return -(abi::EBADF as i64),
@@ -1020,10 +1161,12 @@ fn sys_mmap_file(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 {
     let fd = fd_raw as u32 as i32;
     let f = match proc.fds.get(fd) {
         Some(GuestFd::Host(f)) => f,
-        // Linux 对 /dev/null、目录等不可映射对象返回 ENODEV
-        Some(GuestFd::HostDir(_)) | Some(GuestFd::Null) | Some(GuestFd::Zero) => {
-            return -(abi::ENODEV as i64)
-        }
+        // Linux 对 /dev/null、目录、管道等不可映射对象返回 ENODEV
+        Some(GuestFd::HostDir(_))
+        | Some(GuestFd::Null)
+        | Some(GuestFd::Zero)
+        | Some(GuestFd::PipeRead(_))
+        | Some(GuestFd::PipeWrite(_)) => return -(abi::ENODEV as i64),
         None | Some(GuestFd::Reserved) => return -(abi::EBADF as i64),
     };
     let len_up = (len + PAGE - 1) & !(PAGE - 1);

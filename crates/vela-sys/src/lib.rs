@@ -259,6 +259,13 @@ pub trait HostMem: Send + Sync + 'static {
         let _ = addr;
         Err(HostError::Unimplemented)
     }
+
+    /// 解除区间提交（Windows MEM_DECOMMIT；reserve 保持有效）。
+    /// execve 重载释放含 NOACCESS 页的堆块前先走这一步。默认未实现。
+    unsafe fn decommit(&self, addr: usize, len: usize) -> Result<(), HostError> {
+        let _ = (addr, len);
+        Err(HostError::Unimplemented)
+    }
 }
 
 /// 组 2 file：文件系统与 stdio。

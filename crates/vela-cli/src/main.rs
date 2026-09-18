@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 
 use vela_loader as loader;
 use vela_runtime::{GuestProcess, InterpImage};
+#[cfg(windows)]
+use vela_sys::HostMem;
 
 #[cfg(target_os = "linux")]
 use vela_sys::linux_dev::LinuxDevHost;
@@ -32,6 +34,9 @@ const GUEST_HINT: u64 = 0x0000_4000_0000;
 struct GuestState {
     proc: GuestProcess,
     host: PlatformHost,
+    /// execve 重载时重建堆/栈所需（PLAN-0.0.4 T3.1）。
+    stack_mb: u64,
+    heap_mb: u64,
 }
 
 static GUEST: AtomicPtr<GuestState> = AtomicPtr::new(std::ptr::null_mut());
@@ -228,6 +233,149 @@ fn resolve_interp(
         .unwrap_or(std::path::Path::new("."));
     let name = gpath.rsplit('/').next().unwrap_or(gpath);
     base.join(name)
+}
+
+/// execve 的可执行文件路径解析（PLAN-0.0.4 T3.1）。vela 把宿主目录挂为
+/// guest 根，argv[0] 常为宿主风格路径，故按三种形态依次尝试：
+/// 1. POSIX 绝对路径 → fs 翻译；
+/// 2. POSIX 相对路径 → cwd 拼接后 fs 翻译；
+/// 3. 宿主风格路径（含 \ 或 :，或不带 / 的相对宿主路径）→ 直接按宿主路径。
+fn resolve_exec_path(proc: &GuestProcess, path: &str) -> Option<std::path::PathBuf> {
+    if path.starts_with('/') {
+        return proc.fs.translate(path);
+    }
+    let g = format!("{}/{}", proc.cwd.trim_end_matches('/'), path);
+    if let Some(hp) = proc.fs.translate(&g) {
+        if hp.exists() {
+            return Some(hp);
+        }
+    }
+    let p = std::path::PathBuf::from(path);
+    if p.exists() {
+        return Some(p);
+    }
+    proc.fs.translate(path)
+}
+
+/// execve(59) 的进程内重载（PLAN-0.0.4 T3.1）。vela 无 fork，重载是唯一
+/// 诚实路径：新映像装载成功后，卸载全部旧客户内存（含映像/堆/栈/解释器）、
+/// 关闭 CLOEXEC fd（管道等跨重载保留）、重建堆/栈/auxv，返回新入口与新栈。
+/// 失败返回 -errno，客户继续运行原映像（与 Linux execve 失败语义一致）。
+#[cfg(windows)]
+fn do_execve(st: &mut GuestState, args: &[u64; 6]) -> Result<(u64, u64), i64> {
+    let (path_ptr, argv_ptr, envp_ptr) = (args[0], args[1], args[2]);
+    let err = |e: i32| -> i64 { -(e as i64) };
+
+    // 1. 路径与参数读取（旧映像仍完整可读）
+    let path = vela_runtime::read_cstr(&st.proc, path_ptr).map_err(err)?;
+    let mut argv: Vec<String> = Vec::new();
+    let mut p = argv_ptr;
+    loop {
+        let ent = vela_runtime::read_guest(&st.proc, p, 8).map_err(err)?;
+        let ptr = u64::from_le_bytes(ent[0..8].try_into().unwrap());
+        if ptr == 0 {
+            break;
+        }
+        argv.push(vela_runtime::read_cstr(&st.proc, ptr).map_err(err)?);
+        p += 8;
+    }
+    if argv.is_empty() {
+        argv.push(path.clone());
+    }
+    let mut envp: Vec<String> = Vec::new();
+    p = envp_ptr;
+    loop {
+        let ent = vela_runtime::read_guest(&st.proc, p, 8).map_err(err)?;
+        let ptr = u64::from_le_bytes(ent[0..8].try_into().unwrap());
+        if ptr == 0 {
+            break;
+        }
+        envp.push(vela_runtime::read_cstr(&st.proc, ptr).map_err(err)?);
+        p += 8;
+    }
+
+    // 2. 路径解析：绝对走 fs 翻译；POSIX 相对按 cwd 拼接；argv[0] 为
+    //    宿主风格路径（vela 常见用法）时直接按宿主路径接受
+    let host_path = resolve_exec_path(&st.proc, &path).ok_or(err(vela_abi::ENOENT))?;
+
+    // 3. 读文件 + 装载新映像（失败即 execve 失败，旧映像不动）
+    let bytes = std::fs::read(&host_path).map_err(|_| err(vela_abi::ENOENT))?;
+    let info = loader::parse(&bytes).map_err(|_| err(vela_abi::ENOEXEC))?;
+    let mut img = loader::load(&bytes, &st.host, 0).map_err(|_| err(vela_abi::ENOEXEC))?;
+    if let Some(gipath) = &info.interp {
+        // 解释器：fs 翻译优先，回退到新映像宿主目录下的同名文件
+        let ipath = st
+            .proc
+            .fs
+            .translate(gipath)
+            .or_else(|| {
+                let name = gipath.rsplit('/').next()?;
+                host_path.parent()?.join(name).into()
+            })
+            .ok_or(err(vela_abi::ENOENT))?;
+        let ibytes = std::fs::read(&ipath).map_err(|_| err(vela_abi::ENOENT))?;
+        let iimg = loader::load(&ibytes, &st.host, 0).map_err(|_| err(vela_abi::ENOEXEC))?;
+        img.interp = Some(InterpImage {
+            bias: iimg.bias,
+            entry: iimg.entry,
+            span: iimg.span,
+            exec_ranges: iimg.exec_ranges,
+        });
+    }
+
+    // 4. 卸载旧客户地址空间（新映像仍在 host 内存中，不受影响）
+    vela_sys::windows::clear_guest_exec_ranges();
+    let old: Vec<vela_runtime::MemRange> = st.proc.mem.ranges.values().copied().collect();
+    for r in old {
+        // Reserve 块（映像/堆/栈）不调用 VirtualFree：实测对含 musl donate
+        // PROT_NONE 页的堆块做 free/decommit 会让进程在内核路径死亡（无 VEH、
+        // 无诊断）。解除登记后保留地址空间，进程退出时由 OS 统一回收——
+        // 单 guest 进程内存寿命有限，泄漏代价可接受（记录于 SYSCALLS.md）。
+        // FileView 的 UnmapViewOfFile 是安全的，正常释放。
+        if r.kind == vela_runtime::mem::MemKind::FileView {
+            let _ = unsafe { st.host.unmap_view(r.start as usize) };
+        }
+    }
+    st.proc.mem = vela_runtime::mem::MemRegistry::default();
+    st.proc.heap = None;
+
+    // 5. CLOEXEC fd 关闭（管道等跨重载保留，T3.2）
+    let _ = st.proc.fds.close_cloexec(&st.host);
+
+    // 6. 换上新映像 + 重建堆/栈/auxv
+    st.proc.load = img;
+    st.proc.mem.add(st.proc.load.span);
+    if let Some(i) = &st.proc.load.interp {
+        st.proc.mem.add(i.span);
+    }
+    st.proc
+        .init_heap(&st.host, 0, st.heap_mb * 1024 * 1024)
+        .map_err(|_| err(vela_abi::ENOMEM))?;
+    let (rsp, stack_range) =
+        guest_start::build_stack(&st.host, &st.proc.load, &argv, &envp, st.stack_mb)
+            .map_err(|_| err(vela_abi::ENOMEM))?;
+    st.proc.mem.add(stack_range);
+
+    // execve 清空线程指针：新程序需重新 arch_prctl(SET_FS)
+    st.proc.fs_base = 0;
+    st.proc.gs_base = 0;
+    st.proc.fs_apply_pending = None;
+    vela_sys::windows::set_soft_tls_base(0);
+
+    // 7. 注册新可执行范围，返回新入口
+    for (s, e) in &st.proc.load.exec_ranges {
+        vela_sys::windows::add_guest_exec_range(*s, *e);
+    }
+    if let Some(i) = &st.proc.load.interp {
+        for (s, e) in &i.exec_ranges {
+            vela_sys::windows::add_guest_exec_range(*s, *e);
+        }
+    }
+    let entry = match &st.proc.load.interp {
+        Some(i) => i.entry,
+        None => st.proc.load.entry,
+    };
+    Ok((entry, rsp))
 }
 
 /// 环境自检（PLAN-0.0.2 T4.3）：排障入口，报告宿主能力与常见问题。
@@ -453,7 +601,12 @@ fn run_elf(
                 "[vela] soft-tls enabled: fs-prefixed guest accesses will be emulated (slow; diagnostics/CI only)"
             );
         }
-        let state = Box::new(GuestState { proc, host });
+        let state = Box::new(GuestState {
+            proc,
+            host,
+            stack_mb: opts.stack_mb,
+            heap_mb: opts.heap_mb,
+        });
         let ptr = Box::into_raw(state);
         GUEST.store(ptr, Ordering::Relaxed);
         set_trap_fn(trap);
@@ -529,7 +682,24 @@ unsafe extern "system" fn trap(
             rip
         );
     }
-    let r = vela_runtime::dispatch(&mut st.proc, &st.host, nr, *args);
+    let r = if nr == vela_abi::SYS_EXECVE {
+        // execve（PLAN-0.0.4 T3.1）：进程内重载，属控制流操作，由 CLI 层
+        // 编排（loader/栈构建在此 crate）；成功路径直接改写上下文返回。
+        match do_execve(st, args) {
+            Ok((entry, rsp)) => {
+                ctx.rax = 0;
+                ctx.rip = entry;
+                ctx.rsp = rsp;
+                if logx::enabled() {
+                    eprintln!("[vela] execve → reloaded, entry {entry:#x} rsp {rsp:#x}");
+                }
+                return 0;
+            }
+            Err(e) => e,
+        }
+    } else {
+        vela_runtime::dispatch(&mut st.proc, &st.host, nr, *args)
+    };
     if logx::enabled() {
         eprintln!(
             "[vela] {} = {r} ({:#x})",

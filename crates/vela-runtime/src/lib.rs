@@ -16,14 +16,38 @@ use crate::mem::MemRegistry;
 
 // ---------------------------------------------------------------- fd 表
 
+/// 进程内管道（PLAN-0.0.4 T3.2）：pipe2 创建的 fd 对共享此缓冲。
+/// v0 单线程无阻塞调度——空读且写端开着返回 -EAGAIN、满写返回 -EAGAIN。
+#[derive(Debug, Default)]
+pub struct Pipe {
+    pub buf: std::cell::RefCell<Vec<u8>>,
+    pub read_open: std::cell::Cell<bool>,
+    pub write_open: std::cell::Cell<bool>,
+    /// 环形缓冲容量（Linux 默认 64 KiB）。
+    pub capacity: usize,
+}
+
+pub const PIPE_CAPACITY: usize = 64 * 1024;
+
 #[derive(Debug)]
 pub enum GuestFd {
     Host(HostFile),
     /// 目录快照句柄（O_DIRECTORY 打开；getdents64 消费）。
     HostDir(HostDir),
+    /// 管道读端（clone 自共享 Pipe）。
+    PipeRead(std::rc::Rc<Pipe>),
+    /// 管道写端。
+    PipeWrite(std::rc::Rc<Pipe>),
     Null,
     Zero,
     Reserved,
+}
+
+impl GuestFd {
+    /// 是否持有宿主资源（close 时需要动作）。
+    pub fn is_pipe(&self) -> bool {
+        matches!(self, GuestFd::PipeRead(_) | GuestFd::PipeWrite(_))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -93,6 +117,33 @@ impl FdTable {
     pub fn update_flags(&mut self, fd: i32, f: impl FnOnce(u32) -> u32) {
         let v = self.flags.entry(fd).or_insert(0);
         *v = f(*v);
+    }
+
+    /// execve（PLAN-0.0.4 T3.1/T3.2）：关闭所有带 FD_CLOEXEC 的 fd，
+    /// 其余（管道等）跨重载保留。Host fd 调 host.close；管道端标记关闭，
+    /// 读端看到 EOF、写端看到 EPIPE。返回关闭数量。
+    pub fn close_cloexec(&mut self, host: &dyn Host) -> usize {
+        let clo: Vec<i32> = self
+            .flags
+            .iter()
+            .filter(|(_, f)| *f & 1 != 0)
+            .map(|(fd, _)| *fd)
+            .collect();
+        let mut n = 0;
+        for fd in clo {
+            if let Some(gf) = self.remove(fd) {
+                n += 1;
+                match gf {
+                    GuestFd::Host(h) => {
+                        let _ = host.close(h);
+                    }
+                    GuestFd::PipeRead(p) => p.read_open.set(false),
+                    GuestFd::PipeWrite(p) => p.write_open.set(false),
+                    _ => {}
+                }
+            }
+        }
+        n
     }
 }
 
