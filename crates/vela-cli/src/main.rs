@@ -161,9 +161,8 @@ fn run_elf(elf_path: &str, guest_argv: &[String]) -> Result<std::convert::Infall
         if vela_sys::windows::fs_base_supported() {
             if let Some(hs) = heap_start {
                 let _ = vela_sys::windows::set_thread_fs_base_now(hs);
-                if logx::enabled() {
-                    eprintln!("[vela] fs preset → {hs:#x}");
-                }
+                // 无条件打印：CI 诊断需要（stderr 不影响客户 stdout 纯净性）
+                eprintln!("[vela] fs preset → {hs:#x}");
             }
         }
         let state = Box::new(GuestState { proc, host });
@@ -232,9 +231,7 @@ unsafe extern "system" fn trap(nr: u64, args: &[u64; 6], rip: u64, ctx: &mut vel
     } else if st.proc.fs_base != 0 {
         if let Some(cur) = vela_sys::windows::read_fs_base() {
             if cur != st.proc.fs_base {
-                if logx::enabled() {
-                    eprintln!("[vela] fs heal: {cur:#x} → {:#x}", st.proc.fs_base);
-                }
+                eprintln!("[vela] fs heal: {cur:#x} → {:#x}", st.proc.fs_base);
                 ctx.r10 = st.proc.fs_base;
                 ctx.rip = vela_sys::windows::set_fs_stub_addr() as u64;
             }

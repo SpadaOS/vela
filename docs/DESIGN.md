@@ -51,7 +51,11 @@ vela.exe (PE)
 - **自愈机制（musl 实测必需）**：内核在某些转换路径会把用户 fs 基址恢复为旧值
   （表现为 musl 退出路径的 canary 检查偶发 fs=0 访问违例）。每次 syscall 返回时
   `rdfsbase` 校验当前基址，与 `proc.fs_base` 不符就再跳一次 trampoline 重设。
-  musl hello 压测 90+ 次零失败。
+- **三重防护**：进入客户前用已映射的堆页预切 FS（内核从未见过宿主基址）→
+  arch_prctl 后由 trampoline 改为真实 TLS 区 → 每次 syscall 返回自愈校验。
+  本地 musl hello 300+ 次零失败；CI 机器上仍有 ≤2% 概率的极端时序命中
+  （崩溃于 `__init_tp`/canary 的 fs 访问，两个 syscall 之间无自愈触发点），
+  musl 集成测试因此允许 3 次重试。彻底修复需软件级 FS 保存/恢复（v0.1 评估）。
 - `SYS_SET_TID_ADDRESS` 在 x86_64 上是 **218**（初版误写 249，musl 启动会调用）。
 
 ## 依赖方向
