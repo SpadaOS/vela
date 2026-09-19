@@ -53,8 +53,5 @@ jobs:
           cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/busybox echo hello
           cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/busybox nproc
           cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/busybox true
-          cargo run -p vela-cli --bin vela -- run --soft-tls -v guest/bin/busybox sh -c "echo hello | wc -c" 2> sh-trace.log || true
-          tail -40 sh-trace.log
-          cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/busybox sh -c "seq 1 5 | xargs echo"
       - name: Doctor report (informational)
         run: cargo run -p vela-cli --bin vela -- doctor

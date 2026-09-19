@@ -18,9 +18,10 @@
   Linux status 编码（WIFEXITED/WIFSIGNALED）；孤儿诚实 -ECHILD
 - **kill 最小集（M3）**：SIGKILL/SIGTERM → TerminateProcess(128+sig)、
   sig 0 探测；其余信号诚实 ENOSYS（投递仍 NONGOALS）
-- **busybox shell 解锁（M4）**：白名单扩容 ash（job control 关）+
-  coreutils 全家族（cp/mv/rm/grep/xargs/sort/sed 类 20+ applet）；
-  CI 验收 `sh -c 'echo hello | wc -c'` → `6`
+- **busybox 白名单扩容（M4）**：ash + coreutils 全家族（cp/mv/rm/grep/
+  xargs/sort 等 20+ applet）入构建白名单；⚠ ash 的 `sh -c` 在 CI 发现
+  执行流跑到编译器 UD1 陷阱（fork 路径深层问题，strace 证据存档），
+  **实验性**，验收顺延 0.0.7
 - **进程组/会话近似（M5）**：getpgrp/getpgid/setsid/getsid（pgid=sid=pid）、
   setpgid；utimensat 诚实 ENOSYS
 - **发布工程（M6）**：release workflow——tag 触发 release 构建并上传

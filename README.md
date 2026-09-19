@@ -73,14 +73,12 @@ cargo build -p vela-cli --release
 > 用 `vela doctor` 检查你的环境。
 
 更多命令——文件 IO 全链路、execve 自重载、**用户态 fork**、busybox
-shell（CI 现场构建，本地复现见 [tools/build-busybox.sh](tools/build-busybox.sh)）：
+（CI 现场构建，本地复现见 [tools/build-busybox.sh](tools/build-busybox.sh)）：
 
 ```powershell
 .\target\release\vela.exe run --soft-tls guest\bin\file-io     # 文件 syscall 全链路
 .\target\release\vela.exe run --soft-tls guest\bin\fs-exec     # pipe -> dup2 -> execve 自重载
 .\target\release\vela.exe run --soft-tls guest\bin\fork-test   # fork -> 管道 -> waitpid
-.\target\release\vela.exe run --soft-tls guest\bin\busybox sh -c "echo hello | wc -c"
-# 6
 
 .\target\release\vela.exe doctor    # 环境自检：FSGSBASE / 映射 / guest 清单
 ```
@@ -96,7 +94,7 @@ v0.0.6 实测（CI 在 Windows runner 上自动验收全部 ✅ 项）：
 | **动态链接** | ✅ | `ld-musl` 解释器全权重定位（0.0.4 起）；glibc 诚实拒绝 |
 | **busybox 子集** | ✅ | echo/ls/cat/true/false/nproc/env/printf（0.0.5 起） |
 | **用户态 fork** | ✅ | fork+waitpid 全语义：子进程从返回点继续、独立 pid、fd 继承（0.0.6 起） |
-| **busybox shell** | ✅ | ash：`sh -c` 管道/重定向/变量/xargs（0.0.6 起） |
+| busybox shell | 🟨 | ash 已构建入白名单；`sh -c` 执行流在 CI 出现编译器陷阱问题，实验性（顺延 0.0.7） |
 | mmap | ✅ | 匿名 + 文件映射（COW，写不回宿主文件） |
 | **execve** | ✅ | 进程内重载，fd 跨重载保留；pipe2 管道 |
 | TLS | ✅ | FSGSBASE 硬件路径，缺失时 `--soft-tls` 软件模拟 |
