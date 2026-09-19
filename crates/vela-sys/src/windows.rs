@@ -329,6 +329,12 @@ unsafe extern "system" fn veh_handler(ep: *mut ExceptionPointers) -> i32 {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     let Some(_range) = guest_range_containing(rip) else {
+        // rip 在已注册的 UD2 之外：exec-range 表与执行现场脱节
+        //（典型：fork 恢复/execve 重载后注册表未覆盖新入口）
+        eprintln!(
+            "[vela] UD2 outside guest ranges at rip={:#x} (stale exec-range registration)",
+            rip
+        );
         return EXCEPTION_CONTINUE_SEARCH;
     };
     // 客户段内的 #GP（特权指令）：与 AV 同样致命，给出 rip/字节便于定位
