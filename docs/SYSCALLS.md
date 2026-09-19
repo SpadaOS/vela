@@ -1,4 +1,4 @@
-# Vela syscall 兼容矩阵（0.0.5）
+# Vela syscall 兼容矩阵（0.0.6）
 
 > 状态约定（效仿 Gramine 的诚实标注）：
 > - ✅ 完整翻译
@@ -34,7 +34,7 @@
 | 32 | dup | ✅ | 管道端复制共享缓冲 |
 | 33 | dup2 | ✅ | |
 | 59 | execve | 🟨 | **进程内重载**（CLI 层编排）：新映像装载成功后卸载旧地址空间、重建堆/栈/auxv；CLOEXEC fd 关闭，其余 fd 跨重载保留。⚠ Windows 上旧 Reserve 块解除登记但不 VirtualFree（含 musl donate NOACCESS 页的块会内核致死），泄漏至进程退出。失败路径返回 -errno，原映像继续 |
-| 61 | wait4 | ⭕ | 恒 -ECHILD（单进程无 fork） |
+| 61 | wait4 | ✅ | **真实等待**（0.0.6）：WaitForSingleObject 阻塞 / WNOHANG 轮询；status 按 Linux 编码（退出码 <128 = WIFEXITED，≥128 = WIFSIGNALED）；孤儿无 init 收养 → -ECHILD；rusage 填零 |
 | 74 | fsync | ✅ | stdio/伪设备 no-op |
 | 75 | fdatasync | ✅ | |
 | 76 | truncate | ❌ | 路径版未实现（ftruncate fd 版可用） |
@@ -51,7 +51,7 @@
 | 99 | sysinfo | 🟨 | uptime 真实（宿主时钟）；内存量固定近似；procs=1 |
 | 16 | ioctl | 🟨 | 仅 TIOCGWINSZ（固定 80x25）；其余 ENOTTY（非终端语义） |
 | 20 | writev | ✅ | 管道支持（容量内逐 iov 追加） |
-| 39 | getpid | ✅ | 固定假 pid |
+| 39 | getpid | ✅ | 真实 Windows pid（0.0.6 起；fork 父子各自不同） |
 | 60 | exit | ✅ | 退出前 flush stdio |
 | 63 | uname | ✅ | Linux / vela / 6.6.0-vela |
 | 72 | fcntl | 🟨 | F_GETFD/F_SETFD/F_GETFL/F_SETFL/F_DUPFD/F_DUPFD_CLOEXEC；其余 EINVAL |
@@ -59,7 +59,7 @@
 | 80 | chdir | 🟨 | 记账式 cwd；宿主侧校验目录存在；`..` 拒绝 |
 | 96 | gettimeofday | ✅ | |
 | 102/104/107/108 | getuid/getgid/geteuid/getegid | ✅ | `--uid/--gid` 可配，默认 1000 |
-| 110 | getppid | ✅ | 宿主 pid 派生的稳定值（真实父进程不存在） |
+| 110 | getppid | ✅ | fork 子进程 = 真实父 pid（0.0.6）；普通启动 = 宿主 pid 派生的稳定值 |
 | 158 | arch_prctl | 🟨 | SET_FS 依赖 FSGSBASE；不支持时仅记录（`--soft-tls` 下 fs 访问由 VEH 软件模拟，见 DESIGN.md） |
 | 160/161 | getrlimit/setrlimit | ⭕ | RLIM_INFINITY（与 prlimit64 一致） |
 | 217 | getdents64 | ✅ | 快照式目录遍历（打开后不感知变化）；`..` 逃逸防护 |
@@ -74,7 +74,12 @@
 | 264 | renameat | ✅ | |
 | 269 | faccessat | 🟨 | 同 access |
 | 292 | dup3 | ✅ | 仅接受 O_CLOEXEC flag |
-| 293 | pipe2 | 🟨 | 进程内环形缓冲 fd 对（64 KiB）；仅 O_CLOEXEC/O_NONBLOCK；非阻塞语义（无调度器） |
+| 293 | pipe2 | ✅ | **宿主匿名管道**（0.0.6 下沉）：真实阻塞读写、64 KiB 缓冲、fd 可跨 fork 继承；O_NONBLOCK 无效果（Linux 子集）；fstat = S_IFIFO\|0600 |
+| 22 | pipe | ✅ | ≡ pipe2(flags=0)（musl pipe() 降级路径） |
+| 56/57/58 | clone/fork/vfork | 🟨 | **用户态 fork**（0.0.6）：仅接受 fork 语义（SIGCHLD / vfork / fork 号）——快照客户地址空间（区间级 inheritable section）+ CONTEXT 传递，子进程 MapViewOfFileEx 回原地址后从 fork 返回点继续；父返回子 pid、子返回 0。⚠ 线程类 clone（CLONE_VM 等）诚实拒绝（单线程契约）；⚠ 全量快照（~24 MB/次），性能非目标；⚠ mprotect 运行时历史不传递（按映像段 prot 恢复） |
+| 62 | kill | 🟨 | 最小集（0.0.6）：SIGKILL/SIGTERM → TerminateProcess(128+sig)、sig 0 → 探测；其余信号 → ENOSYS（信号**投递**仍 NONGOALS，客户 handler 永不触发） |
+| 109/121/111 | setpgid/getpgid/getpgrp | 🟨 | 诚实近似（0.0.6）：pgid=sid=pid（单进程无会话）；setpgid 校验后返回 0 |
+| 112/124 | setsid/getsid | 🟨 | 同上：返回 pid |
 | 302 | prlimit64 | ⭕ | 上报 RLIM_INFINITY（无资源限制语义） |
 | 318 | getrandom | ✅ | 上限 64MiB 防呆 |
 | 332 | statx | 🟨 | 128B 布局，mask=STATX_BASIC_STATS；btime 恒 0 |

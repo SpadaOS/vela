@@ -72,20 +72,22 @@ cargo build -p vela-cli --release
 > Vela 会用 VEH 软件模拟客户 fs 段访问。裸机/支持 FSGSBASE 的机器不需要。
 > 用 `vela doctor` 检查你的环境。
 
-更多命令——文件 IO 全链路、execve 自重载、busybox（CI 现场构建，
-本地复现见 [tools/build-busybox.sh](tools/build-busybox.sh)）：
+更多命令——文件 IO 全链路、execve 自重载、**用户态 fork**、busybox
+shell（CI 现场构建，本地复现见 [tools/build-busybox.sh](tools/build-busybox.sh)）：
 
 ```powershell
-.\target\release\vela.exe run --soft-tls guest\bin\file-io   # 文件 syscall 全链路
-.\target\release\vela.exe run --soft-tls guest\bin\fs-exec   # pipe -> dup2 -> execve 自重载
-.\target\release\vela.exe run --soft-tls guest\bin\busybox echo hello
+.\target\release\vela.exe run --soft-tls guest\bin\file-io     # 文件 syscall 全链路
+.\target\release\vela.exe run --soft-tls guest\bin\fs-exec     # pipe -> dup2 -> execve 自重载
+.\target\release\vela.exe run --soft-tls guest\bin\fork-test   # fork -> 管道 -> waitpid
+.\target\release\vela.exe run --soft-tls guest\bin\busybox sh -c "echo hello | wc -c"
+# 6
 
 .\target\release\vela.exe doctor    # 环境自检：FSGSBASE / 映射 / guest 清单
 ```
 
 ## 能力矩阵
 
-v0.0.5 实测（CI 在 Windows runner 上自动验收全部 ✅ 项）：
+v0.0.6 实测（CI 在 Windows runner 上自动验收全部 ✅ 项）：
 
 | 能力 | 状态 | 说明 |
 |---|:---:|---|
@@ -93,11 +95,13 @@ v0.0.5 实测（CI 在 Windows runner 上自动验收全部 ✅ 项）：
 | 静态 musl C 程序 | ✅ | 文件 IO 全链路（stat/getdents64/fcntl） |
 | **动态链接** | ✅ | `ld-musl` 解释器全权重定位（0.0.4 起）；glibc 诚实拒绝 |
 | **busybox 子集** | ✅ | echo/ls/cat/true/false/nproc/env/printf（0.0.5 起） |
+| **用户态 fork** | ✅ | fork+waitpid 全语义：子进程从返回点继续、独立 pid、fd 继承（0.0.6 起） |
+| **busybox shell** | ✅ | ash：`sh -c` 管道/重定向/变量/xargs（0.0.6 起） |
 | mmap | ✅ | 匿名 + 文件映射（COW，写不回宿主文件） |
 | **execve** | ✅ | 进程内重载，fd 跨重载保留；pipe2 管道 |
 | TLS | ✅ | FSGSBASE 硬件路径，缺失时 `--soft-tls` 软件模拟 |
 | 时间 / 熵 / 进程身份 | ✅ | clock/getrandom/uname/auxv 完整 |
-| fork / 信号投递 | ❌ | wait4 诚实返回 -ECHILD |
+| fork / 信号投递 | 🟨 | fork ✅（0.0.6 用户态快照实现）；信号投递 ❌（kill SIGKILL/SIGTERM 可用） |
 | socket / epoll / GUI | ❌ | 返回 `-ENOSYS`，libc 有降级路径 |
 | Go 程序 / 32 位 / ARM | ❌ | 见 [docs/NONGOALS.md](docs/NONGOALS.md) |
 
@@ -205,10 +209,10 @@ Vela 当沙箱用。杀毒软件可能对"进程内改可执行内存再执行"�
 
 ## 路线
 
-- **v0.0.5（当前）**：busybox 静态子集上 vela、abi 模块化、exec-range
-  原地重注册、syscall 广度 +9
-- v0.0.6 候选：busybox 扩容（ash shell、更多 applet）、MAP_SHARED、
-  信号投递地基
+- **v0.0.6（当前）**：多进程之门——用户态 fork + wait4 真实化 + kill
+  最小集 + busybox ash shell 解锁 + Release 挂产物
+- v0.0.7 候选：fork 脏页快照优化、MAP_SHARED、信号投递地基（SIGCHLD/
+  handler 帧）、utimensat
 - v1：SpadaOS `Host` 填满（map/file/time/thread/futex 五组）、外部 X server
   通路
 

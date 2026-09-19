@@ -1,0 +1,42 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build (release)
+        run: cargo build -p vela-cli --release
+      - name: Smoke check
+        run: |
+          cargo run -p vela-cli --bin vela --release -- --version
+          cargo run -p vela-cli --bin vela-mkhello -- guest/bin/hello
+          cargo run -p vela-cli --bin vela --release -- run guest/bin/hello
+      - name: Package
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}"
+          $dir = "vela-$v-windows-x64"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item target/release/vela.exe $dir/
+          Copy-Item README.md LICENSE $dir/
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          $h = (Get-FileHash "$dir.zip" -Algorithm SHA256).Hash
+          "$h  $dir.zip" | Out-File "$dir.zip.sha256" -Encoding ascii
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            vela-*-windows-x64.zip
+            vela-*-windows-x64.zip.sha256

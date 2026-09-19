@@ -112,6 +112,39 @@ FSGSBASE 缺失（Hyper-V/云 VM/VBS）时 FS 基址无法切换，客户的 fs 
 每次 fs 访问 = 一次异常往返，诊断/CI 可用，生产不可用。0.0.5 为解码表
 补了表驱动回归测试（10 组合向量 + 负例），防止扩表时打坏 musl 既有形态。
 
+## 用户态 fork（0.0.6）
+
+Linux fork = 地址空间副本 + 上下文副本 + fd 表副本。客户地址空间完全由
+vela 进程持有且规模受控（映像 + 栈/堆 ≤ 24 MiB 默认），**不需要内核 COW
+页表**——WSL1 用 pico provider 在内核做的事，在用户态等价完成：
+
+1. **快照**：trap 层拦截 `SYS_FORK/CLONE(SIGCHLD)`（musl x86_64 fork 走
+   57 号），按 `MemRegistry` 每区间建 inheritable section
+   （`CreateFileMappingW(PAGE_EXECUTE_READWRITE)`）并 memcpy 客户内存；
+2. **元数据**：inheritable 匿名管道传递免依赖定长编码——CONTEXT 全量
+   （0x4D0，改写 Rip=返回点/Rax=0/Rcx/R11/flags=CONTEXT_ALL）、fd 表
+   （Disk/Pipe 句柄值继承后不变，直接传值）、堆栈尺寸、cwd、TLS 基址；
+3. **spawn 自身**：`CreateProcessW(vela.exe, "vela --internal-fork <r>
+   <父命令行透传>", inheritHandles=TRUE)`——命令行重放使子进程的
+   --root/--map/--soft-tls 配置一致；
+4. **恢复**：子进程 `MapViewOfFileEx` 把 section **映射回客户原地址**
+   （指针一致性的前提；新进程地址空闲），重建 fd 表/堆/映像/auxv，
+   `NtContinue` 注入 CONTEXT 从 fork 返回点继续——父返回子 pid、子返回 0。
+
+三个 Windows 硬约束（实测排障记录）：
+
+- **section 保护**：view 可执行性由 desiredAccess 决定——需
+  `FILE_MAP_EXECUTE` 且 section 对象 `PAGE_EXECUTE_READWRITE`，否则恢复后
+  代码页执行 DEP AV；
+- **CONTEXT 对齐**：内核要求 16 字节对齐——`repr(C, align(16))`；
+- **context_flags**：VEH 传入的 flags 带异常请求位，NtContinue 按位恢复
+  会直接返回——必须显式置 `CONTEXT_ALL`。
+
+诚实边界：全量快照（~24 MB/次，脏页优化顺延）；mprotect 运行时历史不
+传递（按映像段 prot 恢复）；HostDir fd 游标重置；线程类 clone 拒绝。
+pipe2 同步下沉为 Windows 匿名管道（inheritable）——跨进程 fd 继承的
+前提，阻塞/EOF/EPIPE 语义由 OS 维持。
+
 ## 工程地基（0.0.5）
 
 - **exec-range 原地重注册**：`replace_guest_exec_ranges` 用前缀覆盖 + 尾部

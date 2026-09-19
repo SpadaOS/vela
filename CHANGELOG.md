@@ -2,6 +2,46 @@
 
 本项目的所有显著变更记录于此（Keep a Changelog 格式）。
 
+## [0.0.6] - 2026-09-19
+
+主题：多进程之门 —— 用户态 fork + wait 族真实化 + busybox shell 解锁
+（计划见 docs/plans/PLAN-0.0.6.md）。
+
+### Added
+
+- **用户态 fork（M1）**：`fork(2)` 完整语义——拦截 `SYS_FORK/CLONE
+  (SIGCHLD)` 后 spawn vela 自身（`--internal-fork` 隐藏入口），按客户地址
+  区间建 inheritable section 快照，子进程 `MapViewOfFileEx` 回**原地址**
+  （指针一致性），CONTEXT 注入后从 fork 返回点继续；父返回子 pid、
+  子返回 0。快照协议免依赖定长编码，CONTEXT 全量（0x4D0）传递
+- **wait4 真实化（M2）**：`WaitForSingleObject` 阻塞 / WNOHANG 轮询；
+  Linux status 编码（WIFEXITED/WIFSIGNALED）；孤儿诚实 -ECHILD
+- **kill 最小集（M3）**：SIGKILL/SIGTERM → TerminateProcess(128+sig)、
+  sig 0 探测；其余信号诚实 ENOSYS（投递仍 NONGOALS）
+- **busybox shell 解锁（M4）**：白名单扩容 ash（job control 关）+
+  coreutils 全家族（cp/mv/rm/grep/xargs/sort/sed 类 20+ applet）；
+  CI 验收 `sh -c 'echo hello | wc -c'` → `6`
+- **进程组/会话近似（M5）**：getpgrp/getpgid/setsid/getsid（pgid=sid=pid）、
+  setpgid；utimensat 诚实 ENOSYS
+- **发布工程（M6）**：release workflow——tag 触发 release 构建并上传
+  `vela.exe`（zip + SHA256）到 GitHub Release
+
+### Changed
+
+- **pipe2 下沉为 Windows 匿名管道**：fd 可跨 fork 继承（子进程同值句柄）；
+  真实阻塞读写取代进程内环形缓冲的假 EAGAIN；EOF（写端全关）/
+  EPIPE（读端全关）由 OS 语义维持；fstat = S_IFIFO|0600
+- **getpid/getppid 诚实化**：getpid = 真实 Windows pid（fork 父子不同）；
+  getppid = fork 传递的父 pid（普通启动维持派生值）
+- pipe(22) 补齐（musl pipe() 降级到 pipe2）
+
+### Fixed
+
+- fork 子进程执行页 DEP 执行 AV——section 需 PAGE_EXECUTE_READWRITE 且
+  MapViewOfFileEx desiredAccess 含 FILE_MAP_EXECUTE
+- NtContinue 注入失败返回——CONTEXT 需 16 字节对齐（repr(align(16))）
+  且 context_flags 必须显式置 CONTEXT_ALL（VEH 传入的 flags 带异常请求位）
+
 ## [0.0.5] - 2026-09-19
 
 主题：真实软件之门 —— busybox 静态子集压力测试 + 工程地基加固
