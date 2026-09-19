@@ -359,7 +359,7 @@ unsafe extern "system" fn veh_handler(ep: *mut ExceptionPointers) -> i32 {
             .map(|b| format!("{b:02x}"))
             .collect();
         eprintln!(
-            "[vela] ILLEGAL_INSTRUCTION at rip={:#x} is NOT a patch point: bytes={hb} (execution ran off-script — check fork/execve rip restore)",
+            "[vela] ILLEGAL_INSTRUCTION at rip={:#x} is NOT a patch point: bytes={hb:?} (execution ran off-script — check fork/execve rip restore)",
             rip
         );
         return EXCEPTION_CONTINUE_SEARCH;
