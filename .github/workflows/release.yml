@@ -29,8 +29,8 @@ jobs:
           $v = "${{ github.ref_name }}"
           $dir = "vela-$v-windows-x64"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          Copy-Item target/release/vela.exe $dir/
-          Copy-Item README.md LICENSE $dir/
+          Copy-Item target/release/vela.exe -Destination $dir/
+          Copy-Item README.md, LICENSE -Destination $dir/
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
           $h = (Get-FileHash "$dir.zip" -Algorithm SHA256).Hash
           "$h  $dir.zip" | Out-File "$dir.zip.sha256" -Encoding ascii
