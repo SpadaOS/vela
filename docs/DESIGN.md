@@ -109,7 +109,24 @@ FSGSBASE 缺失（Hyper-V/云 VM/VBS）时 FS 基址无法切换，客户的 fs 
 
 价值：CI（Hyper-V runner）与云 VM 上的 musl 验收从"跳过"变"软跑通"
 （`--soft-tls guest/bin/hello-dyn` 端到端输出问候并干净退出）。性能不承诺：
-每次 fs 访问 = 一次异常往返，诊断/CI 可用，生产不可用。
+每次 fs 访问 = 一次异常往返，诊断/CI 可用，生产不可用。0.0.5 为解码表
+补了表驱动回归测试（10 组合向量 + 负例），防止扩表时打坏 musl 既有形态。
+
+## 工程地基（0.0.5）
+
+- **exec-range 原地重注册**：`replace_guest_exec_ranges` 用前缀覆盖 + 尾部
+  清零替代"clear + 重注册"，execve 重载不再受 32 静态槽累积限制。
+- **mmap carve 清零**：Reserve 内 MAP_FIXED 覆盖显式清零，对齐 Linux
+  "替换 = 匿名零页"语义（修掉上面"已知 v0 简化"第 2 条的前半句）。
+- **abi 模块化**：vela-abi 拆 10 个子模块（syscalls/errno/mmap/open/fcntl/
+  stat/statx/auxv/clock/structs），`pub use` 全量重导出保持 API 兼容；
+  `every_dispatched_syscall_has_a_name` 测试锁住"名表完备"约束。
+- **stdin 直通**：`GuestFd::StdIn` 走 file_ops 真实读取，`vela run pipe-a |
+  vela run pipe-b` 宿主管道组合端到端可跑。
+- **busybox 构建渠道**：CI 用 msys2 make + zig cc 交叉编译 busybox 1.36.1
+  静态子集并验收（echo/nproc/true）。zig 0.13 Windows 工具链三处修补
+  （depfile 剥离 / autoconf.h 强制生成 / GNU ld 专属链接参数中和）的
+  决策记录在 `tools/build-busybox.sh` 注释。
 
 
 ## 依赖方向
@@ -130,7 +147,7 @@ vela-cli → vela-loader → vela-runtime → vela-fs
 ## 已知 v0 简化
 
 - `munmap` 只移除完全被覆盖的登记项（Windows 不能部分 VirtualFree）。
-- `mmap` 仅 MAP_PRIVATE；Reserve 块内的 MAP_FIXED 就地覆盖保留原页内容
-  （Linux 为匿名零页；musl 仅对未写入的 brk 尾页这样做）。
+- `mmap` 无 MAP_SHARED（返回 ENOSYS）；文件映射仅限条件满足的 fd
+  （offset/hint 64K 对齐，否则退化为匿名映射 + 读入）。
 - execve 重载不释放旧 Reserve 块（Windows 内核路径致死，见 execve 节）。
 - VEH 处理器在客户栈上执行（见上文 red zone 风险）。

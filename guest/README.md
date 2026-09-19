@@ -96,6 +96,39 @@ dynlink.c，需从 musl.libc.org 补齐同版本源码）。
 fd 3 读出消息，验证 fd 跨 execve 保留。通过输出
 `fs-exec ok: pipe-across-execve`。musl 依赖 TLS，本机验证用 `--soft-tls`。
 
+## `pipe-a` / `pipe-b`（0.0.5 M2 出口，宿主管道组合验收）
+
+两个静态 musl C 程序（`src/pipe-a.c` / `src/pipe-b.c`）：pipe-a 向 stdout
+写 3 行消息，pipe-b 从 stdin 逐块读取并统计字节/行数。宿主侧用真实管道
+串起来：
+
+```powershell
+vela run guest\bin\pipe-a | vela run guest\bin\pipe-b
+# pipe-b ok: 29 bytes, 3 lines
+```
+
+验证两件事：vela 的 stdout/stdin 与宿主管道全双工互通（GuestFd::StdIn
+经 file_ops 真实读取、write 侧 flush 与 EOF 干净），以及两个独立 vela
+进程各自生命周期正常（退出码 0）。编译命令同 hello-musl。
+
+## `busybox`（0.0.5 M3 出口，CI 现场构建，不入库）
+
+busybox 1.36.1 静态子集（allnoconfig + 白名单 applet：echo/ls/cat/true/
+false/nproc/env/printf + CONFIG_STATIC），由 `tools/build-busybox.sh` 在
+CI 上用 msys2 make + zig cc 交叉编译（musl 静态 PIE）。产物
+`guest/bin/busybox` 仅存在于 CI 工作区，验收 echo/nproc/true：
+
+```powershell
+vela run --soft-tls guest\bin\busybox echo hello
+vela run --soft-tls guest\bin\busybox nproc
+vela run --soft-tls guest\bin\busybox true
+```
+
+本地复现需要 msys2（make/gcc/bzip2/curl）+ zig 0.13.0 在 PATH；脚本内
+`cygpath` 处理 workspace 路径转换，并针对 zig 0.13 Windows 工具链做了三项
+修补（depfile 剥离、autoconf.h 强制生成、GNU ld 专属链接参数中和）——
+细节见脚本注释。
+
 ## 禁止
 
 - 用 MinGW 编出来的 PE 当测试（规格 8.3）

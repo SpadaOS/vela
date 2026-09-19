@@ -16,7 +16,7 @@ runtime 及以上禁止 `#[cfg(target_os)]` 与任何宿主类型；路径在进
 
 | 组 | trait | 方法 | SpadaOS 内核能力对应 |
 |---|---|---|---|
-| map | `HostMem` | `map` / `protect` / `unmap` | 地址空间：匿名映射、W^X 收敛、整块释放 |
+| map | `HostMem` | `map` / `protect` / `unmap`；0.0.4 起 `map_file` / `unmap_view` / `decommit` | 地址空间：匿名映射、W^X 收敛、整块释放；文件映射（Windows 走 `CreateFileMappingW` COW，写不回宿主文件） |
 | file | `HostFileOps` | `open` `open_dir` `mkdir` `remove` `rename` `sync_file` `dup_file` `read` `write` `seek` `stat_path` `stat_file` `close` `stdio` | VFS：文件/目录 CRUD、元数据、句柄复制 |
 | time | `HostTime` | `monotonic_ns` / `realtime` / `random` | 时钟：单调钟/实时钟；熵源 |
 | thread | `HostTls` + `Host::thread_*` | `set_fs_base` / `thread_exit` / `thread_create`(桩) | TLS 寄存器切换、线程生命周期 |
@@ -30,6 +30,9 @@ runtime 及以上禁止 `#[cfg(target_os)]` 与任何宿主类型；路径在进
   已按此假设设计（只移除完全覆盖的登记项）。
 - `stat_*` 返回的 `ino/dev` 只需「同进程内稳定 + stat/getdents 一致」
   （musl 不要求真实 inode；Windows 实现用路径哈希）。
+- `map_file` 的可写视图必须 COW（Windows 用 `PAGE_WRITECOPY`），客户写入
+  **永不**回写宿主文件；对文件视图 `protect` 加 WRITE 会关闭 COW——
+  runtime 已按此约束实现（0.0.4）。
 - `set_fs_base` 需要 CPU+OS 的 FSGSBASE；不支持时 runtime 降级（仅记录），
   TLS 依赖程序无法运行——见 docs/DESIGN.md「TLS/FS」。
 - pread64/pwrite64 的宿主层用 seek→io→seek-back 组合实现，依赖
