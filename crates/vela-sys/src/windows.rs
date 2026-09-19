@@ -354,6 +354,14 @@ unsafe extern "system" fn veh_handler(ep: *mut ExceptionPointers) -> i32 {
     // SAFETY: rip..rip+2 已确认位于客户可执行映射内
     let code = unsafe { std::slice::from_raw_parts(rip as *const u8, 2) };
     if code != [0x0F, 0x0B] {
+        let hb: Vec<String> = unsafe { std::slice::from_raw_parts(rip as *const u8, 16) }
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        eprintln!(
+            "[vela] ILLEGAL_INSTRUCTION at rip={:#x} is NOT a patch point: bytes={hb} (execution ran off-script — check fork/execve rip restore)",
+            rip
+        );
         return EXCEPTION_CONTINUE_SEARCH;
     }
     let raw = TRAP_FN.load(Ordering::Relaxed);
