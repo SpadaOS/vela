@@ -73,7 +73,8 @@ extern "system" {
         lpBaseAddress: *mut c_void,
     ) -> *mut c_void;
     fn UnmapViewOfFile(lpBaseAddress: *mut c_void) -> i32;
-    fn CloseHandle(hObject: *mut c_void) -> i32;
+    #[link_name = "CloseHandle"]
+    fn CloseHandle(hObject: isize) -> i32;
     fn SetConsoleOutputCP(wCodePageID: u32) -> i32;
     fn AddVectoredExceptionHandler(
         First: u32,
@@ -91,7 +92,8 @@ extern "system" {
 
 /// x64 CONTEXT 覆盖视图：只声明我们关心的字段 + 尾部不透明区。
 /// 字段偏移与 Win32 CONTEXT 一致（rax=0x78 … rip=0xF8），总大小 0x4D0。
-#[repr(C)]
+/// 内核要求 CONTEXT 16 字节对齐（XSAVE 域）——NtContinue 直接使用本结构。
+#[repr(C, align(16))]
 pub struct Context {
     pub p1_home: u64,
     pub p2_home: u64,
@@ -946,7 +948,7 @@ impl HostMem for WindowsHost {
                 hint as *mut c_void,
             )
         };
-        let closed = unsafe { CloseHandle(handle) } != 0;
+        let closed = unsafe { CloseHandle(handle as isize) } != 0;
         if base.is_null() || !closed {
             if !base.is_null() {
                 // SAFETY: base 来自配对的 MapViewOfFileEx
@@ -1029,6 +1031,9 @@ impl HostFileOps for WindowsHost {
     fn stdio(&self) -> StdioHandles {
         file_ops::stdio()
     }
+    fn create_pipe(&self) -> Result<(HostFile, HostFile), HostError> {
+        file_ops::create_pipe()
+    }
 }
 
 impl HostTime for WindowsHost {
@@ -1074,6 +1079,298 @@ impl Host for WindowsHost {
         std::process::exit(code)
     }
 }
+
+// ---------------------------------------------------------------- 进程与跨进程内存（0.0.6 M1：用户态 fork）
+
+/// CreateProcess 产物：pid 与常驻 hProcess（wait4/kill 用）。
+pub struct ChildProcess {
+    pub pid: u32,
+    pub handle: isize,
+}
+
+pub fn current_pid() -> u32 {
+    // SAFETY: 无参数 API
+    unsafe { GetCurrentProcessId() }
+}
+
+/// 创建 inheritable 匿名管道（fork 元数据通道），返回 (写端, 读端)。
+pub fn create_inherit_pipe() -> Result<(isize, isize), HostError> {
+    let (r, w) = file_ops::pipe_handles()?;
+    Ok((w, r))
+}
+
+/// 由原始句柄构造管道端（fork 元数据管道的 CLI 侧读写包装）。
+pub fn pipe_from_raw_handle(h: isize, _is_read: bool) -> crate::PipeEnd {
+    crate::PipeEnd(crate::PipeEndInner::Handle(h))
+}
+
+pub fn close_handle(h: isize) {
+    if h != 0 {
+        // SAFETY: h 来自 CreateProcess/CreateFileMapping/CreatePipe 的成功返回
+        unsafe { CloseHandle2(h) };
+    }
+}
+
+pub fn set_handle_inherit(h: isize) -> Result<(), HostError> {
+    const HANDLE_FLAG_INHERIT: u32 = 0x1;
+    // SAFETY: h 为调用方持有的有效句柄
+    if unsafe { SetHandleInformation2(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
+        return Err(HostError::Other(file_ops::os_to_errno(
+            unsafe { GetLastError() } as i32,
+        )));
+    }
+    Ok(())
+}
+
+/// 创建命名无关的页文件 backed section（跨进程共享内存）。
+/// 注意：flProtect 用 PAGE_EXECUTE_READWRITE——section 视图的保护由
+/// section 对象决定，子进程需在恢复的代码页上执行（fork 快照场景）。
+pub fn create_shared_section(size: u64) -> Result<isize, HostError> {
+    // SAFETY: INVALID_HANDLE_VALUE + 空名字 = 页文件 backed；size > 0
+    let h = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            std::ptr::null_mut(), // 默认安全属性；继承靠 SetHandleInformation
+            PAGE_EXECUTE_READWRITE,
+            (size >> 32) as u32,
+            size as u32,
+            std::ptr::null(),
+        )
+    } as isize;
+    if h == 0 {
+        return Err(HostError::Other(file_ops::os_to_errno(
+            unsafe { GetLastError() } as i32,
+        )));
+    }
+    Ok(h)
+}
+
+/// 任意基址映射（父进程拷贝快照用）。
+pub fn map_section_anywhere(h: isize, _size: u64) -> Result<usize, HostError> {
+    // SAFETY: h 为有效 section；offset 0/0 + bytes 0 = 全 section 映射
+    let p = unsafe {
+        MapViewOfFileEx(
+            h as *mut c_void,
+            0x6, // FILE_MAP_READ | FILE_MAP_WRITE
+            0,
+            0,
+            0,
+            std::ptr::null_mut(),
+        )
+    } as usize;
+    if p == 0 {
+        return Err(HostError::Other(file_ops::os_to_errno(
+            unsafe { GetLastError() } as i32,
+        )));
+    }
+    Ok(p)
+}
+
+/// 固定基址映射（子进程把快照放回客户原地址——fork 语义的指针一致性前提）。
+/// desiredAccess 含 FILE_MAP_EXECUTE（0x20）：view 保护由 desiredAccess 决定，
+/// 恢复的代码页必须可执行（section 对象已为 RWX）。
+pub fn map_section_at(h: isize, base: u64, _len: u64) -> Result<usize, HostError> {
+    // SAFETY: base 在子进程为空闲地址（新进程首个映射）；对齐由父侧区间保证
+    let p = unsafe {
+        MapViewOfFileEx(
+            h as *mut c_void,
+            0x26, // FILE_MAP_READ | FILE_MAP_WRITE | FILE_MAP_EXECUTE
+            0,
+            0,
+            0,
+            base as *mut c_void,
+        )
+    } as usize;
+    if p == 0 || p != base as usize {
+        return Err(HostError::Other(file_ops::os_to_errno(
+            unsafe { GetLastError() } as i32,
+        )));
+    }
+    Ok(p)
+}
+
+pub fn unmap_section_view(addr: usize) -> Result<(), HostError> {
+    // SAFETY: addr 来自 MapViewOfFileEx 成功返回
+    if unsafe { UnmapViewOfFile(addr as *mut c_void) } == 0 {
+        return Err(HostError::Other(file_ops::os_to_errno(
+            unsafe { GetLastError() } as i32,
+        )));
+    }
+    Ok(())
+}
+
+/// spawn vela 子进程（fork 协议）。句柄继承由调用方预先 SetHandleInformation。
+pub fn create_child_process(cmdline: &str) -> Result<ChildProcess, HostError> {
+    #[repr(C)]
+    struct ProcessInformation {
+        h_process: isize,
+        h_thread: isize,
+        pid: u32,
+        tid: u32,
+    }
+    let mut cmd: Vec<u16> = cmdline.encode_utf16().collect();
+    cmd.push(0);
+    // STARTUPINFOW（x64 = 104 字节）全零 + cb = 104；其余字段不需要
+    let mut si = [0u8; 104];
+    si[0..4].copy_from_slice(&104u32.to_le_bytes());
+    let mut pi = ProcessInformation {
+        h_process: 0,
+        h_thread: 0,
+        pid: 0,
+        tid: 0,
+    };
+    // SAFETY: cmd 以 NUL 结尾；si.cb 正确；pi 输出
+    let ok = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            cmd.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1, // bInheritHandles = TRUE —— fork 协议前提
+            0, // 无特殊标志：继承控制台（客户 stdout 直通）
+            std::ptr::null(),
+            std::ptr::null(),
+            si.as_ptr() as *const c_void,
+            &mut pi as *mut ProcessInformation as *mut c_void,
+        )
+    };
+    if ok == 0 {
+        return Err(HostError::Other(file_ops::os_to_errno(
+            unsafe { GetLastError() } as i32,
+        )));
+    }
+    // 线程句柄用完即关；进程句柄归调用方（wait4/kill）
+    unsafe { CloseHandle2(pi.h_thread) };
+    Ok(ChildProcess {
+        pid: pi.pid,
+        handle: pi.h_process,
+    })
+}
+
+/// 等待子进程。timeout_ms = INFINITE(0xFFFFFFFF) 阻塞 / 0 轮询。
+/// Ok(None) = 超时；Ok(Some(code)) = 退出码。
+pub fn wait_child(h: isize, timeout_ms: u32) -> Result<Option<u32>, HostError> {
+    // SAFETY: h 为 CreateProcess 返回的进程句柄
+    let w = unsafe { WaitForSingleObject(h as *mut c_void, timeout_ms) };
+    if w == 0x0000_0080 {
+        return Err(HostError::Invalid); // WAIT_ABANDONED：不应出现在进程句柄
+    }
+    if w == 0x0000_0102 {
+        return Ok(None); // WAIT_TIMEOUT
+    }
+    if w != 0 {
+        return Err(HostError::Other(file_ops::os_to_errno(
+            unsafe { GetLastError() } as i32,
+        )));
+    }
+    let mut code: u32 = 0;
+    // SAFETY: h 有效；code 输出指针
+    if unsafe { GetExitCodeProcess(h as *mut c_void, &mut code) } == 0 {
+        return Err(HostError::Other(file_ops::os_to_errno(
+            unsafe { GetLastError() } as i32,
+        )));
+    }
+    Ok(Some(code))
+}
+
+/// 终止子进程（kill SIGKILL/SIGTERM 的诚实近似）。
+pub fn terminate_child(h: isize, code: u32) -> Result<(), HostError> {
+    // SAFETY: h 为有效进程句柄
+    if unsafe { TerminateProcess(h as *mut c_void, code) } == 0 {
+        return Err(HostError::Other(file_ops::os_to_errno(
+            unsafe { GetLastError() } as i32,
+        )));
+    }
+    Ok(())
+}
+
+/// 按 pid 打开进程（kill 的 pid 形态；不存在 → NotFound）。
+pub fn open_process_handle(pid: u32) -> Result<isize, HostError> {
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    // SAFETY: pid 为客户传入的进程 id
+    let h = unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            pid,
+        )
+    } as isize;
+    if h == 0 {
+        let e = unsafe { GetLastError() };
+        if e == 87 {
+            return Err(HostError::Invalid);
+        }
+        return Err(HostError::NotFound);
+    }
+    Ok(h)
+}
+
+/// 元数据管道写入（isize 句柄；阻塞直到全部写入）。
+pub fn pipe_write_all(h: isize, data: &[u8]) -> Result<(), HostError> {
+    if let Some(raw) = file_ops::pipe_write_raw(h, data) {
+        eprintln!("[vela] fork: meta pipe WriteFile raw error {raw}");
+        return Err(HostError::Other(file_ops::os_to_errno(raw as i32)));
+    }
+    Ok(())
+}
+
+/// 元数据管道读取（精确 n 字节）。
+pub fn pipe_read_exact(h: isize, buf: &mut [u8]) -> Result<(), HostError> {
+    let mut off = 0;
+    while off < buf.len() {
+        let got = match file_ops::pipe_read_raw(h, &mut buf[off..]) {
+            Ok(g) => g,
+            Err(raw) => return Err(HostError::Other(file_ops::os_to_errno(raw as i32))),
+        };
+        if got == 0 {
+            return Err(HostError::NotFound); // 父端意外关闭
+        }
+        off += got;
+    }
+    Ok(())
+}
+
+/// 注入完整 CONTEXT 后进入客户（fork 子进程恢复现场；不返回）。
+///
+/// # Safety
+/// ctx 必须指向已映射且登记的客户栈/代码（快照恢复完成后调用）。
+pub unsafe fn continue_with(ctx: &Context) -> ! {
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtContinue(ctx: *mut Context, alert: i32) -> i32;
+    }
+    // SAFETY: ctx 全量恢复（调用方保证现场有效）；本调用不返回
+    unsafe { NtContinue(ctx as *const Context as *mut Context, 0) };
+    unreachable!("NtContinue returned")
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateProcessW(
+        app: *const u16,
+        cmd: *mut u16,
+        proc_attr: *const c_void,
+        thread_attr: *const c_void,
+        inherit_handles: i32,
+        flags: u32,
+        env: *const c_void,
+        cwd: *const u16,
+        si: *const c_void,
+        pi: *mut c_void,
+    ) -> i32;
+    fn WaitForSingleObject(h: *mut c_void, ms: u32) -> u32;
+    fn GetExitCodeProcess(h: *mut c_void, code: *mut u32) -> i32;
+    fn TerminateProcess(h: *mut c_void, code: u32) -> i32;
+    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+    fn GetCurrentProcessId() -> u32;
+    #[link_name = "SetHandleInformation"]
+    fn SetHandleInformation2(h: isize, mask: u32, flags: u32) -> i32;
+    #[link_name = "CloseHandle"]
+    fn CloseHandle2(h: isize) -> i32;
+}
+
+const INVALID_HANDLE_VALUE: *mut c_void = -1isize as *mut c_void;
 
 #[cfg(test)]
 mod soft_tls_tests {

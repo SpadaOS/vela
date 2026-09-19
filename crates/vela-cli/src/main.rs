@@ -7,8 +7,11 @@
 //!
 //! 退出码：客户 exit 的码；文件缺失 127；ELF 格式错误 1；CLI 用法错误 2。
 
+mod fork;
 mod guest_start;
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use vela_loader as loader;
@@ -35,6 +38,10 @@ struct GuestState {
     /// execve 重载时重建堆/栈所需（PLAN-0.0.4 T3.1）。
     stack_mb: u64,
     heap_mb: u64,
+    /// soft-tls 开关（fork 子进程继承，0.0.6 M1）。
+    soft_tls: bool,
+    /// 存活子进程表（0.0.6 M1：pid → hProcess 常驻句柄，wait4/kill 用）。
+    children: RefCell<BTreeMap<u32, isize>>,
 }
 
 static GUEST: AtomicPtr<GuestState> = AtomicPtr::new(std::ptr::null_mut());
@@ -60,7 +67,17 @@ fn real_main() -> i32 {
             println!("vela {}", env!("CARGO_PKG_VERSION"));
             0
         }
-        Some("run") => cmd_run(&args[1..]),
+        // fork 子进程入口（0.0.6 M1）：父 spawn 自身并透传全部原始参数，
+        // 本分支在正常解析前拦截元数据句柄，随后按原路径重放（fs 表等）
+        Some("--internal-fork") => {
+            let h: isize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            if h == 0 {
+                eprintln!("vela: --internal-fork requires a handle (internal use only)");
+                return 2;
+            }
+            cmd_run(&args[2..], Some(h))
+        }
+        Some("run") => cmd_run(&args[1..], None),
         Some("doctor") => cmd_doctor(),
         Some(other) => {
             eprintln!("vela: unknown command '{other}'");
@@ -103,7 +120,7 @@ struct RunOpts {
     soft_tls: bool,
 }
 
-fn cmd_run(rest: &[String]) -> i32 {
+fn cmd_run(rest: &[String], internal_fork: Option<isize>) -> i32 {
     let mut opts = RunOpts {
         verbose: false,
         root: None,
@@ -189,6 +206,17 @@ fn cmd_run(rest: &[String]) -> i32 {
     }
     if opts.verbose {
         logx::enable();
+    }
+    // fork 子进程分支（0.0.6 M1）：跳过 ELF 读/装载，直接从快照恢复现场
+    if let Some(h) = internal_fork {
+        #[cfg(windows)]
+        return fork::internal_fork_main(&opts, h);
+        #[cfg(not(windows))]
+        {
+            let _ = h;
+            eprintln!("vela: guest execution is only supported on Windows in v0");
+            return 1;
+        }
     }
     let Some(elf) = pos.first() else {
         print_usage();
@@ -547,7 +575,7 @@ fn run_elf(
         }
     }
 
-    let mut proc = GuestProcess::new(1000, img);
+    let mut proc = GuestProcess::new(vela_sys::windows::current_pid(), img);
     proc.attach_stdio(&host);
     proc.fs = fs;
     if let Some(u) = opts.uid {
@@ -601,6 +629,8 @@ fn run_elf(
             host,
             stack_mb: opts.stack_mb,
             heap_mb: opts.heap_mb,
+            soft_tls: opts.soft_tls,
+            children: std::cell::RefCell::new(BTreeMap::new()),
         });
         let ptr = Box::into_raw(state);
         GUEST.store(ptr, Ordering::Relaxed);
@@ -691,6 +721,41 @@ unsafe extern "system" fn trap(
             }
             Err(e) => e,
         }
+    } else if nr == vela_abi::SYS_FORK
+        || nr == vela_abi::SYS_VFORK
+        || (nr == vela_abi::SYS_CLONE && args[0] == fork::SIGCHLD_FLAGS)
+    {
+        // fork（0.0.6 M1）：musl x86_64 fork() 走 SYS_FORK(57)；线程类
+        // clone（CLONE_VM 等 flags）维持拒绝（单线程契约，NONGOALS）。
+        match fork::do_fork(st, args, ctx) {
+            Ok(pid) => {
+                // 模拟 syscall 副作用：父返回子 pid
+                ctx.rax = pid as u64;
+                ctx.rcx = rip + 2;
+                ctx.r11 = ctx.e_flags as u64;
+                ctx.rip = rip + 2;
+                if logx::enabled() {
+                    eprintln!("[vela] fork → child pid {pid}");
+                }
+                return 0;
+            }
+            Err(e) => e,
+        }
+    } else if nr == vela_abi::SYS_CLONE {
+        // 线程类 clone（CLONE_VM 等 flags）：诚实拒绝（单线程契约，NONGOALS）
+        if logx::enabled() {
+            eprintln!(
+                "[vela] clone(flags={:#x}) → ENOSYS (threads unsupported, NONGOALS)",
+                args[0]
+            );
+        }
+        -(vela_abi::ENOSYS as i64)
+    } else if nr == vela_abi::SYS_WAIT4 {
+        // wait4（0.0.6 M2）：真实等待子进程句柄（CLI 层持有 children 表）
+        fork::do_wait4(st, args)
+    } else if nr == vela_abi::SYS_KILL {
+        // kill（0.0.6 M3）：SIGKILL/SIGTERM 终止 + sig 0 探测
+        fork::do_kill(st, args[0], args[1])
     } else {
         vela_runtime::dispatch(&mut st.proc, &st.host, nr, *args)
     };

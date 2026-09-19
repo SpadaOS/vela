@@ -56,6 +56,43 @@ pub struct HostPath(pub PathBuf);
 #[derive(Debug)]
 pub struct HostFile(pub HostFileKind);
 
+/// 匿名管道的一端（0.0.6 M1：pipe2 下沉为宿主管道，跨进程可继承）。
+/// Windows 为真实句柄（ReadFile/WriteFile，阻塞语义）；内存实现供
+/// 测试宿主/逻辑构建使用（空且写端开 → EAGAIN 假非阻塞）。
+#[derive(Debug, Clone)]
+pub struct PipeEnd(pub(crate) PipeEndInner);
+
+#[derive(Debug, Clone)]
+pub(crate) enum PipeEndInner {
+    /// Windows HANDLE（inheritable；fork 后子进程同值）。
+    Handle(isize),
+    /// 内存管道（MockHost / linux_dev 逻辑测试）；bool = 是否读端。
+    Mem(std::sync::Arc<PipeMem>, bool),
+}
+
+/// 内存管道共享态（仅测试与逻辑构建路径使用）。
+#[derive(Debug, Default)]
+pub struct PipeMem {
+    pub buf: std::sync::Mutex<Vec<u8>>,
+    pub read_open: std::sync::atomic::AtomicBool,
+    pub write_open: std::sync::atomic::AtomicBool,
+}
+
+impl PipeMem {
+    pub fn new() -> Self {
+        Self {
+            buf: std::sync::Mutex::new(Vec::new()),
+            read_open: std::sync::atomic::AtomicBool::new(true),
+            write_open: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+}
+
+/// 内存管道端构造（测试宿主用；真实宿主用 create_pipe）。
+pub fn pipe_mem_end(m: std::sync::Arc<PipeMem>, is_read: bool) -> PipeEnd {
+    PipeEnd(PipeEndInner::Mem(m, is_read))
+}
+
 #[derive(Debug)]
 pub enum HostFileKind {
     StdIn,
@@ -66,6 +103,8 @@ pub enum HostFileKind {
         file: std::fs::File,
         path: PathBuf,
     },
+    /// 匿名管道一端（pipe2 产物；fstat = S_IFIFO）。
+    Pipe(PipeEnd),
 }
 
 impl HostFileKind {
@@ -75,6 +114,7 @@ impl HostFileKind {
             HostFileKind::StdIn => HostFileKind::StdIn,
             HostFileKind::StdOut => HostFileKind::StdOut,
             HostFileKind::StdErr => HostFileKind::StdErr,
+            HostFileKind::Pipe(e) => HostFileKind::Pipe(e.clone()),
             HostFileKind::Disk { .. } => unreachable!("dup_file handles Disk via try_clone"),
         }
     }
@@ -125,6 +165,14 @@ impl HostDir {
     pub fn advance(&self) {
         if let Ok(mut g) = self.queue.lock() {
             g.pop_front();
+        }
+    }
+
+    /// 剩余条目快照（fork 元数据传递用；不消费队列）。
+    pub fn clone_remaining(&self) -> Vec<HostDirEntry> {
+        match self.queue.lock() {
+            Ok(g) => g.clone().into(),
+            Err(p) => p.into_inner().clone().into(),
         }
     }
 }
@@ -301,6 +349,13 @@ pub trait HostFileOps: Send + Sync + 'static {
     }
     fn close(&self, f: HostFile) -> Result<(), HostError>;
     fn stdio(&self) -> StdioHandles;
+    /// 创建匿名管道（pipe2 语义），返回 (读端, 写端)。0.0.6 M1：
+    /// Windows 实现 CreatePipe + 句柄 inheritable（fork 传递的前提）；
+    /// 读写为真实阻塞语义（EOF = 写端全部关闭，EPIPE = 读端全部关闭）。
+    /// 默认未实现（逻辑测试宿主可返回 Unimplemented）。
+    fn create_pipe(&self) -> Result<(HostFile, HostFile), HostError> {
+        Err(HostError::Unimplemented)
+    }
 }
 
 /// 组 3 time：时间与熵（宿主环境信息；RNG 并入本组，见 PLAN-0.0.3 决策点 3）。

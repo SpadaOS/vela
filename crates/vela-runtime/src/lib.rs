@@ -16,28 +16,19 @@ use crate::mem::MemRegistry;
 
 // ---------------------------------------------------------------- fd 表
 
-/// 进程内管道（PLAN-0.0.4 T3.2）：pipe2 创建的 fd 对共享此缓冲。
-/// v0 单线程无阻塞调度——空读且写端开着返回 -EAGAIN、满写返回 -EAGAIN。
-#[derive(Debug, Default)]
-pub struct Pipe {
-    pub buf: std::cell::RefCell<Vec<u8>>,
-    pub read_open: std::cell::Cell<bool>,
-    pub write_open: std::cell::Cell<bool>,
-    /// 环形缓冲容量（Linux 默认 64 KiB）。
-    pub capacity: usize,
-}
-
-pub const PIPE_CAPACITY: usize = 64 * 1024;
-
+/// 管道端 fd（0.0.6 M1 T1.1：pipe2 下沉为宿主管道）。
+/// IO/close 全部经 HostFileOps（Windows = 真实阻塞管道 + 可继承句柄，
+/// 跨 fork 传递；测试宿主 = 内存管道）。端别仅在错误语义上区分：
+/// 读端不可写（EBADF）、写端不可读（EBADF）。
 #[derive(Debug)]
 pub enum GuestFd {
     Host(HostFile),
     /// 目录快照句柄（O_DIRECTORY 打开；getdents64 消费）。
     HostDir(HostDir),
-    /// 管道读端（clone 自共享 Pipe）。
-    PipeRead(std::rc::Rc<Pipe>),
+    /// 管道读端。
+    PipeRead(HostFile),
     /// 管道写端。
-    PipeWrite(std::rc::Rc<Pipe>),
+    PipeWrite(HostFile),
     Null,
     Zero,
     Reserved,
@@ -84,6 +75,11 @@ impl FdTable {
         self.table.get(&fd)
     }
 
+    /// 全表遍历（fork 快照序列化用）。
+    pub fn iter(&self) -> impl Iterator<Item = (i32, &GuestFd)> {
+        self.table.iter().map(|(k, v)| (*k, v))
+    }
+
     pub fn remove(&mut self, fd: i32) -> Option<GuestFd> {
         self.flags.remove(&fd);
         self.table.remove(&fd)
@@ -120,8 +116,9 @@ impl FdTable {
     }
 
     /// execve（PLAN-0.0.4 T3.1/T3.2）：关闭所有带 FD_CLOEXEC 的 fd，
-    /// 其余（管道等）跨重载保留。Host fd 调 host.close；管道端标记关闭，
-    /// 读端看到 EOF、写端看到 EPIPE。返回关闭数量。
+    /// 其余（管道等）跨重载保留。Host fd（含管道端）调 host.close——
+    /// 管道对象在全部端句柄关闭后由 OS 回收，EOF/EPIPE 语义由 OS 维持。
+    /// 返回关闭数量。
     pub fn close_cloexec(&mut self, host: &dyn Host) -> usize {
         let clo: Vec<i32> = self
             .flags
@@ -134,11 +131,9 @@ impl FdTable {
             if let Some(gf) = self.remove(fd) {
                 n += 1;
                 match gf {
-                    GuestFd::Host(h) => {
+                    GuestFd::Host(h) | GuestFd::PipeRead(h) | GuestFd::PipeWrite(h) => {
                         let _ = host.close(h);
                     }
-                    GuestFd::PipeRead(p) => p.read_open.set(false),
-                    GuestFd::PipeWrite(p) => p.write_open.set(false),
                     _ => {}
                 }
             }
@@ -151,6 +146,8 @@ impl FdTable {
 
 pub struct GuestProcess {
     pub pid: u32,
+    /// 父进程 pid（0.0.6 M1：fork 时由元数据传递；普通启动 = 宿主派生值）。
+    pub ppid: u32,
     pub uid: u32,
     pub gid: u32,
     pub fs_base: u64,
@@ -181,6 +178,7 @@ impl GuestProcess {
         }
         GuestProcess {
             pid,
+            ppid: 0,
             uid: 1000,
             gid: 1000,
             fs_base: 0,

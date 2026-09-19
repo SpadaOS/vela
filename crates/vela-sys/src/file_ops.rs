@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::{
     HostDir, HostDirEntry, HostError, HostFile, HostFileKind, HostOpen, HostPath, HostStat,
-    StdioHandles,
+    PipeEnd, PipeEndInner, StdioHandles,
 };
 
 pub(crate) fn io_err(e: &std::io::Error) -> HostError {
@@ -31,6 +31,8 @@ pub(crate) fn os_to_errno(code: i32) -> i32 {
         4 => 24,       // ERROR_TOO_MANY_OPEN_FILES → EMFILE
         32 | 33 => 11, // SHARING_VIOLATION / LOCK_VIOLATION → EAGAIN
         36 => 36,      // ERROR_FILENAME_EXCED_RANGE → ENAMETOOLONG
+        109 => 32,     // ERROR_BROKEN_PIPE（读端全关）→ EPIPE
+        232 => 32,     // ERROR_NO_DATA（同上，写管道变体）→ EPIPE
         112 => 28,     // ERROR_DISK_FULL → ENOSPC
         145 => 39,     // ERROR_DIR_NOT_EMPTY → ENOTEMPTY
         206 => 36,     // ERROR_META_EXPANSION_TOO_LONG → ENAMETOOLONG
@@ -128,6 +130,8 @@ pub(crate) fn dup_file(f: &HostFile) -> Result<HostFile, HostError> {
                 path: path.clone(),
             }))
         }
+        // 管道端：真实句柄必须 DuplicateHandle（裸 clone 会 double-close）
+        HostFileKind::Pipe(e) => Ok(HostFile(HostFileKind::Pipe(e.dup()?))),
         _ => Ok(HostFile(f.0.clone_kind())),
     }
 }
@@ -137,6 +141,7 @@ pub(crate) fn read(f: &HostFile, buf: &mut [u8]) -> Result<usize, HostError> {
     match &f.0 {
         HostFileKind::StdIn => std::io::stdin().read(buf).map_err(|e| io_err(&e)),
         HostFileKind::Disk { file, .. } => (&*file).read(buf).map_err(|e| io_err(&e)),
+        HostFileKind::Pipe(e) => e.read(buf),
         _ => Err(HostError::Access),
     }
 }
@@ -156,6 +161,7 @@ pub(crate) fn write(f: &HostFile, buf: &[u8]) -> Result<usize, HostError> {
             .write_all(buf)
             .map(|_| buf.len())
             .map_err(|e| io_err(&e)),
+        HostFileKind::Pipe(e) => e.write(buf),
         HostFileKind::StdIn => Err(HostError::Access),
     }
 }
@@ -185,10 +191,27 @@ pub(crate) fn stat_file(f: &HostFile) -> Result<HostStat, HostError> {
         HostFileKind::StdIn | HostFileKind::StdOut | HostFileKind::StdErr => {
             Ok(HostStat::char_device())
         }
+        HostFileKind::Pipe(_) => Ok(fifo_stat()),
         HostFileKind::Disk { file, path } => {
             let md = file.metadata().map_err(|e| io_err(&e))?;
             Ok(host_stat_from(&md, Some(path)))
         }
+    }
+}
+
+/// FIFO 元数据（pipe fd 的 fstat；S_IFIFO | 0600，Linux 管道默认权限）。
+pub fn fifo_stat() -> HostStat {
+    HostStat {
+        size: 0,
+        is_dir: false,
+        is_readonly: false,
+        mtime_ns: 0,
+        mode: 0o0010000 | 0o600, // S_IFIFO | 0600
+        nlink: 1,
+        ino: 1,
+        dev: 1,
+        atime_ns: 0,
+        ctime_ns: 0,
     }
 }
 
@@ -288,6 +311,8 @@ pub(crate) fn close(f: HostFile) -> Result<(), HostError> {
         // stdio 生命周期归宿主，不允许真正关闭
         HostFileKind::StdIn | HostFileKind::StdOut | HostFileKind::StdErr => Ok(()),
         HostFileKind::Disk { .. } => Ok(()), // Drop 关闭
+        // 管道端：真实句柄 CloseHandle；内存端标记半关（对端看到 EOF/EPIPE）
+        HostFileKind::Pipe(e) => e.close_half(),
     }
 }
 
@@ -308,4 +333,306 @@ pub(crate) fn realtime() -> (i64, u32) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     (d.as_secs() as i64, d.subsec_nanos())
+}
+
+// ---------------------------------------------------------------- 匿名管道
+
+/// pipe2 的宿主实现（0.0.6 M1 T1.1）。Windows：CreatePipe + 两端句柄
+/// inheritable（fork 的跨进程传递前提）；测试/逻辑宿主：内存管道。
+pub(crate) fn create_pipe() -> Result<(HostFile, HostFile), HostError> {
+    #[cfg(windows)]
+    {
+        let (r, w) = pipe_handles()?;
+        Ok((
+            HostFile(HostFileKind::Pipe(PipeEnd(PipeEndInner::Handle(r)))),
+            HostFile(HostFileKind::Pipe(PipeEnd(PipeEndInner::Handle(w)))),
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        let m = std::sync::Arc::new(crate::PipeMem::new());
+        Ok((
+            HostFile(HostFileKind::Pipe(PipeEnd(PipeEndInner::Mem(
+                m.clone(),
+                true,
+            )))),
+            HostFile(HostFileKind::Pipe(PipeEnd(PipeEndInner::Mem(m, false)))),
+        ))
+    }
+}
+
+impl PipeEnd {
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize, HostError> {
+        match &self.0 {
+            #[cfg(windows)]
+            PipeEndInner::Handle(h) => {
+                let mut got: u32 = 0;
+                // SAFETY: h 为 CreatePipe 返回的有效读句柄；buf/n 配对
+                let ok = unsafe {
+                    ReadFile(
+                        *h,
+                        buf.as_mut_ptr(),
+                        buf.len().min(u32::MAX as usize) as u32,
+                        &mut got,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 {
+                    let e = unsafe { GetLastError() };
+                    // ERROR_BROKEN_PIPE 表示写端已全关——对读端是 EOF 而非错误
+                    if e == 109 {
+                        return Ok(0);
+                    }
+                    return Err(HostError::Other(os_to_errno(e as i32)));
+                }
+                Ok(got as usize)
+            }
+            #[cfg(not(windows))]
+            PipeEndInner::Handle(_) => Err(HostError::Unimplemented),
+            PipeEndInner::Mem(m, _is_read) => {
+                let mut b = m.buf.lock().unwrap_or_else(|p| p.into_inner());
+                if b.is_empty() {
+                    // mock 语义：空且写端开 → EAGAIN（假非阻塞，供单测驱动）
+                    if m.write_open.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(HostError::Other(11)); // EAGAIN
+                    }
+                    return Ok(0); // 写端全关 → EOF
+                }
+                let n = buf.len().min(b.len());
+                buf[..n].copy_from_slice(&b[..n]);
+                b.drain(..n);
+                Ok(n)
+            }
+        }
+    }
+
+    pub fn write(&self, buf: &[u8]) -> Result<usize, HostError> {
+        match &self.0 {
+            #[cfg(windows)]
+            PipeEndInner::Handle(h) => {
+                let mut put: u32 = 0;
+                // SAFETY: h 为 CreatePipe 返回的有效写句柄；buf/n 配对
+                let ok = unsafe {
+                    WriteFile(
+                        *h,
+                        buf.as_ptr(),
+                        buf.len().min(u32::MAX as usize) as u32,
+                        &mut put,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 {
+                    let e = unsafe { GetLastError() };
+                    return Err(HostError::Other(os_to_errno(e as i32)));
+                }
+                Ok(put as usize)
+            }
+            #[cfg(not(windows))]
+            PipeEndInner::Handle(_) => Err(HostError::Unimplemented),
+            PipeEndInner::Mem(m, _is_read) => {
+                if !m.read_open.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(HostError::Other(32)); // EPIPE
+                }
+                m.buf
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+        }
+    }
+
+    /// 关闭本端（close 语义）。Handle → CloseHandle；Mem → 标记本端半关。
+    pub fn close_half(&self) -> Result<(), HostError> {
+        match &self.0 {
+            #[cfg(windows)]
+            PipeEndInner::Handle(h) => {
+                // SAFETY: h 为本端独占句柄，close 后不再使用
+                if unsafe { CloseHandle(*h) } == 0 {
+                    return Err(HostError::Other(os_to_errno(
+                        unsafe { GetLastError() } as i32
+                    )));
+                }
+                Ok(())
+            }
+            #[cfg(not(windows))]
+            PipeEndInner::Handle(_) => Err(HostError::Unimplemented),
+            PipeEndInner::Mem(m, is_read) => {
+                use std::sync::atomic::Ordering;
+                if *is_read {
+                    // 读端关闭 → 写端写时 EPIPE
+                    m.read_open.store(false, Ordering::SeqCst);
+                } else {
+                    // 写端关闭 → 读端读到 EOF
+                    m.write_open.store(false, Ordering::SeqCst);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// dup 语义：Windows DuplicateHandle（新句柄独立可关），内存端共享克隆。
+    pub fn dup(&self) -> Result<PipeEnd, HostError> {
+        match &self.0 {
+            #[cfg(windows)]
+            PipeEndInner::Handle(h) => {
+                const DUPLICATE_SAME_ACCESS: u32 = 2;
+                let mut nh: isize = 0;
+                // SAFETY: -1 = 伪当前进程句柄；h/nh 均为有效句柄位址
+                let ok = unsafe {
+                    DuplicateHandleI(
+                        -1,
+                        *h,
+                        -1,
+                        &mut nh,
+                        0,
+                        1, // inheritable —— fork 传递语义与原句柄一致
+                        DUPLICATE_SAME_ACCESS,
+                    )
+                };
+                if ok == 0 {
+                    return Err(HostError::Other(os_to_errno(
+                        unsafe { GetLastError() } as i32
+                    )));
+                }
+                Ok(PipeEnd(PipeEndInner::Handle(nh)))
+            }
+            #[cfg(not(windows))]
+            PipeEndInner::Handle(_) => Err(HostError::Unimplemented),
+            PipeEndInner::Mem(m, is_read) => Ok(PipeEnd(PipeEndInner::Mem(m.clone(), *is_read))),
+        }
+    }
+
+    /// 原始句柄（fork 元数据传递用；内存端返回 None）。
+    pub fn raw_handle(&self) -> Option<isize> {
+        match &self.0 {
+            #[cfg(windows)]
+            PipeEndInner::Handle(h) => Some(*h),
+            #[cfg(not(windows))]
+            PipeEndInner::Handle(_) => None,
+            PipeEndInner::Mem(..) => None,
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn pipe_handles() -> Result<(isize, isize), HostError> {
+    use std::mem::size_of;
+    #[repr(C)]
+    struct SecurityAttributes {
+        n_length: u32,
+        desc: *mut core::ffi::c_void,
+        inherit: i32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreatePipe(
+            read: *mut isize,
+            write: *mut isize,
+            attr: *const SecurityAttributes,
+            size: u32,
+        ) -> i32;
+        fn SetHandleInformation(h: isize, mask: u32, flags: u32) -> i32;
+    }
+    let mut r: isize = 0;
+    let mut w: isize = 0;
+    let sa = SecurityAttributes {
+        n_length: size_of::<SecurityAttributes>() as u32,
+        desc: std::ptr::null_mut(),
+        inherit: 1, // fork 的句柄继承前提
+    };
+    // SAFETY: 输出指针与 SA 均有效；64KiB 缓冲与 Linux 默认一致
+    if unsafe { CreatePipe(&mut r, &mut w, &sa, 64 * 1024) } == 0 {
+        return Err(HostError::Other(os_to_errno(
+            unsafe { GetLastError() } as i32
+        )));
+    }
+    const HANDLE_FLAG_INHERIT: u32 = 0x1;
+    // SAFETY: 两个句柄均为本函数刚创建的有效句柄
+    if unsafe { SetHandleInformation(r, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0
+        || unsafe { SetHandleInformation(w, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0
+    {
+        let e = unsafe { GetLastError() };
+        unsafe {
+            CloseHandle(r);
+            CloseHandle(w);
+        }
+        return Err(HostError::Other(os_to_errno(e as i32)));
+    }
+    Ok((r, w))
+}
+
+/// 原始管道句柄写（fork 元数据通道用）。Some(raw_err) = 失败。
+#[cfg(windows)]
+pub(crate) fn pipe_write_raw(h: isize, data: &[u8]) -> Option<u32> {
+    let mut off = 0;
+    while off < data.len() {
+        let mut put: u32 = 0;
+        // SAFETY: h 为有效写句柄；切片边界配对
+        let ok = unsafe {
+            WriteFile(
+                h,
+                data[off..].as_ptr(),
+                (data.len() - off).min(u32::MAX as usize) as u32,
+                &mut put,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Some(unsafe { GetLastError() });
+        }
+        off += put as usize;
+    }
+    None
+}
+
+/// 原始管道句柄读（fork 元数据通道用）。Some(raw_err) = 失败。
+#[cfg(windows)]
+pub(crate) fn pipe_read_raw(h: isize, buf: &mut [u8]) -> Result<usize, u32> {
+    let mut got: u32 = 0;
+    // SAFETY: h 为有效读句柄；切片边界配对
+    let ok = unsafe {
+        ReadFile(
+            h,
+            buf.as_mut_ptr(),
+            buf.len().min(u32::MAX as usize) as u32,
+            &mut got,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(unsafe { GetLastError() });
+    }
+    Ok(got as usize)
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn ReadFile(
+        h: isize,
+        buf: *mut u8,
+        n: u32,
+        read: *mut u32,
+        overlapped: *mut core::ffi::c_void,
+    ) -> i32;
+    fn WriteFile(
+        h: isize,
+        buf: *const u8,
+        n: u32,
+        written: *mut u32,
+        overlapped: *mut core::ffi::c_void,
+    ) -> i32;
+    fn CloseHandle(h: isize) -> i32;
+    fn GetLastError() -> u32;
+    #[link_name = "DuplicateHandle"]
+    fn DuplicateHandleI(
+        src_proc: isize,
+        src: isize,
+        dst_proc: isize,
+        dst: *mut isize,
+        access: u32,
+        inherit: i32,
+        options: u32,
+    ) -> i32;
 }

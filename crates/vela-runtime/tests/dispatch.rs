@@ -125,8 +125,18 @@ impl HostFileOps for MockHost {
             HostFileKind::StdIn => HostFile(HostFileKind::StdIn),
             HostFileKind::StdOut => HostFile(HostFileKind::StdOut),
             HostFileKind::StdErr => HostFile(HostFileKind::StdErr),
+            HostFileKind::Pipe(e) => HostFile(HostFileKind::Pipe(e.dup()?)),
             HostFileKind::Disk { .. } => return Err(HostError::Unimplemented),
         })
+    }
+    /// 内存管道（pipe2 的 mock 后端）：EOF/EPIPE 语义与宿主管道一致，
+    /// 空读且写端开为 EAGAIN（供单测驱动，真实宿主为阻塞）。
+    fn create_pipe(&self) -> Result<(HostFile, HostFile), HostError> {
+        let m = std::sync::Arc::new(vela_sys::PipeMem::new());
+        Ok((
+            HostFile(HostFileKind::Pipe(vela_sys::pipe_mem_end(m.clone(), true))),
+            HostFile(HostFileKind::Pipe(vela_sys::pipe_mem_end(m, false))),
+        ))
     }
     fn read(&self, f: &HostFile, buf: &mut [u8]) -> Result<usize, HostError> {
         match &f.0 {
@@ -137,6 +147,7 @@ impl HostFileOps for MockHost {
                     .read(buf)
                     .map_err(|e| HostError::Other(e.raw_os_error().unwrap_or(5)))
             }
+            HostFileKind::Pipe(e) => e.read(buf),
             _ => Err(HostError::Access),
         }
     }
@@ -146,6 +157,7 @@ impl HostFileOps for MockHost {
                 self.out.lock().unwrap().extend_from_slice(buf);
                 Ok(buf.len())
             }
+            HostFileKind::Pipe(e) => e.write(buf),
             _ => Err(HostError::Access),
         }
     }
@@ -194,8 +206,12 @@ impl HostFileOps for MockHost {
             ctime_ns: 1_700_000_000_000_000_000,
         })
     }
-    fn close(&self, _f: HostFile) -> Result<(), HostError> {
-        Ok(())
+    fn close(&self, f: HostFile) -> Result<(), HostError> {
+        match f.0 {
+            // 管道端：标记半关（对端看到 EOF/EPIPE）
+            HostFileKind::Pipe(ref e) => e.close_half(),
+            _ => Ok(()),
+        }
     }
     fn stdio(&self) -> StdioHandles {
         StdioHandles {

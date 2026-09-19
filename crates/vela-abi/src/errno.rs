@@ -19,6 +19,8 @@ pub const EPIPE: i32 = 32;
 pub const EAGAIN: i32 = 11;
 pub const ENOEXEC: i32 = 8;
 pub const ERANGE: i32 = 34;
+pub const EIO: i32 = 5;
+pub const ESRCH: i32 = 3;
 
 pub fn errno_result(e: i32) -> i64 {
     -(e as i64)
