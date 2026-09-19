@@ -49,8 +49,11 @@ jobs:
           cargo run -p vela-cli --bin vela -- run guest/bin/torture
           cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/hello-dyn
           cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/fs-exec
+          cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/fork-test
           cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/busybox echo hello
           cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/busybox nproc
           cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/busybox true
+          cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/busybox sh -c "echo hello | wc -c"
+          cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/busybox sh -c "seq 1 5 | xargs echo"
       - name: Doctor report (informational)
         run: cargo run -p vela-cli --bin vela -- doctor

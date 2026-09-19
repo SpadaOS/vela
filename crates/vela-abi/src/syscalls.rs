@@ -25,7 +25,6 @@ pub const SYS_GETPGID: u64 = 121;
 pub const SYS_GETPGRP: u64 = 111;
 pub const SYS_SETSID: u64 = 112;
 pub const SYS_GETSID: u64 = 124;
-pub const SYS_RSEQ: u64 = 334;
 pub const SYS_RT_SIGACTION: u64 = 13;
 pub const SYS_RT_SIGPROCMASK: u64 = 14;
 pub const SYS_IOCTL: u64 = 16;
@@ -85,6 +84,8 @@ pub const SYS_PRLIMIT64: u64 = 302;
 pub const SYS_CLOCK_GETTIME: u64 = 228;
 pub const SYS_GETRANDOM: u64 = 318;
 pub const SYS_STATX: u64 = 332;
+pub const SYS_UTIMENSAT: u64 = 280;
+pub const SYS_RSEQ: u64 = 334;
 
 /// syscall 号的可读名字，仅供日志使用。
 pub fn syscall_name(nr: u64) -> &'static str {
@@ -103,7 +104,17 @@ pub fn syscall_name(nr: u64) -> &'static str {
         SYS_MSYNC => "msync",
         SYS_EXECVE => "execve",
         SYS_WAIT4 => "wait4",
+        SYS_KILL => "kill",
+        SYS_CLONE => "clone",
+        SYS_FORK => "fork",
+        SYS_VFORK => "vfork",
         SYS_GETPPID => "getppid",
+        SYS_SETPGID => "setpgid",
+        SYS_GETPGID => "getpgid",
+        SYS_GETPGRP => "getpgrp",
+        SYS_SETSID => "setsid",
+        SYS_GETSID => "getsid",
+        SYS_UTIMENSAT => "utimensat",
         SYS_PIPE2 => "pipe2",
         SYS_BRK => "brk",
         SYS_IOCTL => "ioctl",

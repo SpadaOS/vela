@@ -30,7 +30,12 @@ pub fn dispatch(proc: &mut GuestProcess, host: &dyn Host, nr: u64, a: [u64; 6]) 
         abi::SYS_PIPE2 => sys_pipe2(proc, host, a[0], a[1]),
         abi::SYS_PIPE => sys_pipe2(proc, host, a[0], 0), // musl pipe() 降级
         abi::SYS_WAIT4 => sys_wait4(a[0], a[1], a[2]),
+        abi::SYS_KILL => -(abi::ENOSYS as i64), // CLI trap 层处理（SIGKILL/SIGTERM）
         abi::SYS_GETPPID => sys_getppid(proc),
+        // 进程组/会话（0.0.6 M5）：单进程无会话语义——pgid=sid=pid 的诚实近似
+        abi::SYS_GETPGRP | abi::SYS_GETPGID => proc.pid as i64,
+        abi::SYS_SETPGID | abi::SYS_SETSID | abi::SYS_GETSID => proc.pid as i64,
+        abi::SYS_UTIMENSAT => -(abi::ENOSYS as i64), // 无时间戳设置（v0）
         abi::SYS_SYSINFO => sys_sysinfo(proc, host, a[0]),
         abi::SYS_FCHMOD => sys_fchmod(proc, host, a[0], a[1]),
         abi::SYS_READLINK | abi::SYS_READLINKAT => sys_readlinkat(0, a[0], a[1], a[2]),

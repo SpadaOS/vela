@@ -26,9 +26,12 @@ if [ ! -d "$BB_SRC" ]; then
 fi
 cd "$BB_SRC"
 
-# 最小配置：allnoconfig（全部关闭）→ 白名单 applet + 静态
+# 最小配置：allnoconfig（全部关闭）→ 白名单 applet + 静态。
+# 0.0.6 M4 扩容：ash（job control/历史全关，MMU fork 路径）+ coreutils。
 make -s allnoconfig HOSTCC=gcc
-for f in ECHO LS CAT TRUE FALSE NPROC ENV PRINTF; do
+for f in ECHO LS CAT TRUE FALSE NPROC ENV PRINTF \
+         ASH CP MV RM MKDIR RMDIR LN HEAD TAIL WC GREP SLEEP SEQ \
+         XARGS TEST EXPR SORT UNIQ DATE DF DU BASENAME DIRNAME WHOAMI; do
   sed -i "s/^# CONFIG_${f} is not set/CONFIG_${f}=y/" .config
 done
 sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
