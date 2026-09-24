@@ -50,6 +50,19 @@ jobs:
       - name: Build busybox subset (musl cross toolchain)
         shell: msys2 {0}
         run: bash tools/build-busybox.sh
+      - name: ash diagnostics (PLAN-0.1.0 T3.1 — UD1 repro artifacts)
+        run: |
+          cargo run -p vela-cli --bin vela -- run --soft-tls -v guest/bin/busybox sh -c "echo hello | wc -c" 2> sh-trace.log || true
+          Get-Content sh-trace.log -Tail 3
+          cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/busybox echo applet-ok
+      - name: upload ash artifacts (busybox ELF + trace)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ash-ud1
+          path: |
+            guest/bin/busybox
+            sh-trace.log
+          if-no-files-found: warn
       - name: Guest acceptance (spec 9.4, freshly generated images)
         run: |
           cargo run -p vela-cli --bin vela -- run guest/bin/hello
