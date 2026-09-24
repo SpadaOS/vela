@@ -1379,7 +1379,7 @@ fn sys_utimensat(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 {
     let (now_s, now_n) = host.realtime();
     let now = (now_s, now_n as i64);
     let parse = |sec: i64, nsec: i64| -> Result<Option<(i64, i64)>, i32> {
-        if nsec < 0 || nsec >= 1_000_000_000 {
+        if !(0..1_000_000_000).contains(&nsec) {
             return Err(abi::EINVAL);
         }
         match sec {

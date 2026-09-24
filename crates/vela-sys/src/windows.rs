@@ -1335,9 +1335,9 @@ mod island {
     #[no_mangle]
     static mut VELA_VEH_RSP_SAVE: u64 = 0;
 
-    /// VEH 入口 wrapper：保非易失寄存器（内核 ABI）→ 切宿主栈 → Rust 处理体
-    /// → 换回。内核自身的异常帧仍落客户栈（架构固有，量级 ~0x100 字节，
-    /// 诚实记录于 HOST.md）。
+    // VEH 入口 wrapper：保非易失寄存器（内核 ABI）→ 切宿主栈 → Rust 处理体
+    // → 换回。内核自身的异常帧仍落客户栈（架构固有，量级 ~0x100 字节，
+    // 诚实记录于 HOST.md）。
     core::arch::global_asm!(
         ".globl vela_veh_entry",
         "vela_veh_entry:",
@@ -1428,6 +1428,7 @@ mod island {
     static ISLAND_SITES: AtomicUsize = AtomicUsize::new(0);
     static VEH_SITES: AtomicUsize = AtomicUsize::new(0);
     /// patch 点账本（T2.1）：诊断与 fork 子进程确认用（不在热路径）。
+    #[allow(dead_code)] // 字段留待 doctor/诊断消费
     struct PatchSite {
         site: u64,
         stub: u64,
@@ -1493,7 +1494,8 @@ mod island {
     fn gen_stub(site: u64, cell_bytes: &[u8], resume: u64, cell: u64) -> Vec<u8> {
         let save = std::ptr::addr_of_mut!(VELA_ISLAND_SAVE) as u64;
         let stack_top = std::ptr::addr_of_mut!(VELA_ISLAND_STACK) as u64 + 4 * 1024 * 1024;
-        let dispatch = vela_island_dispatch as usize as u64;
+        let dispatch =
+            vela_island_dispatch as unsafe extern "C" fn(*mut IslandSave) as usize as u64;
         let mut b: Vec<u8> = Vec::with_capacity(cell_bytes.len() + 5 + 0x88);
         // ---- cell：迁移指令副本 + jmp resume ----
         b.extend_from_slice(cell_bytes);
@@ -1629,20 +1631,9 @@ mod island {
             total += match op {
                 0x81 | 0x69 | 0xC7 => 4,
                 0x83 | 0x6B | 0xC0 | 0xC1 | 0xC6 => 1,
-                0xF6 => {
-                    if modrm & 0x38 <= 0x08 {
-                        1 // TEST r/m8, imm8（reg=0/1）
-                    } else {
-                        0
-                    }
-                }
-                0xF7 => {
-                    if modrm & 0x38 <= 0x08 {
-                        4 // TEST r/m32/64, imm32
-                    } else {
-                        0
-                    }
-                }
+                0xF6 if modrm & 0x38 <= 0x08 => 1,
+                0xF7 if modrm & 0x38 <= 0x08 => 4,
+                0xF6 | 0xF7 => 0,
                 _ => 0,
             };
         } else {
@@ -1706,19 +1697,8 @@ mod island {
                         // 形态（0F 10/11 SSE、0F 28/29 等）同样可能 RIP 相对
                         // 引用数据——一律收集（保守）
                         let op2 = buf[i + 1];
-                        if (0x80..=0x8F).contains(&op2) && i + 6 <= buf.len() {
-                            let rel = i32::from_le_bytes(buf[i + 2..i + 6].try_into().unwrap());
-                            t.push(
-                                start
-                                    .wrapping_add(i as u64)
-                                    .wrapping_add(6)
-                                    .wrapping_add(rel as i64 as u64),
-                            );
-                            i += 6;
-                        } else if i + 3 <= buf.len()
-                            && buf[i + 2] & 0xC7 == 0x05
-                            && i + 6 <= buf.len()
-                        {
+                        let riprel = i + 3 <= buf.len() && buf[i + 2] & 0xC7 == 0x05;
+                        if ((0x80..=0x8F).contains(&op2) || riprel) && i + 6 <= buf.len() {
                             let rel = i32::from_le_bytes(buf[i + 2..i + 6].try_into().unwrap());
                             t.push(
                                 start
