@@ -2,6 +2,18 @@
 
 本项目的所有显著变更记录于此（Keep a Changelog 格式）。
 
+## [0.1.0] - unreleased
+
+主题：Windows 一等运行时（计划见 docs/plans/PLAN-0.1.0.md）。
+
+- 岛页 syscall 热路径（VEH 降为后备）、陷阱走宿主栈、red zone 纪律
+- fork：映像只读段共享、快照体积/地址空间债可观测、mprotect 账本恢复
+- ash 最小 `sh -c` 闭环（或按决策点正式降级）
+- `utimensat`；SIGCHLD 记账（不投递）
+- Host 增 Trap/Proc 桩；Windows 为唯一实现；runtime 去 Windows API
+- dispatch 拆分、doctor 2.0、Ctrl+C 进程树
+- 唯一支持宿主：Windows。SpadaOS/macOS 仅预留
+
 ## [0.0.6] - 2026-09-19
 
 主题：多进程之门 —— 用户态 fork + wait 族真实化 + busybox shell 解锁
