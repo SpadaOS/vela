@@ -45,11 +45,21 @@ struct GuestState {
     /// SIGCHLD 记账（0.1.0 T3.6）：已回收子进程计数。不投递 handler
     /// （NONGOALS）；ash 以 job control off 运行不依赖投递。
     sigchld_reaped: std::cell::Cell<u64>,
+    /// 不可变区域 section 缓存（0.1.0 T4.1）：映像 X/R 段 + 岛页跨 fork
+    /// 共享，首次填充后零拷贝复用。键 = 区间集合；mprotect 授 W 或
+    /// execve 换图即失效。
+    imm_cache: RefCell<Option<fork::ImmCache>>,
+    /// 本次进程累计 fork 拷贝字节（copied_kib 观测，T4.6）。
+    copied_bytes: std::cell::Cell<u64>,
     /// 陷阱后端选择（0.1.0 T2.6；execve 重载沿用）。
     trap: TrapBackend,
 }
 
 static GUEST: AtomicPtr<GuestState> = AtomicPtr::new(std::ptr::null_mut());
+
+/// execve 地址空间债（T4.5）：Reserve 块解除登记但不释放的累计字节。
+/// 本进程内可观测（-v 日志）；进程退出由 OS 回收。
+static EXECVE_LEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn main() {
     logx::init();
@@ -401,7 +411,16 @@ fn do_execve(st: &mut GuestState, args: &[u64; 6]) -> Result<(u64, u64), i64> {
         // FileView 的 UnmapViewOfFile 是安全的，正常释放。
         if r.kind == vela_runtime::mem::MemKind::FileView {
             let _ = unsafe { st.host.unmap_view(r.start as usize) };
+        } else if r.kind != vela_runtime::mem::MemKind::Island {
+            // T4.5：地址空间债可见——Reserve 不释放的字节计数（岛页同理）
+            EXECVE_LEAK.fetch_add(r.len, Ordering::Relaxed);
         }
+    }
+    if logx::enabled() {
+        eprintln!(
+            "[vela] execve reserve debt: {} KiB (address space not freed until process exit)",
+            EXECVE_LEAK.load(Ordering::Relaxed) / 1024
+        );
     }
     st.proc.mem = vela_runtime::mem::MemRegistry::default();
     st.proc.heap = None;
@@ -740,6 +759,8 @@ fn run_elf(
             soft_tls: opts.soft_tls,
             children: std::cell::RefCell::new(BTreeMap::new()),
             sigchld_reaped: std::cell::Cell::new(0),
+            imm_cache: RefCell::new(None),
+            copied_bytes: std::cell::Cell::new(0),
             trap: opts.trap,
         });
         let ptr = Box::into_raw(state);

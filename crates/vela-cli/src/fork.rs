@@ -405,6 +405,75 @@ fn decode(b: &[u8]) -> Result<Meta, ()> {
 
 // ---------------------------------------------------------------- 父侧
 
+/// 不可变区域 section 缓存（T4.1）：键 = 区间集合；mprotect 授 W 或
+/// execve 换图即失效。区间在父进程受硬件 RX 保护，内容不会变化——
+/// 子进程直接映射同一 section，跨 fork 零拷贝。
+pub struct ImmCache {
+    pub entries: Vec<(isize, u64, u64)>, // (sec handle, start, len)
+    pub key: Vec<(u64, u64)>,
+}
+
+/// 不可变 VA 区间（T4.1）：主映像 X/R 段 + 解释器 exec_ranges + 岛页的
+/// 原始集合，合并重叠后取**完整 64K 块**——MapViewOfFileEx 基址必须
+/// 64K 对齐，且块内每一页都必须不可变（父进程 RX 硬件保护）。
+/// 不满块的零头留在可变拷贝路径。
+fn immutable_ranges(proc: &GuestProcess) -> Vec<(u64, u64)> {
+    const GRAN: u64 = 0x1_0000;
+    let mut raw: Vec<(u64, u64)> = proc
+        .load
+        .segments
+        .iter()
+        .filter(|s| s.prot & 2 == 0 && s.mem_size > 0)
+        .map(|s| (s.vaddr, s.vaddr + s.mem_size))
+        .collect();
+    if let Some(i) = &proc.load.interp {
+        raw.extend(i.exec_ranges.iter().copied());
+    }
+    for r in proc.mem.ranges.values() {
+        if r.kind == MemKind::Island {
+            raw.push((r.start, r.start + r.len));
+        }
+    }
+    raw.sort();
+    // 合并重叠/相邻区间
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (s, e) in raw {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    // 取完整 64K 块
+    merged
+        .into_iter()
+        .filter_map(|(s, e)| {
+            let bs = (s + GRAN - 1) & !(GRAN - 1);
+            let be = e & !(GRAN - 1);
+            (bs < be).then_some((bs, be))
+        })
+        .collect()
+}
+
+/// 区间集合 [lo,hi) 的补集（可写子区间）。
+fn complement(lo: u64, hi: u64, imm: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut cur = lo;
+    for (s, e) in imm {
+        let (s, e) = (*s.max(&lo), *e.min(&hi));
+        if s >= e {
+            continue;
+        }
+        if s > cur {
+            out.push((cur, s));
+        }
+        cur = cur.max(e);
+    }
+    if cur < hi {
+        out.push((cur, hi));
+    }
+    out
+}
+
 /// fd 表序列化（句柄值继承后不变，直接传递）。
 fn ser_fds(st: &GuestState) -> Result<Vec<FdEntrySer>, i64> {
     let eio = -(vela_abi::EIO as i64);
@@ -501,10 +570,77 @@ pub fn do_fork(st: &mut GuestState, args: &[u64; 6], frame: &mut TrapFrame) -> R
         }};
     }
 
-    // 1. 按登记区间创建 section 并拷贝客户内存（父此刻独占客户线程）
+    // 1. 快照分片（T4.1）：不可变区域（映像 X/R 段 + 岛页）走 section
+    //    缓存跨 fork 共享；可变区域（RW 段/堆/栈/mmap）按 fork 拷贝。
+    //    账本授 W 或区间集合变化 → 缓存失效重建。
     let mut range_sers: Vec<RangeSer> = Vec::new();
-    for r in st.proc.mem.ranges.values().copied().collect::<Vec<_>>() {
-        let sec = match st.host.shared_section(r.len) {
+    let mut copied: u64 = 0;
+    let imm = immutable_ranges(&st.proc);
+    let w_granted = st.proc.prot_ledger.iter().any(|p| {
+        p.prot & 2 != 0
+            && imm
+                .iter()
+                .any(|(s, e)| p.start < *e && p.start + p.len > *s)
+    });
+    {
+        let mut cache = st.imm_cache.borrow_mut();
+        if w_granted {
+            // 授 W 使不可变假设失效：丢弃缓存（句柄泄漏有界，诚实记录）
+            *cache = None;
+        }
+        let cache_ok = cache.as_ref().map(|c| c.key == imm).unwrap_or(false);
+        if !cache_ok && !imm.is_empty() {
+            // 重建缓存：每个不可变区间一个 section，内容本次拷贝
+            let mut entries = Vec::with_capacity(imm.len());
+            for (s, e) in &imm {
+                let len = e - s;
+                let sec = match st.host.shared_section(len) {
+                    Ok(s) => s,
+                    Err(e) => bail!("create_section(imm)", e),
+                };
+                if let Err(e) = st.host.set_inherit(sec) {
+                    bail!("inherit(section-imm)", e);
+                }
+                // SAFETY: view 为本进程刚映射的可写视图；客户区间已登记可读
+                let view = match unsafe { st.host.map_section_anywhere(sec) } {
+                    Ok(v) => v,
+                    Err(e) => bail!("map_section_anywhere(imm)", e),
+                };
+                // SAFETY: 同上
+                unsafe {
+                    std::ptr::copy_nonoverlapping(*s as *const u8, view as *mut u8, len as usize);
+                }
+                let _ = st.host.unmap_section_view(view);
+                entries.push((sec, *s, len));
+                copied += len;
+            }
+            *cache = Some(ImmCache {
+                entries,
+                key: imm.clone(),
+            });
+        }
+        // 缓存命中：不可变区间直接引用 section（零拷贝）
+        if let Some(c) = cache.as_ref() {
+            for (sec, start, len) in &c.entries {
+                range_sers.push(RangeSer {
+                    start: *start,
+                    len: *len,
+                    kind: 3, // 不可变共享（T4.1）
+                    sec: *sec,
+                });
+            }
+        }
+    }
+    // 可变区间：load.span 的补集 + 其余登记区间（栈/堆/mmap/FileView）
+    let load_span = st.proc.load.span;
+    let writable: Vec<(u64, u64)> = if imm.is_empty() {
+        vec![(load_span.start, load_span.start + load_span.len)]
+    } else {
+        complement(load_span.start, load_span.start + load_span.len, &imm)
+    };
+    for (s, e) in &writable {
+        let len = e - s;
+        let sec = match st.host.shared_section(len) {
             Ok(s) => s,
             Err(e) => bail!("create_section", e),
         };
@@ -518,19 +654,58 @@ pub fn do_fork(st: &mut GuestState, args: &[u64; 6], frame: &mut TrapFrame) -> R
         };
         // SAFETY: view 为本进程刚映射的可写视图；客户区间已登记可读
         unsafe {
+            std::ptr::copy_nonoverlapping(*s as *const u8, view as *mut u8, len as usize);
+        }
+        let _ = st.host.unmap_section_view(view);
+        copied += len;
+        range_sers.push(RangeSer {
+            start: *s,
+            len,
+            kind: 0,
+            sec,
+        });
+    }
+    for r in st.proc.mem.ranges.values() {
+        if r.start == load_span.start {
+            continue; // load.span 已拆分为不可变块 + 可变补集
+        }
+        let sec = match st.host.shared_section(r.len) {
+            Ok(s) => s,
+            Err(e) => bail!("create_section", e),
+        };
+        if let Err(e) = st.host.set_inherit(sec) {
+            bail!("inherit(section)", e);
+        }
+        // SAFETY: view 为本进程刚映射的可写视图；客户区间已登记可读
+        let view = match unsafe { st.host.map_section_anywhere(sec) } {
+            Ok(v) => v,
+            Err(e) => bail!("map_section_anywhere", e),
+        };
+        // SAFETY: 同上
+        unsafe {
             std::ptr::copy_nonoverlapping(r.start as *const u8, view as *mut u8, r.len as usize);
         }
         let _ = st.host.unmap_section_view(view);
+        copied += r.len;
         range_sers.push(RangeSer {
             start: r.start,
             len: r.len,
             kind: match r.kind {
                 MemKind::FileView => 1,
-                MemKind::Island => 2, // 岛页随快照原样传递（T2.7：子同 VA，E9 有效）
+                MemKind::Island => 2, // 岛页随快照原样传递（T2.7）
                 MemKind::Reserve => 0,
             },
             sec,
         });
+    }
+    st.copied_bytes.set(st.copied_bytes.get() + copied);
+    if crate::logx::enabled() {
+        eprintln!(
+            "[vela] fork snapshot: copied {} KiB (immutable shared: {} KiB, {} blocks)",
+            copied / 1024,
+            imm.iter().map(|(s, e)| e - s).sum::<u64>() / 1024,
+            imm.len()
+        );
     }
 
     // 2. 元数据：子 CONTEXT = 父快照（宿主完整上下文，含 XSAVE）改写为
@@ -643,7 +818,7 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
         for r in &meta.ranges {
             let kind = match r.kind {
                 1 => MemKind::FileView,
-                2 => MemKind::Island,
+                2 | 3 => MemKind::Island, // 岛页 / 不可变共享（T2.7/T4.1）
                 _ => MemKind::Reserve,
             };
             // SAFETY: base 在本进程为空闲地址；section 由父继承
@@ -804,6 +979,8 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
             soft_tls: meta.soft_tls,
             children: RefCell::new(BTreeMap::new()),
             sigchld_reaped: std::cell::Cell::new(0),
+            imm_cache: RefCell::new(None),
+            copied_bytes: std::cell::Cell::new(0),
             trap: crate::TrapBackend::Auto, // 父进程已建岛（快照含岛页），子进程沿用
         });
         let ptr = Box::into_raw(state);
