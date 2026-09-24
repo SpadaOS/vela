@@ -1,7 +1,7 @@
-# ash `sh -c` UD1 陷阱 — 证据与复现（PLAN-0.1.0 T0.3）
+# ash `sh -c` UD1 陷阱 — 已解决（PLAN-0.1.0 T3.1 收口）
 
-> 状态：0.0.6 顺延项的冻结证据。M3（T3.1）开工的门槛材料。
-> 结论未定：本文只固化「可复现的现象与数据」，定性见 PLAN-0.1.0 T3.1。
+> 状态：**已定性并修复**（0.1.0 M3）。0.0.6 顺延项收口。
+> 修复：tools/build-busybox.sh sed 注入 `jq != NULL` 守卫（e929af4）。
 
 ## 1. 现象
 
@@ -57,38 +57,28 @@ STATUS_ILLEGAL_INSTRUCTION)
 两条独立命令（带/不带 `-v`）均死在**同一固定地址** `0x400722cc`
 （PIE + no-ASLR-by-vela，客户映像地址确定 → 地址可比对）。
 
-## 5. 字节解读
+## 5. 字节解读（定性结论）
 
 ```
-67 0f b9 40 13   addr32 UD1 + ModRM(0x40, disp8=0x13)
-48 8b 45 d0      mov rax, [rbp-0x30]
-48 89 45 e0      mov [rbp-0x20], rax
-48 83 7d ...     cmp qword [rbp-0x??], imm8
+0000000000072220 <growjobtab>:        ← busybox ash job 表扩容
+   7222b: movl 0x34837(%rip),%eax    ← eax = njobs（首次 = 0）
+   72231: imulq $0x28,%rax           ← size = njobs * 40（= 0）
+   72253: callq xrealloc             ← ckrealloc(NULL, 160)
+   72264: subq %rcx,%rax             ← offset = jp - jq（jq==NULL，UB！）
+   72270: je → offset==0 跳过        ← 首次 offset≠0 → 进入 relocation
+   722a0: ud1l 0x13(%eax),%eax       ← 检查 (jq!=0)&&(jq+len!=0)&&(无溢出)
+                                      全部失败 → unreachable → ud1
 ```
 
-- `0f b9` = UD1（LLVM trap 常用 UD2；UD1+ModRM 形态罕见）
-- **后续字节是规整的 rbp 帧代码**——要么这是一个真实的编译器陷阱
-  指令（unreachable 分支），要么执行流**落进了一条指令的中间**
-  （rip 被计算跳转/返回地址带偏）。两种假设都指向「执行流跑偏或
-  编译器不可达分支」，不是 vela 主动注入的 UD2 patch 点
-  （VEH 已判明 NOT a patch point）。
-- 死亡点**在 fork 之前**：整条 trace 无 SYS_FORK/CLONE/sys_119。
-  → PLAN-0.0.6 时期「fork 恢复 prot」类假设与证据矛盾，
-    PLAN-0.1.0 T3.1 已降级为验证项。
+**根因（T3.1 定性）**：首次扩容时 `jobtab == NULL`，源码
+`offset = (char *)jp - (char *)jq` 非零进入 relocation 块，
+`(char *)jq + l` 为 **NULL 指针算术 = C UB**。zig cc/LLVM 利用 UB
+把该路径标记 unreachable 并发射 `ud1`；gcc 不利用此 UB，故 Linux
+构建从未触发。假设 3（fork prot）确认排除，假设 1 的机制成立但
+责任在 busybox 源码 UB × LLVM 的组合，非 vela 侧缺陷。
 
-## 6. M3 开工时的定性框架（T3.1，按证据重排）
+**修复**：`tools/build-busybox.sh` sed 注入 `if (offset && jq != NULL)`
+守卫——`jq == NULL` 时无指针可重定位，跳过 relocation 块（语义等价：
+njobs == 0 时循环体零次）。grep 断言补丁生效。
 
-假设排序（证据在手的优先验证）：
-
-1. **ash/musl 走进编译器 unreachable 分支**（UD1 形态吻合）——
-   触发条件可能是某个 stub syscall 返回值/寄存器约定被 ash 的
-   断言（musl 的 `a_crash()`/`__unreachable`）捕获。重点核对
-   rt_sigaction(0x11 SIGCHLD handler) 与 getppid 之后的执行路径。
-2. **执行流落进指令中间**（返回地址/跳转表被带偏）——用 debug_info
-   对 `0x400722cc` 反解所属函数即可一锤定音（需 CI 产物或本地
-   重建 objdump；`not stripped, with debug_info` 是为此保的）。
-3. ~~fork 恢复 prot 错~~ —— 与「死在 fork 前」矛盾，降级为验证项。
-
-工具门槛：本地无法构建该 busybox（无 msys2 + zig musl 目标）；
-定性工作需 (a) 在 CI 加产物上传（busybox ELF + sh-trace.log 全量），
-或 (b) 本机补 msys2 环境。M3 T3.1 首个动作是前者。
+## 6. 定性框架的验证记录
