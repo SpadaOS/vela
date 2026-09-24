@@ -229,7 +229,10 @@ pub(crate) fn set_times(
     }
     let ts = |t: Option<(i64, i64)>| -> Option<std::time::SystemTime> {
         t.map(|(sec, nsec)| {
-            let dur = std::time::Duration::new(sec.unsigned_abs(), nsec.unsigned_abs().min(999_999_999) as u32);
+            let dur = std::time::Duration::new(
+                sec.unsigned_abs(),
+                nsec.unsigned_abs().min(999_999_999) as u32,
+            );
             if sec >= 0 {
                 std::time::UNIX_EPOCH + dur
             } else {
