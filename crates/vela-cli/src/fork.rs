@@ -508,7 +508,11 @@ pub fn do_fork(st: &mut GuestState, args: &[u64; 6], frame: &mut TrapFrame) -> R
         range_sers.push(RangeSer {
             start: r.start,
             len: r.len,
-            kind: if r.kind == MemKind::FileView { 1 } else { 0 },
+            kind: match r.kind {
+                MemKind::FileView => 1,
+                MemKind::Island => 2, // 岛页随快照原样传递（T2.7：子同 VA，E9 有效）
+                MemKind::Reserve => 0,
+            },
             sec,
         });
     }
@@ -615,24 +619,25 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
         // 2. 区间恢复：MapViewOfFileEx 回客户原地址（指针一致性前提）
         let mut mem = vela_runtime::mem::MemRegistry::default();
         for r in &meta.ranges {
-            let kind = if r.kind == 1 {
-                MemKind::FileView
-            } else {
-                MemKind::Reserve
+            let kind = match r.kind {
+                1 => MemKind::FileView,
+                2 => MemKind::Island,
+                _ => MemKind::Reserve,
             };
             // SAFETY: base 在本进程为空闲地址；section 由父继承
             if unsafe { host.map_section_at(r.sec, r.start) }.is_err() {
                 return 1;
             }
-            let range = if kind == MemKind::FileView {
-                MemRange::view(r.start, r.len)
-            } else {
-                MemRange::reserve(r.start, r.len)
+            let range = match kind {
+                MemKind::FileView => MemRange::view(r.start, r.len),
+                MemKind::Island => MemRange::island(r.start, r.len),
+                MemKind::Reserve => MemRange::reserve(r.start, r.len),
             };
             mem.add(range);
         }
 
         // 3. 重建 LoadedImage（host_addr == vaddr，同进程映射约定）
+        // syscall_sites 置空：子进程不重建岛（快照已含岛页，E9 保持有效）
         let rebuild = |l: &LoadSer| -> LoadedImage {
             LoadedImage {
                 bias: l.bias,
@@ -652,6 +657,7 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
                     })
                     .collect(),
                 exec_ranges: l.exec_ranges.clone(),
+                syscall_sites: Vec::new(),
                 span: MemRange::reserve(l.span_start, l.span_len),
                 interp: None,
             }
@@ -664,6 +670,7 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
                 entry: irebuild.entry,
                 span: irebuild.span,
                 exec_ranges: irebuild.exec_ranges,
+                syscall_sites: Vec::new(),
             });
         }
 
@@ -762,6 +769,7 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
             heap_mb: meta.heap_mb,
             soft_tls: meta.soft_tls,
             children: RefCell::new(BTreeMap::new()),
+            trap: crate::TrapBackend::Auto, // 父进程已建岛（快照含岛页），子进程沿用
         });
         let ptr = Box::into_raw(state);
         crate::GUEST.store(ptr, std::sync::atomic::Ordering::Relaxed);

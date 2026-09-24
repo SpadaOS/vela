@@ -85,6 +85,12 @@ extern "system" {
     fn GetLastError() -> u32;
 }
 
+extern "system" {
+    /// VEH 入口 wrapper（island 模块 global_asm 定义）：切宿主栈后进
+    /// veh_handler（T2.4）。
+    fn vela_veh_entry(ep: *mut ExceptionPointers) -> i32;
+}
+
 #[link(name = "advapi32")]
 extern "system" {
     /// RtlGenRandom 的旧导出名；返回 0 表示失败。
@@ -198,8 +204,10 @@ fn install_trap_impl(f: TrapFn) -> Result<(), HostError> {
     if INSTALLED.swap(1, Ordering::SeqCst) == 1 {
         return Ok(());
     }
-    // SAFETY: veh_handler 是有效的 extern "system" 回调
-    let h = unsafe { AddVectoredExceptionHandler(1, Some(veh_handler)) };
+    // SAFETY: vela_veh_entry 是有效的 extern "system" 回调（先切宿主栈再进
+    // Rust 处理体——T2.4：dispatch/fork 等重活不落客户栈）
+    // 【A/B 实验】wrapper 注册（诊断标记版）
+    let h = unsafe { AddVectoredExceptionHandler(1, Some(vela_veh_entry)) };
     if h.is_null() {
         let e = file_ops::os_to_errno(unsafe { GetLastError() } as i32);
         Err(HostError::Other(e))
@@ -225,6 +233,7 @@ fn guest_range_containing(rip: usize) -> Option<(usize, usize)> {
 }
 
 /// 方法 C（规格 5.3 已拍板）：UD2 (#UD) → VEH → dispatch → 改写上下文续跑。
+/// （VEH 回调经 vela_veh_entry 先切宿主栈，见 T2.4。）
 unsafe extern "system" fn veh_handler(ep: *mut ExceptionPointers) -> i32 {
     // SAFETY: Windows 保证异常回调参数在回调期间有效
     let ep = unsafe { &*ep };
@@ -1125,6 +1134,20 @@ impl HostTrap for WindowsHost {
     fn soft_tls_stub_hit(&self) -> bool {
         stub_hit()
     }
+
+    fn build_islands(
+        &self,
+        sites: &[u64],
+        exec_segs: &[(u64, u64)],
+    ) -> Result<crate::IslandPlan, HostError> {
+        island::build_islands(sites, exec_segs)
+    }
+    fn trap_backend_name(&self) -> &'static str {
+        island::backend_name()
+    }
+    fn island_veh_counts(&self) -> (usize, usize) {
+        island::counts()
+    }
 }
 
 impl HostProc for WindowsHost {
@@ -1174,7 +1197,10 @@ impl HostProc for WindowsHost {
         pipe_from_raw_handle(h, is_read)
     }
     fn fork_child_context(&self, frame: &TrapFrame) -> Vec<u8> {
-        // 父 CONTEXT 全量快照（含 XSAVE：子进程必须继承浮点/向量现场）
+        if island::is_island_mode() {
+            return island::fork_child_context(frame);
+        }
+        // VEH 路径：父 CONTEXT 全量快照（含 XSAVE：子进程必须继承浮点/向量现场）
         let mut b = frame.opaque_bytes().to_vec();
         assert_eq!(b.len(), 0x4D0, "CONTEXT snapshot size");
         // 模拟 syscall 副作用：Rax=0（子返回值）、Rip/Rcx=返回地址、R11=RFLAGS
@@ -1236,7 +1262,844 @@ extern "C" {
     fn vela_enter_guest(entry: u64, rsp: u64) -> !;
 }
 
-// ---------------------------------------------------------------- 进程与跨进程内存（0.0.6 M1：用户态 fork）
+// ---------------------------------------------------------------- 岛页跳板（0.1.0 T2.1/T2.2）
+//
+// 热路径机制：patch 点 2 字节 UD2 → 5 字节 `jmp rel32` 进映像 ±2GB 内的
+// RX 岛页；岛内保存活寄存器（rcx/r11 按 syscall 契约即死值）→ 切**宿主栈**
+// → call dispatch → 写回结果 → 恢复 → 经迁移指令副本回到 site+2。
+// 校验不过的点留 UD2+VEH（混合模式，T2.6）。VEH 仍是后备路径与故障处理者。
+
+mod island {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// 每线程保存区（v0 单客户线程契约）。布局前 0x88 字节 = GuestRegs
+    /// （零拷贝视图前提），之后为 ret/cell 地址与 cs/ss。
+    #[repr(C, align(16))]
+    pub struct IslandSave {
+        pub guest: GuestRegs, // 0x00..0x88
+        pub ret: u64,         // 0x88 = site+2
+        pub cell: u64,        // 0x90 = 迁移指令副本地址
+        pub segs: [u16; 2],   // 0x98 = cs, ss（fork 子 CONTEXT_CONTROL 所需）
+    }
+    const OFF_RET: usize = 0x88;
+    const OFF_CELL: usize = 0x90;
+    const OFF_SEGS: usize = 0x98;
+    pub const SAVE_SIZE: usize = std::mem::size_of::<IslandSave>(); // 0xA0
+
+    // static mut：岛内桩经保存区写入/读回寄存器（地址在生成期嵌入 imm64）
+    static mut VELA_ISLAND_SAVE: IslandSave = IslandSave {
+        guest: GuestRegs {
+            rax: 0,
+            rcx: 0,
+            rdx: 0,
+            rbx: 0,
+            rsp: 0,
+            rbp: 0,
+            rsi: 0,
+            rdi: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rip: 0,
+        },
+        ret: 0,
+        cell: 0,
+        segs: [0; 2],
+    };
+
+    /// 岛页 dispatch 的宿主栈（4 MiB；dispatch/fork/日志全在宿主栈上执行，
+    /// 客户栈零写入）。static mut 确保落 .bss（可写）而非常量节；
+    /// no_mangle 供 global_asm/桩机器码 RIP 相对取址。
+    #[repr(C, align(16))]
+    struct AlignedStack([u8; 4 * 1024 * 1024]);
+    #[no_mangle]
+    static mut VELA_ISLAND_STACK: AlignedStack = AlignedStack([0; 4 * 1024 * 1024]);
+
+    /// VEH 处理体宿主栈（T2.4）：Rust 处理（dispatch/fork/日志）不再压客户栈。
+    #[no_mangle]
+    static mut VELA_VEH_STACK: AlignedStack = AlignedStack([0; 4 * 1024 * 1024]);
+    #[no_mangle]
+    static mut VELA_VEH_RSP_SAVE: u64 = 0;
+
+    /// VEH 入口 wrapper：保非易失寄存器（内核 ABI）→ 切宿主栈 → Rust 处理体
+    /// → 换回。内核自身的异常帧仍落客户栈（架构固有，量级 ~0x100 字节，
+    /// 诚实记录于 HOST.md）。
+    core::arch::global_asm!(
+        ".globl vela_veh_entry",
+        "vela_veh_entry:",
+        "    push rbx",
+        "    push rbp",
+        "    push rdi",
+        "    push rsi",
+        "    push r12",
+        "    push r13",
+        "    push r14",
+        "    push r15",
+        // RIP 相对取址（x64 无 32 位绝对重定位）
+        "    lea r10, [rip + VELA_VEH_RSP_SAVE]",
+        "    mov [r10], rsp",
+        "    lea rsp, [rip + VELA_VEH_STACK]",
+        "    add rsp, 4194304",
+        "    sub rsp, 0x30",
+        "    call {inner}",
+        "    lea r10, [rip + VELA_VEH_RSP_SAVE]",
+        "    mov rsp, [r10]",
+        "    pop r15",
+        "    pop r14",
+        "    pop r13",
+        "    pop r12",
+        "    pop rsi",
+        "    pop rdi",
+        "    pop rbp",
+        "    pop rbx",
+        "    ret",
+        inner = sym super::veh_handler,
+    );
+
+    /// 岛页 dispatch（岛内桩 call 进来；宿主栈上执行）。
+    /// 约定：regs.rip 已 = site（TrapFn 契约与 VEH 路径一致）；返回后
+    /// regs.rip/regs.rcx 若仍为 site+2 则改指迁移指令副本（cell）。
+    #[no_mangle]
+    unsafe extern "C" fn vela_island_dispatch(sa: *mut IslandSave) {
+        // SAFETY: 岛内桩以固定静态区指针调用；单客户线程
+        let sa = unsafe { &mut *sa };
+        let site = sa.ret.wrapping_sub(2);
+        sa.guest.rip = site;
+        let raw = TRAP_FN.load(Ordering::Relaxed);
+        if raw == 0 {
+            sa.guest.rax = (-(vela_abi_enosys())) as u64;
+            sa.guest.rip = sa.ret;
+            return;
+        }
+        // SAFETY: 由 CLI 在进入客户前注册的有效函数指针
+        let tf: TrapFn = unsafe { std::mem::transmute(raw) };
+        let nr = sa.guest.rax;
+        let args = [
+            sa.guest.rdi,
+            sa.guest.rsi,
+            sa.guest.rdx,
+            sa.guest.r10,
+            sa.guest.r8,
+            sa.guest.r9,
+        ];
+        // regs 零拷贝视图 = 保存区本身；opaque = 保存区全量（fork 子上下文用）
+        let sa_ptr = sa as *const IslandSave as *const u8;
+        let mut frame = TrapFrame::new(
+            &mut sa.guest,
+            0x202, // IF|保留位：岛路径无法捕获真实 RFLAGS（pushfq 会写客户栈）；
+            // syscall 契约下客户不得依赖 R11=RFLAGS，见 SYSCALLS 诚实边界
+            sa_ptr,
+            SAVE_SIZE,
+        );
+        // SAFETY: 回调由 CLI 注册，仅操作客户状态
+        unsafe { tf(nr, &args, &mut frame) };
+        // 返回地址改指迁移指令副本（cell 地址由桩在保存期写入）
+        let ret = sa.ret;
+        let cell = sa.cell;
+        if frame.regs.rip == ret {
+            frame.regs.rip = cell;
+        }
+        if frame.regs.rcx == ret {
+            frame.regs.rcx = cell;
+        }
+    }
+
+    fn vela_abi_enosys() -> i32 {
+        38 // ENOSYS（vela_abi 值；避免 vela-sys 反向依赖 abi crate）
+    }
+
+    // ---- 后端状态与账本 ----
+    /// 0 = veh-only 1 = island（含混合）
+    static TRAP_MODE: AtomicU32 = AtomicU32::new(0);
+    static ISLAND_SITES: AtomicUsize = AtomicUsize::new(0);
+    static VEH_SITES: AtomicUsize = AtomicUsize::new(0);
+    /// patch 点账本（T2.1）：诊断与 fork 子进程确认用（不在热路径）。
+    struct PatchSite {
+        site: u64,
+        stub: u64,
+    }
+    static LEDGER: Mutex<Vec<PatchSite>> = Mutex::new(Vec::new());
+
+    pub fn is_island_mode() -> bool {
+        TRAP_MODE.load(Ordering::Relaxed) == 1
+    }
+    pub fn backend_name() -> &'static str {
+        if is_island_mode() {
+            "island"
+        } else {
+            "veh"
+        }
+    }
+    pub fn counts() -> (usize, usize) {
+        (
+            ISLAND_SITES.load(Ordering::Relaxed),
+            VEH_SITES.load(Ordering::Relaxed),
+        )
+    }
+
+    // ---- stub 机器码生成 ----
+
+    fn movabs_rcx_imm64(out: &mut Vec<u8>, imm: u64) {
+        out.extend_from_slice(&[0x48, 0xB9]);
+        out.extend_from_slice(&imm.to_le_bytes());
+    }
+    fn movabs_r11_imm64(out: &mut Vec<u8>, imm: u64) {
+        out.extend_from_slice(&[0x49, 0xBC]);
+        out.extend_from_slice(&imm.to_le_bytes());
+    }
+    fn movabs_rax_imm64(out: &mut Vec<u8>, imm: u64) {
+        out.extend_from_slice(&[0x48, 0xB8]);
+        out.extend_from_slice(&imm.to_le_bytes());
+    }
+    fn movabs_rsp_imm64(out: &mut Vec<u8>, imm: u64) {
+        out.extend_from_slice(&[0x48, 0xBC]);
+        out.extend_from_slice(&imm.to_le_bytes());
+    }
+    /// mov [rcx+disp32], r64（reg: 0..15）
+    fn store_rcx_disp32(out: &mut Vec<u8>, reg: usize, disp: usize) {
+        let rex = 0x48 | if reg >= 8 { 0x4 } else { 0 };
+        out.extend_from_slice(&[rex, 0x89, 0x81 | ((reg as u8 & 7) << 3)]);
+        out.extend_from_slice(&(disp as u32).to_le_bytes());
+    }
+    /// mov r64, [rcx+disp32]
+    fn load_rcx_disp32(out: &mut Vec<u8>, reg: usize, disp: usize) {
+        let rex = 0x48 | if reg >= 8 { 0x4 } else { 0 };
+        out.extend_from_slice(&[rex, 0x8B, 0x81 | ((reg as u8 & 7) << 3)]);
+        out.extend_from_slice(&(disp as u32).to_le_bytes());
+    }
+    /// mov [rcx+disp32], ax（16 位段寄存器存储）
+    fn store_rcx_disp32_ax(out: &mut Vec<u8>, disp: usize) {
+        out.extend_from_slice(&[0x66, 0x89, 0x81]);
+        out.extend_from_slice(&(disp as u32).to_le_bytes());
+    }
+
+    /// 生成单 site 的 cell（迁移指令副本 + jmp 续接）与桩。布局：
+    /// [cell: disp(L) + E9 rel32 → site+2+L][stub ~120 字节]。
+    /// E9 patch 目标 = 桩首；cell 绝对地址由参数传入（分配后已知）。
+    fn gen_stub(site: u64, cell_bytes: &[u8], resume: u64, cell: u64) -> Vec<u8> {
+        let save = std::ptr::addr_of_mut!(VELA_ISLAND_SAVE) as u64;
+        let stack_top = std::ptr::addr_of_mut!(VELA_ISLAND_STACK) as u64 + 4 * 1024 * 1024;
+        let dispatch = vela_island_dispatch as usize as u64;
+        let mut b: Vec<u8> = Vec::with_capacity(cell_bytes.len() + 5 + 0x88);
+        // ---- cell：迁移指令副本 + jmp resume ----
+        b.extend_from_slice(cell_bytes);
+        b.push(0xE9);
+        let rel = resume as i64 - (cell as i64 + cell_bytes.len() as i64 + 5);
+        b.extend_from_slice(&(rel as i32).to_le_bytes());
+        // ---- stub ----
+        movabs_rcx_imm64(&mut b, save); // rcx = 保存区
+        movabs_r11_imm64(&mut b, site + 2); // r11 = 返回地址（syscall 契约下即死值）
+        store_rcx_disp32(&mut b, 11, OFF_RET);
+        // 保存全部活寄存器（rcx/r11 之外；rsp 必须保存以便恢复）
+        for (reg, off) in [
+            (0usize, 0x00usize), // rax
+            (2, 0x10),           // rdx
+            (3, 0x18),           // rbx
+            (4, 0x20),           // rsp（客户栈指针）
+            (5, 0x28),           // rbp
+            (6, 0x30),           // rsi
+            (7, 0x38),           // rdi
+            (8, 0x40),
+            (9, 0x48),
+            (10, 0x50),
+            (12, 0x60),
+            (13, 0x68),
+            (14, 0x70),
+            (15, 0x78),
+        ] {
+            store_rcx_disp32(&mut b, reg, off);
+        }
+        // cell 地址写入保存区（rax 此刻已是保存后的死值，恢复时从内存重载）
+        movabs_rax_imm64(&mut b, cell);
+        store_rcx_disp32(&mut b, 0, OFF_CELL);
+        // cs/ss（fork 子 CONTEXT_CONTROL 所需；mov ax, sreg = 8C /r）
+        b.extend_from_slice(&[0x8C, 0xC8]); // mov ax, cs
+        store_rcx_disp32_ax(&mut b, OFF_SEGS);
+        b.extend_from_slice(&[0x8C, 0xD0]); // mov ax, ss
+        store_rcx_disp32_ax(&mut b, OFF_SEGS + 2);
+        // 切宿主栈 → call dispatch（写回结果/返回地址由 dispatch 完成）
+        movabs_rsp_imm64(&mut b, stack_top);
+        b.extend_from_slice(&[0x48, 0x83, 0xEC, 0x30]); // sub rsp, 0x30
+        movabs_rax_imm64(&mut b, dispatch);
+        b.extend_from_slice(&[0xFF, 0xD0]); // call rax
+        movabs_rcx_imm64(&mut b, save); // rcx 被 call 破坏（Win64 易失）
+                                        // 恢复（rip 最后跳；rcx 次之；r11 = 跳转目标）
+        for (reg, off) in [
+            (2usize, 0x10),
+            (3, 0x18),
+            (5, 0x28),
+            (6, 0x30),
+            (7, 0x38),
+            (8, 0x40),
+            (9, 0x48),
+            (10, 0x50),
+            (12, 0x60),
+            (13, 0x68),
+            (14, 0x70),
+            (15, 0x78),
+        ] {
+            load_rcx_disp32(&mut b, reg, off);
+        }
+        load_rcx_disp32(&mut b, 4, 0x20); // rsp = 客户栈
+        load_rcx_disp32(&mut b, 11, 0x80); // r11 = regs.rip（cell 或 fs trampoline）
+        load_rcx_disp32(&mut b, 0, 0x00); // rax = 返回值
+        load_rcx_disp32(&mut b, 1, 0x08); // rcx = regs.rcx（syscall 语义）
+        b.extend_from_slice(&[0x41, 0xFF, 0xE3]); // jmp r11
+        b
+    }
+
+    // ---- 校验（T2.1：迁移指令 ≤3 字节 + 非跳转目标）----
+
+    /// site+2 处指令长度；>3 / 不可解码 / 越读窗 → None（该点留 VEH）。
+    /// 最小长度解码器：只求「长度正确或放弃」，不确定即 None（安全方向）。
+    fn displaced_len(b: &[u8]) -> Option<usize> {
+        let mut i = 0;
+        // 前缀：legacy（段/操作数/地址/rep/lock）+ REX
+        while let Some(&p) = b.get(i) {
+            if matches!(
+                p,
+                0x66 | 0x67 | 0xF2 | 0xF3 | 0xF0 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65
+            ) || p & 0xF0 == 0x40
+            {
+                i += 1;
+                if i > 4 {
+                    return None;
+                }
+            } else {
+                break;
+            }
+        }
+        let op = *b.get(i)?;
+        i += 1;
+        if op == 0x0F {
+            return None; // 两字节族保守放弃
+        }
+        let has_modrm = matches!(
+            op,
+            0x00..=0x3B
+                | 0x63
+                | 0x69
+                | 0x6B
+                | 0x80..=0x8F
+                | 0xC0
+                | 0xC1
+                | 0xC4
+                | 0xC5
+                | 0xC6
+                | 0xC7
+                | 0xD0..=0xD3
+                | 0xF6
+                | 0xF7
+                | 0xFE
+                | 0xFF
+        );
+        let mut total = i;
+        if has_modrm {
+            let modrm = *b.get(total)?;
+            total += 1;
+            if matches!(op, 0xC4 | 0xC5) {
+                return None; // les/lds x64 无效
+            }
+            if modrm >> 6 != 3 {
+                if modrm & 7 == 4 {
+                    total += 1; // SIB
+                }
+                match modrm >> 6 {
+                    0 if modrm & 7 == 5 => total += 4, // disp32
+                    1 => total += 1,
+                    2 => total += 4,
+                    _ => {}
+                }
+            }
+            // ModRM 后随立即数
+            total += match op {
+                0x81 | 0x69 | 0xC7 => 4,
+                0x83 | 0x6B | 0xC0 | 0xC1 | 0xC6 => 1,
+                0xF6 => {
+                    if modrm & 0x38 <= 0x08 {
+                        1 // TEST r/m8, imm8（reg=0/1）
+                    } else {
+                        0
+                    }
+                }
+                0xF7 => {
+                    if modrm & 0x38 <= 0x08 {
+                        4 // TEST r/m32/64, imm32
+                    } else {
+                        0
+                    }
+                }
+                _ => 0,
+            };
+        } else {
+            // 无 ModRM 的立即数族
+            total += match op {
+                0x04
+                | 0x0C
+                | 0x14
+                | 0x1C
+                | 0x24
+                | 0x2C
+                | 0x34
+                | 0x3C
+                | 0xA8
+                | 0xB0..=0xB7
+                | 0x70..=0x7F
+                | 0xEB
+                | 0xCD
+                | 0xD4
+                | 0xD5 => 1,
+                0x05 | 0x0D | 0x15 | 0x1D | 0x25 | 0x2D | 0x35 | 0x3D | 0xA9 => 4,
+                0xE8 | 0xE9 => 4, // 直接分支（syscall 后接分支极少见；长度已知）
+                _ => 0,
+            };
+        }
+        if (1..=3).contains(&total) && total <= b.len() {
+            Some(total)
+        } else {
+            None
+        }
+    }
+
+    /// 收集直接分支目标（E8/E9 rel32、0F 8x rel32、EB/7x rel8）与
+    /// RIP 相对目标（lea/mov 等的 [rip+disp32] 数据/代码引用——mkhello 的
+    /// `lea rsi, [rip+msg]` 实测：数据引用落在 patch 窗口即客户数据损坏）。
+    fn collect_branch_targets(exec_segs: &[(u64, u64)]) -> Vec<u64> {
+        let mut t = Vec::new();
+        for (start, end) in exec_segs {
+            // SAFETY: 段来自已映射登记的客户映像，构建期可读
+            let buf = unsafe {
+                std::slice::from_raw_parts(*start as *const u8, (*end - *start) as usize)
+            };
+            let mut i = 0;
+            while i + 1 < buf.len() {
+                match buf[i] {
+                    0xE8 | 0xE9 => {
+                        if i + 5 <= buf.len() {
+                            let rel = i32::from_le_bytes(buf[i + 1..i + 5].try_into().unwrap());
+                            // 负 rel（回跳）按模运算加——目标可能落在段前
+                            t.push(
+                                start
+                                    .wrapping_add(i as u64)
+                                    .wrapping_add(5)
+                                    .wrapping_add(rel as i64 as u64),
+                            );
+                        }
+                        i += 5;
+                    }
+                    0x0F if i + 2 < buf.len() => {
+                        // 两字节族：0F 8x = jcc rel32（分支）；其余带 modrm 的
+                        // 形态（0F 10/11 SSE、0F 28/29 等）同样可能 RIP 相对
+                        // 引用数据——一律收集（保守）
+                        let op2 = buf[i + 1];
+                        if (0x80..=0x8F).contains(&op2) && i + 6 <= buf.len() {
+                            let rel = i32::from_le_bytes(buf[i + 2..i + 6].try_into().unwrap());
+                            t.push(
+                                start
+                                    .wrapping_add(i as u64)
+                                    .wrapping_add(6)
+                                    .wrapping_add(rel as i64 as u64),
+                            );
+                            i += 6;
+                        } else if i + 3 <= buf.len()
+                            && buf[i + 2] & 0xC7 == 0x05
+                            && i + 6 <= buf.len()
+                        {
+                            let rel = i32::from_le_bytes(buf[i + 2..i + 6].try_into().unwrap());
+                            t.push(
+                                start
+                                    .wrapping_add(i as u64)
+                                    .wrapping_add(6)
+                                    .wrapping_add(rel as i64 as u64),
+                            );
+                            i += 6;
+                        } else {
+                            i += 2;
+                        }
+                    }
+                    0xEB => {
+                        let rel = buf[i + 1] as i8;
+                        t.push(
+                            start
+                                .wrapping_add(i as u64)
+                                .wrapping_add(2)
+                                .wrapping_add(rel as i64 as u64),
+                        );
+                        i += 2;
+                    }
+                    0x70..=0x7F => {
+                        let rel = buf[i + 1] as i8;
+                        t.push(
+                            start
+                                .wrapping_add(i as u64)
+                                .wrapping_add(2)
+                                .wrapping_add(rel as i64 as u64),
+                        );
+                        i += 2;
+                    }
+                    _ => {
+                        // RIP 相对引用：[legacy 前缀][REX] op modrm(mod=0,rm=5) disp32
+                        let mut j = i;
+                        while j < buf.len()
+                            && matches!(
+                                buf[j],
+                                0x66 | 0x67 | 0xF2 | 0xF3 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65
+                            )
+                        {
+                            j += 1;
+                        }
+                        if j < buf.len() && buf[j] & 0xF0 == 0x40 {
+                            j += 1;
+                        }
+                        if j < buf.len() {
+                            let op = buf[j];
+                            if matches!(
+                                op,
+                                0x03 | 0x0B
+                                    | 0x13
+                                    | 0x1B
+                                    | 0x23
+                                    | 0x2B
+                                    | 0x33
+                                    | 0x3B
+                                    | 0x63
+                                    | 0x69
+                                    | 0x6B
+                                    | 0x8A
+                                    | 0x8B
+                                    | 0x8D
+                                    | 0x80
+                                    ..=0x8F | 0xC6 | 0xC7 | 0xF6 | 0xF7 | 0xFE | 0xFF
+                            ) && j + 1 < buf.len()
+                            {
+                                let modrm = buf[j + 1];
+                                if modrm & 0xC7 == 0x05 && j + 6 <= buf.len() {
+                                    let rel =
+                                        i32::from_le_bytes(buf[j + 2..j + 6].try_into().unwrap());
+                                    // disp32 尾地址 + rel（含写入/读取目标）
+                                    t.push(
+                                        start
+                                            .wrapping_add(j as u64)
+                                            .wrapping_add(6)
+                                            .wrapping_add(rel as i64 as u64),
+                                    );
+                                    i += 6;
+                                    continue;
+                                }
+                            }
+                        }
+                        i += 1;
+                    }
+                }
+            }
+        }
+        t.sort_unstable();
+        t.dedup();
+        t
+    }
+
+    fn targets_between(sorted: &[u64], lo: u64, hi: u64) -> bool {
+        // lo < t < hi（半开窗口内任一目标即失败；t == lo（= site+2）允许——
+        // 它落进 cell 的迁移指令，语义等同直连）
+        sorted
+            .binary_search_by(|t| {
+                if *t < lo {
+                    std::cmp::Ordering::Less
+                } else if *t >= hi {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
+    }
+
+    /// 数据引用启发（mkhello 实测教训：字符串紧跟 syscall，5 字节 patch
+    /// 覆盖数据字节 → 客户数据损坏）。扫描代码段内 4/8 字节 LE 值命中
+    /// 覆盖窗口 → 该点不可 patch（留 VEH）。RIP 相对数据引用不覆盖
+    /// （诚实边界：偶发误 patch 由 VEH 混合模式兜底，回归测试锁定）。
+    fn data_ref_hit(exec_segs: &[(u64, u64)], lo: u64, hi: u64) -> bool {
+        for (start, end) in exec_segs {
+            // SAFETY: 段来自已映射登记的客户映像，构建期可读
+            let buf = unsafe {
+                std::slice::from_raw_parts(*start as *const u8, (*end - *start) as usize)
+            };
+            if buf.len() >= 8 {
+                for i in 0..=buf.len() - 8 {
+                    let v = u64::from_le_bytes(buf[i..i + 8].try_into().unwrap());
+                    if v >= lo && v < hi {
+                        return true;
+                    }
+                }
+            }
+            if buf.len() >= 4 {
+                for i in 0..=buf.len() - 4 {
+                    let v = u32::from_le_bytes(buf[i..i + 4].try_into().unwrap()) as u64;
+                    if v >= lo && v < hi {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// 映像 ±2GB 内分配岛页（64K 步进向上扫描）。先 RW 分配（写桩用），
+    /// 全部桩写完后由 build_islands 统一切 RX。
+    unsafe fn alloc_island_page(near: u64) -> Result<(usize, u64), HostError> {
+        const PAGE: usize = 4096;
+        const STEP: u64 = 0x1_0000;
+        let base = near & !(STEP - 1);
+        for k in 1..32_000u64 {
+            let hint = base + k * STEP;
+            let p = unsafe {
+                VirtualAlloc(
+                    hint as *mut c_void,
+                    PAGE,
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_READWRITE,
+                )
+            } as usize;
+            if p != 0 {
+                return Ok((p, hint));
+            }
+        }
+        Err(HostError::NoMemory)
+    }
+
+    /// 建岛主流程（T2.1/T2.6）。auto 语义 = **全通过才上岛**：任一 site
+    /// 校验存疑（迁移不可解码/分支或数据引用落窗）则整图回退 VEH——
+    /// 部分 patch 对 ldso 类客户的边角损坏风险不可枚举，稳定性优先。
+    /// `--trap=island` 仍可强制混合模式（此处全量建岛逻辑同一份）。
+    pub fn build_islands(
+        sites: &[u64],
+        exec_segs: &[(u64, u64)],
+    ) -> Result<crate::IslandPlan, HostError> {
+        *LEDGER.lock().unwrap_or_else(|p| p.into_inner()) = Vec::new();
+        ISLAND_SITES.store(0, Ordering::Relaxed);
+        VEH_SITES.store(0, Ordering::Relaxed);
+        static mut CUR_PAGE: usize = 0;
+        static mut CUR_OFF: usize = 0;
+        unsafe {
+            CUR_PAGE = 0;
+            CUR_OFF = 0;
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn FlushInstructionCache(h: isize, addr: *const c_void, size: usize) -> i32;
+            fn GetCurrentProcess() -> isize;
+        }
+        let targets = collect_branch_targets(exec_segs);
+        // a. 全量校验：迁移序列 + 引用窗口
+        let mut plan: Vec<(u64, Vec<u8>, u64)> = Vec::new(); // (site, cell_bytes, resume)
+        for &site in sites {
+            // 迁移序列：从 site+2 起逐条解码，累计覆盖 ≥ 5 字节（patch
+            // 覆盖 site..site+5，续跑边界必须 ≥ site+5，绝不能落在
+            // rel32 中段）。任何一条不可解码 → 该点不可岛化。
+            let mut cell_bytes: Vec<u8> = Vec::new();
+            let mut off = 2usize;
+            let mut movable = true;
+            loop {
+                // SAFETY: site 在已映射可执行段内（loader 记录）；读窗 6 字节
+                // 覆盖 1-3 字节指令的完整编码（>3 一律 None）
+                let win =
+                    unsafe { std::slice::from_raw_parts((site + off as u64) as *const u8, 6) };
+                match displaced_len(win) {
+                    Some(l) => {
+                        // SAFETY: 同上，l ≤ 6 且 off+6 在映射内
+                        // RIP 相对（mod=0,rm=5）与分支类指令不可迁移：复制到
+                        // 岛后基址/目标改变。前缀后才是 opcode/modrm。
+                        let mut j = 0;
+                        while j < l
+                            && matches!(
+                                win[j],
+                                0x66 | 0x67
+                                    | 0xF2
+                                    | 0xF3
+                                    | 0xF0
+                                    | 0x2E
+                                    | 0x36
+                                    | 0x3E
+                                    | 0x26
+                                    | 0x64
+                                    | 0x65
+                            )
+                        {
+                            j += 1;
+                        }
+                        if j < l && win[j] & 0xF0 == 0x40 {
+                            j += 1;
+                        }
+                        if j >= l {
+                            movable = false;
+                            break;
+                        }
+                        let op_at = win[j];
+                        if op_at == 0x0F || matches!(op_at, 0xE8 | 0xE9 | 0xEB | 0x70..=0x7F) {
+                            movable = false;
+                            break;
+                        }
+                        if j + 1 < l && win[j + 1] & 0xC7 == 0x05 {
+                            movable = false; // mod=0, rm=101 = RIP 相对
+                            break;
+                        }
+                        cell_bytes.extend_from_slice(unsafe {
+                            std::slice::from_raw_parts((site + off as u64) as *const u8, l)
+                        });
+                        off += l;
+                    }
+                    None => {
+                        movable = false;
+                        break;
+                    }
+                }
+                if off >= 5 || cell_bytes.len() > 24 {
+                    break;
+                }
+            }
+            if !movable {
+                return all_veh(sites.len());
+            }
+            // patch 覆盖窗口 (site+2, site+5) 不得是分支/rip 相对/绝对
+            // 数据目标（mkhello 字符串实测：lea rip+msg 落在窗口 → 损坏）
+            let lo = site + 2;
+            let hi = site + 5;
+            if targets_between(&targets, lo, hi) || data_ref_hit(exec_segs, lo, hi) {
+                return all_veh(sites.len());
+            }
+            plan.push((site, cell_bytes, site + off as u64));
+        }
+        // b. 全部通过 → 建岛
+        let mut island_n = 0usize;
+        let mut island_ranges: Vec<(u64, u64)> = Vec::new();
+        for (site, cell_bytes, resume) in &plan {
+            let site = *site;
+            let resume = *resume;
+            // c. 取岛页空间（页满换新页；64K 步进贴映像扫描）。
+            //    桩实际上界 ~240B（14 次寄存器保存 + 3 次 disp32 存储 + 段寄存器
+            //    + 切栈 + call + 恢复）——上界必须真实，否则复制溢出岛页。
+            const STUB_MAX: usize = 320;
+            let stub_len = cell_bytes.len() + 5 + STUB_MAX;
+            let (page, off_island) = unsafe {
+                if CUR_PAGE == 0 || CUR_OFF + stub_len > 4096 {
+                    let (p, _) = alloc_island_page(site)?;
+                    CUR_PAGE = p;
+                    CUR_OFF = 0;
+                }
+                (CUR_PAGE, CUR_OFF)
+            };
+            let cell = (page + off_island) as u64;
+            let stub = gen_stub(site, cell_bytes, resume, cell);
+            // d. 写桩 + 刷指令缓存（岛页当前 RW，收尾统一转 RX）
+            // SAFETY: page..page+4096 为本进程独占岛页，off+stub_len ≤ 4096
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    stub.as_ptr(),
+                    (page + off_island) as *mut u8,
+                    stub.len(),
+                );
+                FlushInstructionCache(
+                    GetCurrentProcess(),
+                    (page + off_island) as *const c_void,
+                    stub.len(),
+                );
+            }
+            // e. 改写 patch 点：UD2(2) → E9 rel32(5)（指向桩首）；页临时 RWX 后复原
+            let target = cell + cell_bytes.len() as u64 + 5; // 桩首
+            let rel = target as i64 - (site as i64 + 5);
+            unsafe {
+                let page_base = site & !0xFFF;
+                let mut old = 0u32;
+                if VirtualProtect(
+                    page_base as *mut c_void,
+                    4096,
+                    PAGE_EXECUTE_READWRITE,
+                    &mut old,
+                ) == 0
+                {
+                    return Err(HostError::Invalid);
+                }
+                let mut patch = vec![0xE9u8];
+                patch.extend_from_slice(&(rel as i32).to_le_bytes());
+                std::ptr::copy_nonoverlapping(patch.as_ptr(), site as *mut u8, 5);
+                FlushInstructionCache(GetCurrentProcess(), site as *const c_void, 5);
+                VirtualProtect(page_base as *mut c_void, 4096, old, &mut old);
+            }
+            unsafe { CUR_OFF = off_island + stub.len() };
+            LEDGER
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(PatchSite { site, stub: target });
+            island_n += 1;
+            // 记录岛页区间（fork 快照传递 + MemRegistry 登记）
+            let span = (page as u64, page as u64 + 4096);
+            if !island_ranges.contains(&span) {
+                island_ranges.push(span);
+            }
+        }
+        ISLAND_SITES.store(island_n, Ordering::Relaxed);
+        VEH_SITES.store(0, Ordering::Relaxed);
+        TRAP_MODE.store(if island_n > 0 { 1 } else { 0 }, Ordering::Relaxed);
+        // 收尾：全部岛页 RW → RX（写桩完成后统一收敛，W^X）
+        for (s, e) in &island_ranges {
+            unsafe {
+                let mut old = 0u32;
+                if VirtualProtect(
+                    *s as *mut c_void,
+                    (*e - *s) as usize,
+                    PAGE_EXECUTE_READ,
+                    &mut old,
+                ) == 0
+                {
+                    return Err(HostError::Invalid);
+                }
+                FlushInstructionCache(GetCurrentProcess(), *s as *const c_void, (*e - *s) as usize);
+            }
+        }
+        Ok((island_n, 0, island_ranges))
+    }
+
+    /// 全图回退 VEH（auto 语义：任一 site 存疑 → 全部保持 UD2）。
+    fn all_veh(n: usize) -> Result<crate::IslandPlan, HostError> {
+        ISLAND_SITES.store(0, Ordering::Relaxed);
+        VEH_SITES.store(n, Ordering::Relaxed);
+        TRAP_MODE.store(0, Ordering::Relaxed);
+        Ok((0, n, Vec::new()))
+    }
+
+    /// fork 子上下文（岛路径）：从 IslandSave 合成整数+控制 CONTEXT。
+    /// 诚实边界：FPU/XMM 不传递（SysV 调用约定下调用方不得跨 fork 依赖
+    /// xmm；0.0.6 VEH 路径传递完整 XSAVE）；DS/ES 为进程默认平展段。
+    pub fn fork_child_context(frame: &TrapFrame) -> Vec<u8> {
+        assert!(frame.opaque_bytes().len() >= SAVE_SIZE, "island save size");
+        let sa = frame.opaque_bytes();
+        let mut b = vec![0u8; 0x4D0];
+        // 整数寄存器：CONTEXT 0x78..0x100 = GuestRegs 0x00..0x88（布局断言锁定）
+        let regs = unsafe {
+            std::slice::from_raw_parts(frame.regs as *const GuestRegs as *const u8, 0x88)
+        };
+        b[0x78..0x100].copy_from_slice(regs);
+        // cs/ss（CONTEXT_CONTROL 恢复所需；0x38 = SegCs，0x42 = SegSs）
+        b[0x38..0x3A].copy_from_slice(&sa[OFF_SEGS..OFF_SEGS + 2]); // cs
+        b[0x42..0x44].copy_from_slice(&sa[OFF_SEGS + 2..OFF_SEGS + 4]); // ss
+                                                                        // context_flags = CONTEXT_AMD64 | CONTROL | INTEGER
+        b[0x30..0x34].copy_from_slice(&0x0010_0003u32.to_le_bytes());
+        // syscall 返回形态（岛路径）：Rax=0、Rip/Rcx=cell（patch 区不可落）、
+        // R11=RFLAGS
+        let cell = u64::from_le_bytes(sa[OFF_CELL..OFF_CELL + 8].try_into().unwrap());
+        b[0xF8..0x100].copy_from_slice(&cell.to_le_bytes()); // rip
+        b[0x78..0x80].copy_from_slice(&0u64.to_le_bytes()); // rax
+        b[0x80..0x88].copy_from_slice(&cell.to_le_bytes()); // rcx
+        b[0xD0..0xD8].copy_from_slice(&frame.e_flags.to_le_bytes()); // r11
+        b
+    }
+}
 
 /// CreateProcess 产物：pid 与常驻 hProcess（wait4/kill 用）。
 pub struct ChildProcess {

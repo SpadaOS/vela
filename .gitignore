@@ -12,3 +12,4 @@ Thumbs.db
 
 # musl 本地源码树（ldso 复现构建用，不入库）
 musl-1.2.5/
+/target2

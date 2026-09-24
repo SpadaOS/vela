@@ -270,6 +270,7 @@ fn setup(len: usize) -> (MockHost, GuestProcess, usize) {
             prot: 5,
         }],
         exec_ranges: vec![],
+        syscall_sites: vec![],
         span: MemRange::reserve(addr as u64, len as u64),
         interp: None,
     };

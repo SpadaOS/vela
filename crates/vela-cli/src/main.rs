@@ -42,6 +42,8 @@ struct GuestState {
     soft_tls: bool,
     /// 存活子进程表（0.0.6 M1：pid → hProcess 常驻句柄，wait4/kill 用）。
     children: RefCell<BTreeMap<u32, isize>>,
+    /// 陷阱后端选择（0.1.0 T2.6；execve 重载沿用）。
+    trap: TrapBackend,
 }
 
 static GUEST: AtomicPtr<GuestState> = AtomicPtr::new(std::ptr::null_mut());
@@ -103,7 +105,17 @@ fn print_usage() {
     eprintln!("  -v                 syscall 日志到 stderr（或 VELA_LOG=1）");
     eprintln!("  --soft-tls         实验开关：FSGSBASE 缺失环境下软件模拟客户 fs 段");
     eprintln!("                     访问（诊断/CI 可用，性能不承诺）");
+    eprintln!("  --trap=<backend>   陷阱后端：island|veh|auto（默认 auto = 岛页跳板，");
+    eprintln!("                     校验不过的点位混合 VEH；veh = 0.0.6 行为）");
     eprintln!("env:   VELA_LOG=1 或 -v 打印 syscall 日志到 stderr");
+}
+
+/// 陷阱后端选择（PLAN-0.1.0 T2.6）。auto = 岛页优先、校验不过的点混合 VEH。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrapBackend {
+    Auto,
+    Veh,
+    Island,
 }
 
 /// run 子命令的选项（解析自 elf 路径之前）。
@@ -118,6 +130,7 @@ struct RunOpts {
     heap_mb: u64,
     interp: Option<String>,
     soft_tls: bool,
+    trap: TrapBackend,
 }
 
 fn cmd_run(rest: &[String], internal_fork: Option<isize>) -> i32 {
@@ -132,6 +145,7 @@ fn cmd_run(rest: &[String], internal_fork: Option<isize>) -> i32 {
         heap_mb: 8,
         interp: None,
         soft_tls: false,
+        trap: TrapBackend::Auto,
     };
     let mut pos: Vec<String> = Vec::new();
     let mut i = 0;
@@ -170,6 +184,27 @@ fn cmd_run(rest: &[String], internal_fork: Option<isize>) -> i32 {
             }
             "--soft-tls" => {
                 opts.soft_tls = true;
+            }
+            a if a == "--trap" || a.starts_with("--trap=") => {
+                // --trap=veh|island|auto 与 --trap veh|island|auto 两种形式
+                let (v, consumed) = match a.split_once('=') {
+                    Some((_, v)) => (v, false),
+                    None => match rest.get(i + 1) {
+                        Some(v) => (v.as_str(), true),
+                        None => return usage_err("--trap 需要参数"),
+                    },
+                };
+                opts.trap = match v {
+                    "veh" => TrapBackend::Veh,
+                    "island" => TrapBackend::Island,
+                    "auto" => TrapBackend::Auto,
+                    other => {
+                        return usage_err(&format!("--trap 未知后端 '{other}'（veh|island|auto）"))
+                    }
+                };
+                if consumed {
+                    i += 1;
+                }
             }
             "--uid" | "--gid" | "--stack-mb" | "--heap-mb" => {
                 let Some(v) = rest.get(i + 1) else {
@@ -341,11 +376,14 @@ fn do_execve(st: &mut GuestState, args: &[u64; 6]) -> Result<(u64, u64), i64> {
             .ok_or(err(vela_abi::ENOENT))?;
         let ibytes = std::fs::read(&ipath).map_err(|_| err(vela_abi::ENOENT))?;
         let iimg = loader::load(&ibytes, &st.host, 0).map_err(|_| err(vela_abi::ENOEXEC))?;
+        // 解释器 syscall sites 并入主映像清单（build_islands_for 统一处理）
+        img.syscall_sites.extend(iimg.syscall_sites.iter().copied());
         img.interp = Some(InterpImage {
             bias: iimg.bias,
             entry: iimg.entry,
             span: iimg.span,
             exec_ranges: iimg.exec_ranges,
+            syscall_sites: iimg.syscall_sites,
         });
     }
 
@@ -368,11 +406,19 @@ fn do_execve(st: &mut GuestState, args: &[u64; 6]) -> Result<(u64, u64), i64> {
     // 5. CLOEXEC fd 关闭（管道等跨重载保留，T3.2）
     let _ = st.proc.fds.close_cloexec(&st.host);
 
+    // 6a. 新映像建岛（T2.6/T2.7）：旧岛地址空间随旧映像泄漏（T4.5 计债）
+    let island_ranges = build_islands_for(&st.host, &img, st.trap);
+
     // 6. 换上新映像 + 重建堆/栈/auxv
     st.proc.load = img;
     st.proc.mem.add(st.proc.load.span);
     if let Some(i) = &st.proc.load.interp {
         st.proc.mem.add(i.span);
+    }
+    for (s, e) in island_ranges {
+        st.proc
+            .mem
+            .add(vela_runtime::mem::MemRange::island(s, e - s));
     }
     st.proc
         .init_heap(&st.host, 0, st.heap_mb * 1024 * 1024)
@@ -431,6 +477,11 @@ fn cmd_doctor() -> i32 {
     // 路径映射约定
     println!("  path mapping : default /mnt/c -> C:\\; override with --root <dir> / --map <g>=<h>");
 
+    // 陷阱后端（0.1.0 T2.6）：island 为默认 auto 的首选，混合模式是预期形态
+    println!(
+        "  trap         : island trampoline supported (default --trap=auto; mixed island/veh expected)"
+    );
+
     // 杀软提示（README 安全节）：进程内改可执行内存可能被拦截
     println!("  antivirus    : if guests are blocked, exclude vela.exe (Vela patches syscall in-process; no packing/obfuscation)");
 
@@ -470,6 +521,53 @@ fn build_envp(envs: &[String]) -> Vec<String> {
         }
     }
     list.into_iter().map(|(k, v)| format!("{k}={v}")).collect()
+}
+
+/// 岛页跳板构建（PLAN-0.1.0 T2.1/T2.6）：--trap=veh 时跳过（保持 0.0.6
+/// 行为）。主映像 + 解释器的全部 syscall site 一次建岛；通过校验的点改写
+/// E9 进岛页，其余留 UD2+VEH（混合模式）。返回岛页区间（调用方登记进
+/// MemRegistry——fork 快照经此原样传递，T2.7：子进程同 VA 映射，E9 有效）。
+#[cfg(windows)]
+fn build_islands_for(
+    host: &PlatformHost,
+    img: &vela_runtime::mem::LoadedImage,
+    trap: TrapBackend,
+) -> Vec<(u64, u64)> {
+    if trap == TrapBackend::Veh {
+        return Vec::new();
+    }
+    let mut sites = img.syscall_sites.clone();
+    if let Some(i) = &img.interp {
+        sites.extend(i.syscall_sites.iter().copied());
+    }
+    if sites.is_empty() {
+        return Vec::new();
+    }
+    // 可执行段（分支目标扫描域）：主映像逐段 + 解释器 exec_ranges
+    // （解释器 span 含 PROT_NONE 捐赠页，不可整体扫描）
+    let mut segs: Vec<(u64, u64)> = img
+        .segments
+        .iter()
+        .filter(|s| s.prot & 4 != 0)
+        .map(|s| (s.vaddr, s.vaddr + s.mem_size))
+        .collect();
+    if let Some(i) = &img.interp {
+        segs.extend(i.exec_ranges.iter().copied());
+    }
+    match host.build_islands(&sites, &segs) {
+        Ok((ni, nv, ranges)) => {
+            if logx::enabled() {
+                eprintln!(
+                    "[vela] island trampoline: {ni} sites → island, {nv} sites → VEH (mixed mode expected)"
+                );
+            }
+            ranges
+        }
+        Err(e) => {
+            eprintln!("[vela] island build failed: {e} (continuing with VEH backend)");
+            Vec::new()
+        }
+    }
 }
 
 fn run_elf(
@@ -566,6 +664,7 @@ fn run_elf(
                     entry: iimg.entry,
                     span: iimg.span,
                     exec_ranges: iimg.exec_ranges,
+                    syscall_sites: iimg.syscall_sites,
                 });
             }
             Err(e) => {
@@ -575,9 +674,15 @@ fn run_elf(
         }
     }
 
+    // 岛页跳板（T2.6）：在 proc 建立前构建（映像内存已就位），区间随后登记
+    let island_ranges = build_islands_for(&host, &img, opts.trap);
+
     let mut proc = GuestProcess::new(host.current_pid(), img);
     proc.attach_stdio(&host);
     proc.fs = fs;
+    for (s, e) in island_ranges {
+        proc.mem.add(vela_runtime::mem::MemRange::island(s, e - s));
+    }
     if let Some(u) = opts.uid {
         proc.uid = u;
     }
@@ -631,6 +736,7 @@ fn run_elf(
             heap_mb: opts.heap_mb,
             soft_tls: opts.soft_tls,
             children: std::cell::RefCell::new(BTreeMap::new()),
+            trap: opts.trap,
         });
         let ptr = Box::into_raw(state);
         GUEST.store(ptr, Ordering::Relaxed);

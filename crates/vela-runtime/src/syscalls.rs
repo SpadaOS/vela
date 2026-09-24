@@ -1348,12 +1348,17 @@ fn sys_munmap(proc: &mut GuestProcess, host: &dyn Host, addr_raw: u64, len_raw: 
         return 0;
     }
     // v0：只移除完全被覆盖的登记项，释放 best-effort（规格 5.4）；
-    // 登记项类型决定释放原语：文件视图走 UnmapViewOfFile（PLAN-0.0.4 T1.3）
+    // 登记项类型决定释放原语：文件视图走 UnmapViewOfFile（PLAN-0.0.4 T1.3）。
+    // Island（0.1.0 T2.1）：客户 munmap 岛页无意义，仅解除登记不释放
+    // （释放原语是 Windows 私有细节，语义上等同 Reserve 的诚实近似——
+    // 但岛页地址空间极小且与映像同寿命，直接吞掉释放动作）。
     let removed = proc.mem.remove_fully_covered(addr, len);
     for r in &removed {
         let _ = match r.kind {
             crate::mem::MemKind::FileView => unsafe { host.unmap_view(r.start as usize) },
-            crate::mem::MemKind::Reserve => unsafe { host.unmap(r.start as usize, r.len as usize) },
+            crate::mem::MemKind::Reserve | crate::mem::MemKind::Island => unsafe {
+                host.unmap(r.start as usize, r.len as usize)
+            },
         };
     }
     0

@@ -223,13 +223,15 @@ pub fn parse(bytes: &[u8]) -> Result<ElfInfo, LoadError> {
 
 /// 朴素扫描：可执行段内连续的 `0F 05`（syscall）改写为 `0F 0B`（UD2）。
 /// 已知风险（规格 5.3）：紧邻数据恰好组成 0F 05 的误报概率极低，v0 接受。
-/// 返回 patch 数量。
-pub fn patch_syscalls(code: &mut [u8]) -> usize {
+/// patch 点 VA 记入 `sites`（0.1.0 T2.1：岛页跳板只信这份清单，不认
+/// 客户自身代码里的 UD2）。返回 patch 数量。
+pub fn patch_syscalls(code: &mut [u8], base: u64, sites: &mut Vec<u64>) -> usize {
     let mut n = 0;
     let mut i = 0;
     while i + 1 < code.len() {
         if code[i] == 0x0F && code[i + 1] == 0x05 {
             code[i + 1] = 0x0B;
+            sites.push(base + i as u64);
             n += 1;
             i += 2;
         } else {
@@ -276,6 +278,7 @@ pub fn load(bytes: &[u8], host: &dyn Host, hint: u64) -> Result<LoadedImage, Loa
 
     let mut segments = Vec::with_capacity(info.loads.len());
     let mut exec_ranges = Vec::new();
+    let mut syscall_sites = Vec::new();
     for s in &info.loads {
         let dst = base + (s.vaddr - lo);
         if s.filesz > 0 {
@@ -300,7 +303,7 @@ pub fn load(bytes: &[u8], host: &dyn Host, hint: u64) -> Result<LoadedImage, Loa
             // patch 仅覆盖文件内容范围；bss 零页无指令
             // SAFETY: dst..dst+filesz 是本函数映射的可写内存
             let code = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, s.filesz as usize) };
-            patch_syscalls(code);
+            patch_syscalls(code, bias + s.vaddr, &mut syscall_sites);
             exec_ranges.push((bias + s.vaddr, bias + s.vaddr + s.memsz));
         }
         segments.push(Segment {
@@ -339,6 +342,7 @@ pub fn load(bytes: &[u8], host: &dyn Host, hint: u64) -> Result<LoadedImage, Loa
         phentsize: info.phentsize,
         segments,
         exec_ranges,
+        syscall_sites,
         span: MemRange::reserve(base, span as u64),
         interp: None,
     })

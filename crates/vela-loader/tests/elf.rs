@@ -10,17 +10,21 @@ use vela_sys::HostProt;
 fn patcher_rewrites_syscall_to_ud2() {
     // 0F 05 ×2 + 干扰数据
     let mut buf = vec![0x90, 0x0F, 0x05, 0xCC, 0x0F, 0x05, 0x48];
-    let n = patch_syscalls(&mut buf);
+    let mut sites = Vec::new();
+    let n = patch_syscalls(&mut buf, 0x1000, &mut sites);
     assert_eq!(n, 2);
     assert_eq!(buf, vec![0x90, 0x0F, 0x0B, 0xCC, 0x0F, 0x0B, 0x48]);
+    assert_eq!(sites, vec![0x1001, 0x1004]);
 }
 
 #[test]
 fn patcher_ignores_non_syscall() {
     let mut buf = vec![0x0F, 0x0B, 0x05, 0x0F, 0x05];
-    let n = patch_syscalls(&mut buf);
+    let mut sites = Vec::new();
+    let n = patch_syscalls(&mut buf, 0, &mut sites);
     assert_eq!(n, 1);
     assert_eq!(buf, vec![0x0F, 0x0B, 0x05, 0x0F, 0x0B]);
+    assert_eq!(sites, vec![0x3]);
 }
 
 #[test]

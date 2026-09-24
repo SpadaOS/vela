@@ -394,6 +394,9 @@ impl TrapFrame<'_> {
 /// 由回调直接操作 `frame.regs` 完成。
 pub type TrapFn = unsafe extern "system" fn(nr: u64, args: &[u64; 6], frame: &mut TrapFrame) -> i64;
 
+/// 岛页构建结果（T2.1）：(island_sites, veh_sites, island 区间列表)。
+pub type IslandPlan = (usize, usize, Vec<(u64, u64)>);
+
 /// 组 6 trap：客户执行与 syscall 陷阱机制（VEH / 岛页 / 未来宿主机制）。
 /// 默认全部未实现——仅真正能执行客户的宿主填实。
 pub trait HostTrap: Send + Sync + 'static {
@@ -448,6 +451,30 @@ pub trait HostTrap: Send + Sync + 'static {
     /// trampoline 是否被实际执行过（诊断观测）。
     fn soft_tls_stub_hit(&self) -> bool {
         false
+    }
+
+    // ---- 岛页跳板（PLAN-0.1.0 T2.1/T2.2，目前唯一实现 windows）----
+
+    /// 构建岛页跳板：对每个 syscall patch 点（loader 记录的 UD2 site）
+    /// 做「迁移指令 ≤3 字节 + 非跳转目标」校验，通过者改写 5 字节
+    /// `jmp rel32` 进岛页（宿主栈 dispatch），失败者留 UD2+VEH（混合
+    /// 模式是预期形态，T2.6）。exec_segs = 全部可执行段 [(start, end)]
+    /// （分支目标扫描域）。
+    fn build_islands(
+        &self,
+        sites: &[u64],
+        exec_segs: &[(u64, u64)],
+    ) -> Result<IslandPlan, HostError> {
+        let _ = (sites, exec_segs);
+        Err(HostError::Unimplemented)
+    }
+    /// 实际生效的陷阱后端名（doctor 报告）。
+    fn trap_backend_name(&self) -> &'static str {
+        "veh"
+    }
+    /// island / veh 点位计数（doctor 报告）。
+    fn island_veh_counts(&self) -> (usize, usize) {
+        (0, 0)
     }
 }
 

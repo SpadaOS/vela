@@ -27,6 +27,9 @@ pub struct LoadedImage {
     pub segments: Vec<Segment>,
     /// 客户可执行范围（trap 过滤 Rip 用）。
     pub exec_ranges: Vec<(u64, u64)>,
+    /// syscall patch 点（PLAN-0.1.0 T2.1）：loader 改写为 UD2 的客户 VA，
+    /// 岛页跳板构建的输入（避免误认客户自身代码里的 UD2）。
+    pub syscall_sites: Vec<u64>,
     /// 整块映射范围（用于内存登记）。
     pub span: MemRange,
     /// 动态链接解释器（PLAN-0.0.4 T2.2）：PT_INTERP 存在时由 CLI 装载
@@ -44,6 +47,8 @@ pub struct InterpImage {
     /// 解释器整块映射范围（内存登记与 munmap 记账）。
     pub span: MemRange,
     pub exec_ranges: Vec<(u64, u64)>,
+    /// syscall patch 点（同 LoadedImage）。
+    pub syscall_sites: Vec<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,11 +61,13 @@ pub struct MemRange {
 
 /// 映射类型（PLAN-0.0.4 T1.3）。
 /// - Reserve：匿名预留块（VirtualAlloc → VirtualFree 整块释放）；
-/// - FileView：文件映射视图（MapViewOfFileEx → UnmapViewOfFile）。
+/// - FileView：文件映射视图（MapViewOfFileEx → UnmapViewOfFile）；
+/// - Island：岛页跳板块（0.1.0 T2.1，syscall 蹦床；fork 经快照原样传递）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemKind {
     Reserve,
     FileView,
+    Island,
 }
 
 impl MemRange {
@@ -76,6 +83,13 @@ impl MemRange {
             start,
             len,
             kind: MemKind::FileView,
+        }
+    }
+    pub fn island(start: u64, len: u64) -> MemRange {
+        MemRange {
+            start,
+            len,
+            kind: MemKind::Island,
         }
     }
 }
