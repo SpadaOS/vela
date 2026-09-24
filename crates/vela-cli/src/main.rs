@@ -721,8 +721,7 @@ unsafe extern "system" fn trap(
             }
             Err(e) => e,
         }
-    } else if nr == vela_abi::SYS_FORK
-        || nr == vela_abi::SYS_VFORK
+    } else if nr == vela_abi::SYS_FORK || nr == vela_abi::SYS_VFORK
         || (nr == vela_abi::SYS_CLONE && args[0] == fork::SIGCHLD_FLAGS)
     {
         // fork（0.0.6 M1）：musl x86_64 fork() 走 SYS_FORK(57)；线程类

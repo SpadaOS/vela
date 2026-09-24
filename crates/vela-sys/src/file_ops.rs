@@ -352,10 +352,7 @@ pub(crate) fn create_pipe() -> Result<(HostFile, HostFile), HostError> {
     {
         let m = std::sync::Arc::new(crate::PipeMem::new());
         Ok((
-            HostFile(HostFileKind::Pipe(PipeEnd(PipeEndInner::Mem(
-                m.clone(),
-                true,
-            )))),
+            HostFile(HostFileKind::Pipe(PipeEnd(PipeEndInner::Mem(m.clone(), true)))),
             HostFile(HostFileKind::Pipe(PipeEnd(PipeEndInner::Mem(m, false)))),
         ))
     }
@@ -433,10 +430,7 @@ impl PipeEnd {
                 if !m.read_open.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err(HostError::Other(32)); // EPIPE
                 }
-                m.buf
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .extend_from_slice(buf);
+                m.buf.lock().unwrap_or_else(|p| p.into_inner()).extend_from_slice(buf);
                 Ok(buf.len())
             }
         }
@@ -543,9 +537,7 @@ pub(crate) fn pipe_handles() -> Result<(isize, isize), HostError> {
     };
     // SAFETY: 输出指针与 SA 均有效；64KiB 缓冲与 Linux 默认一致
     if unsafe { CreatePipe(&mut r, &mut w, &sa, 64 * 1024) } == 0 {
-        return Err(HostError::Other(os_to_errno(
-            unsafe { GetLastError() } as i32
-        )));
+        return Err(HostError::Other(os_to_errno(unsafe { GetLastError() } as i32)));
     }
     const HANDLE_FLAG_INHERIT: u32 = 0x1;
     // SAFETY: 两个句柄均为本函数刚创建的有效句柄
