@@ -25,7 +25,7 @@ use vela_sys::{
 use crate::GuestState;
 
 const META_MAGIC: u32 = 0x5645_4C46; // "VELF"
-const META_VERSION: u32 = 1;
+const META_VERSION: u32 = 2; // 0.1.0 T3.2：+mprotect 账本
 /// Linux SIGCHLD；musl fork() = clone(SIGCHLD, 0)。
 pub const SIGCHLD_FLAGS: u64 = 17;
 
@@ -165,6 +165,8 @@ struct Meta {
     ranges: Vec<RangeSer>,
     load: LoadSer,
     fds: Vec<FdEntrySer>,
+    /// mprotect 账本（T3.2；按应用顺序）。
+    prots: Vec<(u64, u64, u8)>,
 }
 
 fn w_img(w: &mut W, l: &LoadSer) {
@@ -298,6 +300,13 @@ fn encode(meta: &Meta) -> Vec<u8> {
             FdSer::Zero => w.u32(8),
         }
     }
+    // mprotect 账本（T3.2）
+    w.u32(meta.prots.len() as u32);
+    for (start, len, prot) in &meta.prots {
+        w.u64(*start);
+        w.u64(*len);
+        w.u32(*prot as u32);
+    }
     w.finish()
 }
 
@@ -367,6 +376,12 @@ fn decode(b: &[u8]) -> Result<Meta, ()> {
         };
         fds.push(FdEntrySer { fd, flags, kind });
     }
+    // mprotect 账本（T3.2）
+    let np = r.u32()?;
+    let mut prots = Vec::with_capacity(np as usize);
+    for _ in 0..np {
+        prots.push((r.u64()?, r.u64()?, r.u32()? as u8));
+    }
     Ok(Meta {
         ppid,
         uid,
@@ -384,6 +399,7 @@ fn decode(b: &[u8]) -> Result<Meta, ()> {
         ranges,
         load,
         fds,
+        prots,
     })
 }
 
@@ -538,6 +554,12 @@ pub fn do_fork(st: &mut GuestState, args: &[u64; 6], frame: &mut TrapFrame) -> R
         ranges: range_sers,
         load: ser_img(&st.proc.load),
         fds: ser_fds(st)?,
+        prots: st
+            .proc
+            .prot_ledger
+            .iter()
+            .map(|p| (p.start, p.len, p.prot))
+            .collect(),
     };
     let payload = encode(&meta);
 
@@ -760,6 +782,18 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
             // 客户按需 mprotect——与 0.0.4 的 donate 语义一致性已标注
             let _ = i;
         }
+        // 7b. mprotect 账本重放（T3.2）：映像段收敛后按父进程运行时顺序
+        //     重放保护变更（子进程区间为 section 视图非 COW，W 合法）
+        for (start, len, prot) in &meta.prots {
+            // SAFETY: 区间来自快照 section 映射，归客户管理
+            let _ = unsafe {
+                host.protect(
+                    *start as usize,
+                    *len as usize,
+                    HostProt::from_bits(*prot as u32),
+                )
+            };
+        }
 
         // 8. VELA 客户机制装配
         let state = Box::new(GuestState {
@@ -769,6 +803,7 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
             heap_mb: meta.heap_mb,
             soft_tls: meta.soft_tls,
             children: RefCell::new(BTreeMap::new()),
+            sigchld_reaped: std::cell::Cell::new(0),
             trap: crate::TrapBackend::Auto, // 父进程已建岛（快照含岛页），子进程沿用
         });
         let ptr = Box::into_raw(state);
@@ -859,6 +894,8 @@ pub fn do_wait4(st: &mut GuestState, args: &[u64; 6]) -> i64 {
     }
     st.children.borrow_mut().remove(&child);
     st.host.close_handle(handle);
+    // T3.6 SIGCHLD 记账：wait 回收即置位（不投递 handler，NONGOALS）
+    st.sigchld_reaped.set(st.sigchld_reaped.get() + 1);
     child as i64
 }
 

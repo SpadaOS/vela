@@ -113,6 +113,14 @@ impl HostFileOps for LinuxDevHost {
     fn set_readonly_file(&self, f: &HostFile, readonly: bool) -> Result<(), HostError> {
         file_ops::set_readonly(f, readonly)
     }
+    fn set_times(
+        &self,
+        path: &HostPath,
+        atime: Option<(i64, i64)>,
+        mtime: Option<(i64, i64)>,
+    ) -> Result<(), HostError> {
+        file_ops::set_times(path, atime, mtime)
+    }
     fn close(&self, f: HostFile) -> Result<(), HostError> {
         file_ops::close(f)
     }

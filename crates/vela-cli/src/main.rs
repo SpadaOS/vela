@@ -42,6 +42,9 @@ struct GuestState {
     soft_tls: bool,
     /// 存活子进程表（0.0.6 M1：pid → hProcess 常驻句柄，wait4/kill 用）。
     children: RefCell<BTreeMap<u32, isize>>,
+    /// SIGCHLD 记账（0.1.0 T3.6）：已回收子进程计数。不投递 handler
+    /// （NONGOALS）；ash 以 job control off 运行不依赖投递。
+    sigchld_reaped: std::cell::Cell<u64>,
     /// 陷阱后端选择（0.1.0 T2.6；execve 重载沿用）。
     trap: TrapBackend,
 }
@@ -736,6 +739,7 @@ fn run_elf(
             heap_mb: opts.heap_mb,
             soft_tls: opts.soft_tls,
             children: std::cell::RefCell::new(BTreeMap::new()),
+            sigchld_reaped: std::cell::Cell::new(0),
             trap: opts.trap,
         });
         let ptr = Box::into_raw(state);

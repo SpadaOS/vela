@@ -215,6 +215,43 @@ pub fn fifo_stat() -> HostStat {
     }
 }
 
+/// utimensat 语义：设置 atime/mtime（T3.5）。None = UTIME_OMIT。
+/// std File::set_times（1.75+）：需写方式打开以取 FILE_WRITE_ATTRIBUTES。
+/// ctime 无 Windows 对应，诚实忽略。
+pub(crate) fn set_times(
+    path: &HostPath,
+    atime: Option<(i64, i64)>,
+    mtime: Option<(i64, i64)>,
+) -> Result<(), HostError> {
+    use std::fs::FileTimes;
+    if atime.is_none() && mtime.is_none() {
+        return Ok(()); // 全 OMIT：no-op
+    }
+    let ts = |t: Option<(i64, i64)>| -> Option<std::time::SystemTime> {
+        t.map(|(sec, nsec)| {
+            let dur = std::time::Duration::new(sec.unsigned_abs(), nsec.unsigned_abs().min(999_999_999) as u32);
+            if sec >= 0 {
+                std::time::UNIX_EPOCH + dur
+            } else {
+                std::time::UNIX_EPOCH - dur
+            }
+        })
+    };
+    let mut times = FileTimes::new();
+    if let Some(a) = ts(atime) {
+        times = times.set_accessed(a);
+    }
+    if let Some(m) = ts(mtime) {
+        times = times.set_modified(m);
+    }
+    // SAFETY: 无；std 接口
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path.0)
+        .map_err(|e| io_err(&e))?;
+    f.set_times(times).map_err(|e| io_err(&e))
+}
+
 /// ftruncate 语义：截断/扩展已打开文件（std File::set_len，含 Windows）。
 pub(crate) fn set_len(f: &HostFile, len: u64) -> Result<(), HostError> {
     match &f.0 {

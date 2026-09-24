@@ -35,7 +35,7 @@ pub fn dispatch(proc: &mut GuestProcess, host: &dyn Host, nr: u64, a: [u64; 6]) 
         // 进程组/会话（0.0.6 M5）：单进程无会话语义——pgid=sid=pid 的诚实近似
         abi::SYS_GETPGRP | abi::SYS_GETPGID => proc.pid as i64,
         abi::SYS_SETPGID | abi::SYS_SETSID | abi::SYS_GETSID => proc.pid as i64,
-        abi::SYS_UTIMENSAT => -(abi::ENOSYS as i64), // 无时间戳设置（v0）
+        abi::SYS_UTIMENSAT => sys_utimensat(proc, host, a),
         abi::SYS_SYSINFO => sys_sysinfo(proc, host, a[0]),
         abi::SYS_FCHMOD => sys_fchmod(proc, host, a[0], a[1]),
         abi::SYS_READLINK | abi::SYS_READLINKAT => sys_readlinkat(0, a[0], a[1], a[2]),
@@ -1336,6 +1336,72 @@ fn sys_mprotect(
         return 0;
     }
     match unsafe { host.protect(addr as usize, len as usize, prot) } {
+        Ok(()) => {
+            // T3.2 账本：记录客户请求的原值（不剥离 FileView WRITE 位——
+            // fork 子进程的区间是 section 视图非 COW 文件映射，W 合法）
+            proc.prot_ledger.push(crate::ProtOverride {
+                start: addr,
+                len,
+                prot: linux_prot as u8,
+            });
+            0
+        }
+        Err(e) => -(host_err_to_errno(&e) as i64),
+    }
+}
+
+/// utimensat(280)（PLAN-0.1.0 T3.5）：设置 atime/mtime。
+/// UTIME_NOW = (1<<30)-1，UTIME_OMIT = (1<<30)-2。flags ≠ 0（AT_SYMLINK
+/// NOFOLLOW）与 pathname=NULL（dirfd 形态）诚实 ENOSYS；ctime 无 Windows
+/// 对应，stat 回读值不变——均记录于 SYSCALLS 诚实边界。
+fn sys_utimensat(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 {
+    const UTIME_NOW: i64 = (1 << 30) - 1;
+    const UTIME_OMIT: i64 = (1 << 30) - 2;
+    let (dirfd, path_ptr, times_ptr, flags) = (a[0] as u32 as i32, a[1], a[2], a[3]);
+    if flags != 0 {
+        return -(abi::ENOSYS as i64);
+    }
+    if dirfd != abi::AT_FDCWD {
+        return -(abi::EBADF as i64); // 目录 fd 相对路径同 newfstatat 边界
+    }
+    let path = if path_ptr == 0 {
+        return -(abi::ENOSYS as i64);
+    } else {
+        match read_cstr(proc, path_ptr) {
+            Ok(p) => p,
+            Err(e) => return -(e as i64),
+        }
+    };
+    let Some(host_path) = proc.fs.translate(&resolve_rel(proc, &path)) else {
+        return -(abi::ENOENT as i64);
+    };
+    // 解析 2×timespec（各 {i64 sec, i64 nsec}）
+    let (now_s, now_n) = host.realtime();
+    let now = (now_s, now_n as i64);
+    let parse = |sec: i64, nsec: i64| -> Result<Option<(i64, i64)>, i32> {
+        if nsec < 0 || nsec >= 1_000_000_000 {
+            return Err(abi::EINVAL);
+        }
+        match sec {
+            UTIME_NOW => Ok(Some(now)),
+            UTIME_OMIT => Ok(None),
+            _ => Ok(Some((sec, nsec))),
+        }
+    };
+    let (atime, mtime) = if times_ptr == 0 {
+        (Some(now), Some(now)) // times = NULL → 两者皆 UTIME_NOW
+    } else {
+        let buf = match read_guest(proc, times_ptr, 32) {
+            Ok(b) => b,
+            Err(e) => return -(e as i64),
+        };
+        let rd = |off: usize| i64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+        match (parse(rd(0), rd(8)), parse(rd(16), rd(24))) {
+            (Ok(a), Ok(m)) => (a, m),
+            (Err(e), _) | (_, Err(e)) => return -(e as i64),
+        }
+    };
+    match host.set_times(&HostPath(host_path), atime, mtime) {
         Ok(()) => 0,
         Err(e) => -(host_err_to_errno(&e) as i64),
     }

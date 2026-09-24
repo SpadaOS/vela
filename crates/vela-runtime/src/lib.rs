@@ -144,6 +144,16 @@ impl FdTable {
 
 // ---------------------------------------------------------------- 进程
 
+/// mprotect 运行时账本条目（PLAN-0.1.0 T3.2）：成功应用的保护变更，
+/// fork 恢复时按「映像段 + 账本」收敛（0.0.6 只按映像段的诚实近似补全）。
+#[derive(Clone, Copy, Debug)]
+pub struct ProtOverride {
+    pub start: u64,
+    pub len: u64,
+    /// Linux PROT_* 位（bit0=R bit1=W bit2=X）。
+    pub prot: u8,
+}
+
 pub struct GuestProcess {
     pub pid: u32,
     /// 父进程 pid（0.0.6 M1：fork 时由元数据传递；普通启动 = 宿主派生值）。
@@ -166,6 +176,8 @@ pub struct GuestProcess {
     pub cwd: String,
     /// 客户→宿主路径映射表（vela-fs）。默认 legacy：`/mnt/c → C:\`。
     pub fs: vela_fs::FsMap,
+    /// mprotect 运行时账本（T3.2；按应用顺序追加，fork 元数据传递）。
+    pub prot_ledger: Vec<ProtOverride>,
 }
 
 impl GuestProcess {
@@ -192,6 +204,7 @@ impl GuestProcess {
             mem: memreg,
             cwd: "/mnt/c".to_string(),
             fs: vela_fs::FsMap::legacy(),
+            prot_ledger: Vec::new(),
         }
     }
 

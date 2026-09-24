@@ -669,6 +669,18 @@ pub trait HostFileOps: Send + Sync + 'static {
         let _ = (f, readonly);
         Err(HostError::Unimplemented)
     }
+    /// 设置文件时间戳（utimensat 语义，PLAN-0.1.0 T3.5）。
+    /// None = UTIME_OMIT；Some((sec, nsec)) = 绝对时间（可为负 = 纪元前）。
+    /// ctime 无对应，诚实忽略。
+    fn set_times(
+        &self,
+        path: &HostPath,
+        atime: Option<(i64, i64)>,
+        mtime: Option<(i64, i64)>,
+    ) -> Result<(), HostError> {
+        let _ = (path, atime, mtime);
+        Err(HostError::Unimplemented)
+    }
     fn close(&self, f: HostFile) -> Result<(), HostError>;
     fn stdio(&self) -> StdioHandles;
     /// 创建匿名管道（pipe2 语义），返回 (读端, 写端)。0.0.6 M1：
