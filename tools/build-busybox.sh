@@ -51,6 +51,13 @@ test -f include/autoconf.h || { echo "FATAL: include/autoconf.h not generated"; 
 # Makefile.host 单独定义，但宿主工具已构建完成，同样禁用无害）。
 sed -i 's/-Wp,-MD,\$(depfile) //' scripts/Makefile.lib
 sed -i 's|scripts/basic/fixdep|: fixdep-disabled|' scripts/Makefile.build scripts/Kbuild.include
+# T3.1（PLAN-0.1.0）：ash growjobtab 的 NULL 指针算术 UB——首次扩容时
+# jobtab == NULL，`offset = jp - NULL` 非零进入 relocation 块，`NULL + len`
+# 是 C UB；zig cc/LLVM 利用 UB 把该路径标 unreachable 并发射 ud1 陷阱
+# （gcc 不利用此 UB，Linux 构建无恙——CI 现场证据 docs/plans/ash-ud1.md）。
+# 修复：jq == NULL 时无指针可重定位，跳过 relocation 块。
+sed -i 's/^\tif (offset) {/\tif (offset \&\& jq != NULL) {/' shell/ash.c
+grep -q 'if (offset && jq != NULL) {' shell/ash.c || { echo "FATAL: growjobtab NULL guard patch failed"; exit 1; }
 # zig 用 lld：GNU ld 专属链接参数（--sort-section/--sort-common/--warn-common/
 # --verbose）不被支持，trylink 的 check_cc 探测在纯编译阶段无法发现，直接在
 # 源头中和；CI 无 binutils，跳过 strip（未 strip 静态二进制对 vela 无影响）
