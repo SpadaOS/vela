@@ -140,6 +140,10 @@ impl HostTime for LinuxDevHost {
 
 impl HostTls for LinuxDevHost {}
 
+// trap/proc 组：全部走默认 Unimplemented 桩（客户执行仅在 Windows 验收）。
+impl crate::HostTrap for LinuxDevHost {}
+impl crate::HostProc for LinuxDevHost {}
+
 impl Host for LinuxDevHost {
     fn thread_exit(&self, code: i32) -> ! {
         std::process::exit(code)

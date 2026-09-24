@@ -68,7 +68,7 @@ pub(crate) fn open(path: &HostPath, opt: HostOpen) -> Result<HostFile, HostError
     }
     let f = o.open(&path.0).map_err(|e| io_err(&e))?;
     Ok(HostFile(HostFileKind::Disk {
-        file: f,
+        file: crate::DiskFile(f),
         path: path.0.clone(),
     }))
 }
@@ -111,9 +111,9 @@ pub(crate) fn sync_file(f: &HostFile, data_only: bool) -> Result<(), HostError> 
     match &f.0 {
         HostFileKind::Disk { file, .. } => {
             if data_only {
-                file.sync_data().map_err(|e| io_err(&e))
+                file.0.sync_data().map_err(|e| io_err(&e))
             } else {
-                file.sync_all().map_err(|e| io_err(&e))
+                file.0.sync_all().map_err(|e| io_err(&e))
             }
         }
         // stdio 无持久化语义，no-op 成功
@@ -124,9 +124,9 @@ pub(crate) fn sync_file(f: &HostFile, data_only: bool) -> Result<(), HostError> 
 pub(crate) fn dup_file(f: &HostFile) -> Result<HostFile, HostError> {
     match &f.0 {
         HostFileKind::Disk { file, path } => {
-            let nf = file.try_clone().map_err(|e| io_err(&e))?;
+            let nf = file.0.try_clone().map_err(|e| io_err(&e))?;
             Ok(HostFile(HostFileKind::Disk {
-                file: nf,
+                file: crate::DiskFile(nf),
                 path: path.clone(),
             }))
         }
@@ -140,7 +140,7 @@ pub(crate) fn read(f: &HostFile, buf: &mut [u8]) -> Result<usize, HostError> {
     use std::io::Read;
     match &f.0 {
         HostFileKind::StdIn => std::io::stdin().read(buf).map_err(|e| io_err(&e)),
-        HostFileKind::Disk { file, .. } => (&*file).read(buf).map_err(|e| io_err(&e)),
+        HostFileKind::Disk { file, .. } => (&file.0).read(buf).map_err(|e| io_err(&e)),
         HostFileKind::Pipe(e) => e.read(buf),
         _ => Err(HostError::Access),
     }
@@ -157,7 +157,7 @@ pub(crate) fn write(f: &HostFile, buf: &[u8]) -> Result<usize, HostError> {
             .write_all(buf)
             .map(|_| buf.len())
             .map_err(|e| io_err(&e)),
-        HostFileKind::Disk { file, .. } => (&*file)
+        HostFileKind::Disk { file, .. } => (&file.0)
             .write_all(buf)
             .map(|_| buf.len())
             .map_err(|e| io_err(&e)),
@@ -175,7 +175,7 @@ pub(crate) fn seek(f: &HostFile, off: i64, whence: i32) -> Result<u64, HostError
         _ => return Err(HostError::Invalid),
     };
     match &f.0 {
-        HostFileKind::Disk { file, .. } => (&*file).seek(from).map_err(|e| io_err(&e)),
+        HostFileKind::Disk { file, .. } => (&file.0).seek(from).map_err(|e| io_err(&e)),
         _ => Err(HostError::Invalid),
     }
 }
@@ -193,7 +193,7 @@ pub(crate) fn stat_file(f: &HostFile) -> Result<HostStat, HostError> {
         }
         HostFileKind::Pipe(_) => Ok(fifo_stat()),
         HostFileKind::Disk { file, path } => {
-            let md = file.metadata().map_err(|e| io_err(&e))?;
+            let md = file.0.metadata().map_err(|e| io_err(&e))?;
             Ok(host_stat_from(&md, Some(path)))
         }
     }
@@ -218,7 +218,7 @@ pub fn fifo_stat() -> HostStat {
 /// ftruncate 语义：截断/扩展已打开文件（std File::set_len，含 Windows）。
 pub(crate) fn set_len(f: &HostFile, len: u64) -> Result<(), HostError> {
     match &f.0 {
-        HostFileKind::Disk { file, .. } => file.set_len(len).map_err(|e| io_err(&e)),
+        HostFileKind::Disk { file, .. } => file.0.set_len(len).map_err(|e| io_err(&e)),
         _ => Err(HostError::Invalid),
     }
 }
@@ -352,7 +352,10 @@ pub(crate) fn create_pipe() -> Result<(HostFile, HostFile), HostError> {
     {
         let m = std::sync::Arc::new(crate::PipeMem::new());
         Ok((
-            HostFile(HostFileKind::Pipe(PipeEnd(PipeEndInner::Mem(m.clone(), true)))),
+            HostFile(HostFileKind::Pipe(PipeEnd(PipeEndInner::Mem(
+                m.clone(),
+                true,
+            )))),
             HostFile(HostFileKind::Pipe(PipeEnd(PipeEndInner::Mem(m, false)))),
         ))
     }
@@ -430,7 +433,10 @@ impl PipeEnd {
                 if !m.read_open.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err(HostError::Other(32)); // EPIPE
                 }
-                m.buf.lock().unwrap_or_else(|p| p.into_inner()).extend_from_slice(buf);
+                m.buf
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .extend_from_slice(buf);
                 Ok(buf.len())
             }
         }
@@ -537,7 +543,9 @@ pub(crate) fn pipe_handles() -> Result<(isize, isize), HostError> {
     };
     // SAFETY: 输出指针与 SA 均有效；64KiB 缓冲与 Linux 默认一致
     if unsafe { CreatePipe(&mut r, &mut w, &sa, 64 * 1024) } == 0 {
-        return Err(HostError::Other(os_to_errno(unsafe { GetLastError() } as i32)));
+        return Err(HostError::Other(os_to_errno(
+            unsafe { GetLastError() } as i32
+        )));
     }
     const HANDLE_FLAG_INHERIT: u32 = 0x1;
     // SAFETY: 两个句柄均为本函数刚创建的有效句柄

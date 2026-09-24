@@ -143,7 +143,7 @@ impl HostFileOps for MockHost {
             HostFileKind::StdIn => Ok(0), // v0 stdin 先返回 0（规格 5.4）
             HostFileKind::Disk { file, .. } => {
                 use std::io::Read;
-                (&*file)
+                file.as_std_file()
                     .read(buf)
                     .map_err(|e| HostError::Other(e.raw_os_error().unwrap_or(5)))
             }
@@ -170,7 +170,7 @@ impl HostFileOps for MockHost {
                     1 => SeekFrom::Current(off),
                     _ => SeekFrom::End(off),
                 };
-                (&*file)
+                file.as_std_file()
                     .seek(from)
                     .map_err(|e| HostError::Other(e.raw_os_error().unwrap_or(5)))
             }
@@ -236,6 +236,10 @@ impl HostTime for MockHost {
 }
 
 impl HostTls for MockHost {}
+
+// trap/proc：mock 宿主不需要客户执行，默认桩即可
+impl vela_sys::HostTrap for MockHost {}
+impl vela_sys::HostProc for MockHost {}
 
 impl Host for MockHost {
     fn thread_exit(&self, code: i32) -> ! {
@@ -386,7 +390,7 @@ fn mmap_file_readback_matches_content_and_zero_fills_past_eof() {
     file_bytes[4096..].copy_from_slice(&payload);
     std::fs::write(&p, &file_bytes).unwrap();
     let hf = HostFile(HostFileKind::Disk {
-        file: std::fs::File::open(&p).unwrap(),
+        file: vela_sys::DiskFile::new(std::fs::File::open(&p).unwrap()),
         path: p,
     });
     let fd = proc.fds.alloc_fd(GuestFd::Host(hf));
@@ -434,7 +438,7 @@ fn mmap_file_fixed_inside_reservation_carves_readback() {
     let p = dir.join("seg.bin");
     std::fs::write(&p, &payload).unwrap();
     let hf = HostFile(HostFileKind::Disk {
-        file: std::fs::File::open(&p).unwrap(),
+        file: vela_sys::DiskFile::new(std::fs::File::open(&p).unwrap()),
         path: p,
     });
     let fd = proc.fds.alloc_fd(GuestFd::Host(hf));
@@ -483,7 +487,7 @@ fn mmap_file_view_registers_and_unmaps_via_view_primitive() {
     let p = dir.join("lib.bin");
     std::fs::write(&p, vec![0x5A; 0x10000]).unwrap();
     let hf = HostFile(HostFileKind::Disk {
-        file: std::fs::File::open(&p).unwrap(),
+        file: vela_sys::DiskFile::new(std::fs::File::open(&p).unwrap()),
         path: p,
     });
     let fd = proc.fds.alloc_fd(GuestFd::Host(hf));

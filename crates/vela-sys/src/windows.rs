@@ -8,8 +8,9 @@ use std::time::Instant;
 
 use crate::file_ops;
 use crate::{
-    Host, HostDir, HostError, HostFile, HostFileKind, HostFileOps, HostMem, HostOpen, HostPath,
-    HostProt, HostStat, HostTime, HostTls, StdioHandles,
+    GuestRegs, Host, HostDir, HostError, HostFile, HostFileKind, HostFileOps, HostMem, HostOpen,
+    HostPath, HostProc, HostProt, HostStat, HostTime, HostTls, HostTrap, PipeEnd, StdioHandles,
+    TrapFn, TrapFrame,
 };
 
 // ---------------------------------------------------------------- Win32 FFI
@@ -137,6 +138,12 @@ pub struct Context {
     pub tail: [u8; 0x4D0 - 0x100],
 }
 
+// GuestRegs 与 CONTEXT 的 RAX..RIP 连续段零拷贝重解释的前提（T1.1）。
+const _: () = assert!(std::mem::offset_of!(Context, rax) == 0x78);
+const _: () = assert!(std::mem::offset_of!(Context, rip) == 0xF8);
+const _: () = assert!(std::mem::offset_of!(Context, e_flags) == 0x44);
+const _: () = assert!(std::mem::size_of::<GuestRegs>() == 0x88); // 17×u64（含 rip）
+
 #[repr(C)]
 pub struct ExceptionRecord {
     pub exception_code: u32,
@@ -156,43 +163,12 @@ pub struct ExceptionPointers {
 
 // ---------------------------------------------------------------- VEH 陷阱
 
-/// VEH 回调注入的业务函数：nr、args、rip、可变 CONTEXT → syscall 返回值。
-/// 回调负责写回 Rax、模拟 syscall 副作用（Rip+=2、Rcx、R11），
-/// 需要改变控制流（如 FS trampoline）时可直接改写 ctx.rip。
-pub type TrapFn =
-    unsafe extern "system" fn(nr: u64, args: &[u64; 6], rip: u64, ctx: &mut Context) -> i64;
-
 const MAX_GUEST_RANGES: usize = 32;
 /// start==0 视为空槽（客户基址来自 VirtualAlloc，永远非 0）。
 static RANGE_START: [AtomicU64; MAX_GUEST_RANGES] = [const { AtomicU64::new(0) }; MAX_GUEST_RANGES];
 static RANGE_END: [AtomicU64; MAX_GUEST_RANGES] = [const { AtomicU64::new(0) }; MAX_GUEST_RANGES];
 static TRAP_FN: AtomicUsize = AtomicUsize::new(0);
 static INSTALLED: AtomicU32 = AtomicU32::new(0);
-
-/// 登记 VEH 需要识别的客户可执行地址范围（Rip 过滤用）。
-pub fn add_guest_exec_range(start: u64, end: u64) {
-    for (s, e) in RANGE_START.iter().zip(RANGE_END.iter()) {
-        if s.load(Ordering::Relaxed) == 0 {
-            s.store(start, Ordering::Relaxed);
-            e.store(end, Ordering::Relaxed);
-            return;
-        }
-    }
-    // 静态容量是刻意的（VEH 上下文不适合动态分配/加锁）；超限必须可见，
-    // 否则超出段的 syscall 会被静默当成真实非法指令放过
-    eprintln!("[vela] warn: exec range table full ({MAX_GUEST_RANGES}), range {start:#x}-{end:#x} NOT registered");
-}
-
-/// 清空全部客户可执行范围（execve 重载前调用：旧映像即将卸载，
-/// 范围表是静态槽位，VEH 与本线程同步执行故可安全重置）。
-pub fn clear_guest_exec_ranges() {
-    for s in RANGE_START.iter() {
-        s.store(0, Ordering::Relaxed);
-    }
-    for e in RANGE_END.iter() {
-        e.store(0, Ordering::Relaxed);
-    }
-}
 
 /// 用新范围集合整体替换已登记范围（PLAN-0.0.5 T1.1：execve 原地重注册）。
 /// 前缀覆盖 + 尾部清零，无分配无递归；超过 MAX_GUEST_RANGES 响亮警告。
@@ -216,13 +192,9 @@ pub fn replace_guest_exec_ranges(ranges: &[(u64, u64)]) {
     }
 }
 
-/// 注册 syscall dispatch 回调。
-pub fn set_trap_fn(f: TrapFn) {
+/// 注册 syscall dispatch 回调并安装 VEH（HostTrap::install_trap 的实现体）。
+fn install_trap_impl(f: TrapFn) -> Result<(), HostError> {
     TRAP_FN.store(f as usize, Ordering::Relaxed);
-}
-
-/// 安装 VEH。重复调用幂等。
-pub fn install_syscall_trap() -> Result<(), HostError> {
     if INSTALLED.swap(1, Ordering::SeqCst) == 1 {
         return Ok(());
     }
@@ -277,9 +249,12 @@ unsafe extern "system" fn veh_handler(ep: *mut ExceptionPointers) -> i32 {
             // SAFETY: rip 在客户映射内（已确认），读 16 字节仅用于诊断
             let bytes = unsafe { std::slice::from_raw_parts(ctx.rip as *const u8, 16) };
             let hb: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
-            // fs 段前缀（0x64）开头的 AV，且本机不支持 FSGSBASE：几乎必然是
-            // 客户 TLS 访问（fs 基址未能切换），给出明确原因而不是裸崩溃
-            let fs_hint = if !fs_base_supported() && bytes.first() == Some(&0x64) {
+            // fs 段前缀（0x64，可被冗余 66 前缀垫开）开头的 AV，且本机不支持
+            // FSGSBASE：几乎必然是客户 TLS 访问（fs 基址未能切换），给出明确
+            // 原因而不是裸崩溃
+            let skip66 = bytes.iter().take_while(|&&b| b == 0x66).count();
+            let fs_prefixed = bytes.get(skip66).map(|&b| b == 0x64).unwrap_or(false);
+            let fs_hint = if !fs_base_supported() && fs_prefixed {
                 " [hint: FSGSBASE unavailable - guest TLS (fs) cannot be switched; TLS-dependent programs cannot run here]"
             } else {
                 ""
@@ -319,7 +294,8 @@ unsafe extern "system" fn veh_handler(ep: *mut ExceptionPointers) -> i32 {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     // SAFETY: 同上
-    let ctx = unsafe { &mut *ep.context_record };
+    let ctx_ptr = ep.context_record;
+    let ctx = unsafe { &mut *ctx_ptr };
     let rip = ctx.rip as usize;
     // FS commit stub：预切后的 ud2+ret，直接跳过 ud2 让 ret 返回调用者。
     // 必须在 guest range 过滤之前判断（stub 位于 vela.exe 自身代码段）。
@@ -373,8 +349,17 @@ unsafe extern "system" fn veh_handler(ep: *mut ExceptionPointers) -> i32 {
     let nr = ctx.rax;
     // Linux syscall 约定：第 4 参在 R10 而非 RCX（规格 5.3）
     let args = [ctx.rdi, ctx.rsi, ctx.rdx, ctx.r10, ctx.r8, ctx.r9];
+    // 寄存器视图：GuestRegs 零拷贝重解释 CONTEXT 的 RAX..RIP 连续段
+    // （布局断言锁定）；回调对 regs 的写回直接落入 CONTEXT。
+    // SAFETY: ctx 指向内核提供的有效 CONTEXT，回调期间有效；GuestRegs
+    // 布局与该连续段一致（上方 const 断言）。regs（&mut）与 opaque（&）
+    // 指向同一 CONTEXT 是刻意的双视图：寄存器段独占写、全量字节独占读，
+    // 二者生命周期均限于本回调，无并发访问者。
+    let regs = unsafe { &mut *(std::ptr::addr_of_mut!((*ctx_ptr).rax) as *mut GuestRegs) };
+    let e_flags = ctx.e_flags as u64;
+    let mut frame = TrapFrame::new(regs, e_flags, ctx_ptr as *const u8, 0x4D0);
     // SAFETY: 回调由 CLI 注册，内部仅操作客户进程状态与异常上下文
-    let _ret = unsafe { tf(nr, &args, rip as u64, ctx) };
+    let _ret = unsafe { tf(nr, &args, &mut frame) };
     // syscall 模拟（rax/rcx/r11/rip 推进）与控制流改写均由回调完成
     EXCEPTION_CONTINUE_EXECUTION
 }
@@ -427,12 +412,18 @@ struct FsMov {
     disp: i64,
 }
 
-/// 解码 `64 [REX] 8b/89 modrm [sib] [disp]`。不认识/非内存形态返回 None。
+/// 解码 `[66]* 64 [REX] 8b/89 modrm [sib] [disp]`。不认识/非内存形态返回 None。
+/// 0x66 前缀容忍：musl 汇编常用冗余 66 做对齐填充（实测 file-io 的 getcwd
+/// 路径 `66 66 66 64 48 8b …`）——有 REX.W 时操作数仍为 64 位，语义不变。
 fn decode_fs_mov(b: &[u8]) -> Option<FsMov> {
-    if b.first() != Some(&0x64) {
+    let mut i = 0;
+    while i < b.len() && b[i] == 0x66 {
+        i += 1;
+    }
+    if i >= b.len() || b[i] != 0x64 {
         return None;
     }
-    let mut i = 1;
+    i += 1;
     let mut rex = 0u8;
     if i < b.len() && b[i] & 0xF0 == 0x40 {
         rex = b[i];
@@ -938,7 +929,7 @@ impl HostMem for WindowsHost {
         // SAFETY: file 为有效打开的宿主文件句柄；其余参数均为文档允许的取值
         let handle = unsafe {
             CreateFileMappingW(
-                file.as_raw_handle(),
+                file.0.as_raw_handle(),
                 std::ptr::null_mut(),
                 map_prot,
                 0,
@@ -1092,6 +1083,157 @@ impl Host for WindowsHost {
     fn process_exit(&self, code: i32) -> ! {
         std::process::exit(code)
     }
+}
+
+// ---------------------------------------------------------------- HostTrap / HostProc（0.1.0 T1.1/T1.2）
+
+impl HostTrap for WindowsHost {
+    fn install_trap(&self, f: TrapFn) -> Result<(), HostError> {
+        install_trap_impl(f)
+    }
+
+    fn replace_exec_ranges(&self, ranges: &[(u64, u64)]) {
+        replace_guest_exec_ranges(ranges);
+    }
+
+    unsafe fn enter_guest(&self, entry: u64, rsp: u64) -> ! {
+        // SAFETY: entry/rsp 由调用方保证来自已映射登记的客户映像；不返回
+        unsafe { vela_enter_guest(entry, rsp) }
+    }
+
+    fn fs_base_supported(&self) -> bool {
+        fs_base_supported()
+    }
+    fn preset_fs_base(&self, v: u64) -> Result<(), HostError> {
+        set_thread_fs_base_now(v)
+    }
+    fn commit_fs_base(&self) {
+        commit_fs_base_after_preset();
+    }
+    fn read_fs_base(&self) -> Option<u64> {
+        read_fs_base()
+    }
+    fn fs_trampoline_addr(&self) -> usize {
+        set_fs_stub_addr()
+    }
+    fn enable_soft_tls(&self) {
+        enable_soft_tls();
+    }
+    fn set_soft_tls_base(&self, v: u64) {
+        set_soft_tls_base(v);
+    }
+    fn soft_tls_stub_hit(&self) -> bool {
+        stub_hit()
+    }
+}
+
+impl HostProc for WindowsHost {
+    fn shared_section(&self, size: u64) -> Result<isize, HostError> {
+        create_shared_section(size)
+    }
+    unsafe fn map_section_anywhere(&self, sec: isize) -> Result<usize, HostError> {
+        // SAFETY: sec 为 create_shared_section 返回的有效 section
+        map_section_anywhere(sec, 0)
+    }
+    unsafe fn map_section_at(&self, sec: isize, base: u64) -> Result<usize, HostError> {
+        // SAFETY: sec 有效；base 为空闲地址（调用方保证）
+        map_section_at(sec, base, 0)
+    }
+    fn unmap_section_view(&self, addr: usize) -> Result<(), HostError> {
+        unmap_section_view(addr)
+    }
+    fn set_inherit(&self, handle: isize) -> Result<(), HostError> {
+        set_handle_inherit(handle)
+    }
+    fn spawn_self(&self, cmdline: &str) -> Result<(u32, isize), HostError> {
+        let c = create_child_process(cmdline)?;
+        Ok((c.pid, c.handle))
+    }
+    fn wait(&self, proc: isize, timeout_ms: u32) -> Result<Option<u32>, HostError> {
+        wait_child(proc, timeout_ms)
+    }
+    fn kill(&self, proc: isize, code: u32) -> Result<(), HostError> {
+        terminate_child(proc, code)
+    }
+    fn open_process(&self, pid: u32) -> Result<isize, HostError> {
+        open_process_handle(pid)
+    }
+    fn close_handle(&self, handle: isize) {
+        close_handle(handle);
+    }
+    fn create_inherit_pipe(&self) -> Result<(isize, isize), HostError> {
+        create_inherit_pipe()
+    }
+    fn pipe_write_all(&self, h: isize, data: &[u8]) -> Result<(), HostError> {
+        pipe_write_all(h, data)
+    }
+    fn pipe_read_exact(&self, h: isize, buf: &mut [u8]) -> Result<(), HostError> {
+        pipe_read_exact(h, buf)
+    }
+    fn pipe_end_from_raw(&self, h: isize, is_read: bool) -> PipeEnd {
+        pipe_from_raw_handle(h, is_read)
+    }
+    fn fork_child_context(&self, frame: &TrapFrame) -> Vec<u8> {
+        // 父 CONTEXT 全量快照（含 XSAVE：子进程必须继承浮点/向量现场）
+        let mut b = frame.opaque_bytes().to_vec();
+        assert_eq!(b.len(), 0x4D0, "CONTEXT snapshot size");
+        // 模拟 syscall 副作用：Rax=0（子返回值）、Rip/Rcx=返回地址、R11=RFLAGS
+        let ret = frame.regs.rip + 2;
+        b[0xF8..0x100].copy_from_slice(&ret.to_le_bytes()); // rip
+        b[0x78..0x80].copy_from_slice(&0u64.to_le_bytes()); // rax
+        b[0x80..0x88].copy_from_slice(&ret.to_le_bytes()); // rcx
+        b[0xD0..0xD8].copy_from_slice(&frame.e_flags.to_le_bytes()); // r11
+                                                                     // context_flags = CONTEXT_ALL（0x10003F）：VEH 的 flags 带异常请求位，
+                                                                     // NtContinue 按位恢复——必须显式要求全量（Control|Integer|Segments|
+                                                                     // FloatingPoint|DebugRegisters | CONTEXT_AMD64），否则 NtContinue 返回。
+        b[0x30..0x34].copy_from_slice(&0x0010_003Fu32.to_le_bytes());
+        b
+    }
+    unsafe fn resume_child(&self, ctx: &[u8]) -> ! {
+        // SAFETY: ctx 来自 fork_child_context（0x4D0 完整 CONTEXT）；
+        // 客户栈/代码/堆已按快照恢复并登记（调用方保证）
+        unsafe { continue_with_bytes(ctx) }
+    }
+}
+
+/// 注入完整 CONTEXT 后进入客户（fork 子进程恢复现场；不返回）。
+/// 字节接口（HostProc::resume_child 的实现体）：0x4D0 完整 CONTEXT，
+/// 16 字节对齐由栈上副本保证（NtContinue 的 XSAVE 域要求）。
+unsafe fn continue_with_bytes(bytes: &[u8]) -> ! {
+    assert_eq!(bytes.len(), 0x4D0, "fork child CONTEXT size");
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtContinue(ctx: *mut Context, alert: i32) -> i32;
+    }
+    let mut aligned: Context = unsafe { std::mem::zeroed() };
+    // SAFETY: 同类型字节拷贝；对齐由 aligned 自身的 repr(C, align(16)) 保证。
+    // 元数据字节缓冲无对齐保证，不能直接重解释——先落到对齐副本再交给内核。
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            &mut aligned as *mut Context as *mut u8,
+            0x4D0,
+        );
+        NtContinue(&mut aligned as *mut Context, 0)
+    };
+    unreachable!("NtContinue returned")
+}
+
+// Win64 ABI：参数在 rcx(entry)/rdx(rsp)。Vela 自身汇编边界用 Win64；客户内部用 SysV（规格 6）。
+// （0.1.0 T1.1 自 CLI guest_start.rs 迁入：切入客户属于 HostTrap 契约。）
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    ".globl vela_enter_guest",
+    "vela_enter_guest:",
+    "    mov rsp, rdx",
+    "    xor ebp, ebp",
+    "    xor ebx, ebx",
+    "    jmp rcx",
+);
+
+#[cfg(target_arch = "x86_64")]
+extern "C" {
+    fn vela_enter_guest(entry: u64, rsp: u64) -> !;
 }
 
 // ---------------------------------------------------------------- 进程与跨进程内存（0.0.6 M1：用户态 fork）
@@ -1345,20 +1487,6 @@ pub fn pipe_read_exact(h: isize, buf: &mut [u8]) -> Result<(), HostError> {
     Ok(())
 }
 
-/// 注入完整 CONTEXT 后进入客户（fork 子进程恢复现场；不返回）。
-///
-/// # Safety
-/// ctx 必须指向已映射且登记的客户栈/代码（快照恢复完成后调用）。
-pub unsafe fn continue_with(ctx: &Context) -> ! {
-    #[link(name = "ntdll")]
-    extern "system" {
-        fn NtContinue(ctx: *mut Context, alert: i32) -> i32;
-    }
-    // SAFETY: ctx 全量恢复（调用方保证现场有效）；本调用不返回
-    unsafe { NtContinue(ctx as *const Context as *mut Context, 0) };
-    unreachable!("NtContinue returned")
-}
-
 #[link(name = "kernel32")]
 extern "system" {
     fn CreateProcessW(
@@ -1509,6 +1637,16 @@ mod soft_tls_table_tests {
         (&[0x64, 0x48, 0x8b, 0x44, 0x24, 0x08], 6, 0, false, 8),
         // mov rax, fs:[r12*4+0x40]（mod=01 SIB 变址 r12、无基址 → disp8+idx）
         (&[0x64, 0x48, 0x8b, 0x44, 0xa5, 0x40], 6, 0, false, 0x40),
+        // 冗余 66 前缀填充 + fs（file-io 实测 getcwd 路径）
+        (
+            &[
+                0x66, 0x66, 0x66, 0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00,
+            ],
+            12,
+            0,
+            false,
+            0,
+        ),
     ];
 
     /// 写形态：mov fs:[mem], reg

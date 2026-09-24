@@ -14,17 +14,13 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::os::windows::io::FromRawHandle;
 
 use vela_abi as abi;
 use vela_runtime::mem::{InterpImage, LoadedImage, MemKind, MemRange, Segment};
 use vela_runtime::{FdTable, GuestFd, GuestProcess};
-use vela_sys::windows::{
-    close_handle, continue_with, create_child_process, create_inherit_pipe, create_shared_section,
-    current_pid, map_section_anywhere, map_section_at, open_process_handle, pipe_from_raw_handle,
-    pipe_read_exact, pipe_write_all, set_handle_inherit, terminate_child, wait_child, Context,
+use vela_sys::{
+    HostDir, HostFile, HostFileKind, HostFileOps, HostMem, HostProc, HostProt, TrapFrame,
 };
-use vela_sys::{HostDir, HostFile, HostFileKind, HostFileOps, HostMem, HostProt};
 
 use crate::GuestState;
 
@@ -399,31 +395,26 @@ fn ser_fds(st: &GuestState) -> Result<Vec<FdEntrySer>, i64> {
     let mut out = Vec::new();
     for (fd, gf) in st.proc.fds.iter() {
         let kind = match gf {
-            GuestFd::Host(HostFile(HostFileKind::Disk { path, file })) => {
-                use std::os::windows::io::AsRawHandle;
-                let h = file.as_raw_handle() as isize;
+            GuestFd::Host(f) if matches!(f.0, HostFileKind::Disk { .. }) => {
                 // Disk 句柄默认不可继承——fork 传递前显式打开继承标志
-                set_handle_inherit(h).map_err(|_| eio)?;
+                let h = f.raw_handle().ok_or(eio)?;
+                st.host.set_inherit(h).map_err(|_| eio)?;
                 FdSer::Disk {
-                    path: path.to_string_lossy().into_owned(),
+                    path: f.disk_path().ok_or(eio)?.to_string_lossy().into_owned(),
                     handle: h,
                 }
             }
-            GuestFd::Host(HostFile(HostFileKind::StdIn)) => FdSer::StdIn,
-            GuestFd::Host(HostFile(HostFileKind::StdOut)) => FdSer::StdOut,
-            GuestFd::Host(HostFile(HostFileKind::StdErr)) => FdSer::StdErr,
-            GuestFd::Host(_) => continue, // 未知宿主形态：不继承（诚实缺失）
-            GuestFd::PipeRead(f) => match f {
-                HostFile(HostFileKind::Pipe(e)) => FdSer::PipeRead {
-                    handle: e.raw_handle().ok_or(eio)?,
-                },
-                _ => continue,
+            GuestFd::Host(f) => match f.0 {
+                HostFileKind::StdIn => FdSer::StdIn,
+                HostFileKind::StdOut => FdSer::StdOut,
+                HostFileKind::StdErr => FdSer::StdErr,
+                _ => continue, // 未知宿主形态：不继承（诚实缺失）
             },
-            GuestFd::PipeWrite(f) => match f {
-                HostFile(HostFileKind::Pipe(e)) => FdSer::PipeWrite {
-                    handle: e.raw_handle().ok_or(eio)?,
-                },
-                _ => continue,
+            GuestFd::PipeRead(f) => FdSer::PipeRead {
+                handle: f.raw_handle().ok_or(eio)?,
+            },
+            GuestFd::PipeWrite(f) => FdSer::PipeWrite {
+                handle: f.raw_handle().ok_or(eio)?,
             },
             GuestFd::HostDir(d) => FdSer::HostDir {
                 path: d.host_path().to_string_lossy().into_owned(),
@@ -482,8 +473,8 @@ fn ser_img(l: &LoadedImage) -> LoadSer {
 }
 
 /// fork(2)（CLI trap 层拦截 SYS_CLONE 的 SIGCHLD 形态）。
-/// 返回子进程 pid（写入 ctx.rax 由 trap 返回路径完成）。
-pub fn do_fork(st: &mut GuestState, args: &[u64; 6], ctx: &mut Context) -> Result<u32, i64> {
+/// 返回子进程 pid（写入 regs.rax 由 trap 返回路径完成）。
+pub fn do_fork(st: &mut GuestState, args: &[u64; 6], frame: &mut TrapFrame) -> Result<u32, i64> {
     let _ = args;
     let eio = -(vela_abi::EIO as i64);
     // 诊断：fork 每步失败点（临时；发版前降为 -v 日志）
@@ -497,14 +488,15 @@ pub fn do_fork(st: &mut GuestState, args: &[u64; 6], ctx: &mut Context) -> Resul
     // 1. 按登记区间创建 section 并拷贝客户内存（父此刻独占客户线程）
     let mut range_sers: Vec<RangeSer> = Vec::new();
     for r in st.proc.mem.ranges.values().copied().collect::<Vec<_>>() {
-        let sec = match create_shared_section(r.len) {
+        let sec = match st.host.shared_section(r.len) {
             Ok(s) => s,
             Err(e) => bail!("create_section", e),
         };
-        if let Err(e) = set_handle_inherit(sec) {
+        if let Err(e) = st.host.set_inherit(sec) {
             bail!("inherit(section)", e);
         }
-        let view = match map_section_anywhere(sec, r.len) {
+        // SAFETY: view 为本进程刚映射的可写视图；客户区间已登记可读
+        let view = match unsafe { st.host.map_section_anywhere(sec) } {
             Ok(v) => v,
             Err(e) => bail!("map_section_anywhere", e),
         };
@@ -512,7 +504,7 @@ pub fn do_fork(st: &mut GuestState, args: &[u64; 6], ctx: &mut Context) -> Resul
         unsafe {
             std::ptr::copy_nonoverlapping(r.start as *const u8, view as *mut u8, r.len as usize);
         }
-        let _ = vela_sys::windows::unmap_section_view(view);
+        let _ = st.host.unmap_section_view(view);
         range_sers.push(RangeSer {
             start: r.start,
             len: r.len,
@@ -521,24 +513,12 @@ pub fn do_fork(st: &mut GuestState, args: &[u64; 6], ctx: &mut Context) -> Resul
         });
     }
 
-    // 2. 元数据：CONTEXT 改写为「clone 已返回 0」形态（Rip 越过 UD2）
-    let mut ctx_bytes = vec![0u8; 0x4D0];
-    // SAFETY: ctx 为 VEH 提供的完整 CONTEXT（0x4D0）
-    ctx_bytes.copy_from_slice(unsafe {
-        std::slice::from_raw_parts(ctx as *const Context as *const u8, 0x4D0)
-    });
-    // 模拟 syscall 副作用：Rax=0（子返回值）、Rip/Rcx=返回地址、R11=RFLAGS
-    ctx_bytes[0xF8..0x100].copy_from_slice(&(ctx.rip + 2).to_le_bytes()); // rip
-    ctx_bytes[0x78..0x80].copy_from_slice(&0u64.to_le_bytes()); // rax
-    ctx_bytes[0x80..0x88].copy_from_slice(&(ctx.rip + 2).to_le_bytes()); // rcx
-    ctx_bytes[0xC8..0xD0].copy_from_slice(&(ctx.e_flags as u64).to_le_bytes()); // r11
-                                                                                // context_flags = CONTEXT_ALL（0x10003F）：VEH 的 flags 带异常请求位，
-                                                                                // NtContinue 按位恢复——必须显式要求全量（Control|Integer|Segments|
-                                                                                // FloatingPoint|DebugRegisters | CONTEXT_AMD64），否则 NtContinue 返回。
-    ctx_bytes[0x30..0x34].copy_from_slice(&0x0010_003Fu32.to_le_bytes());
+    // 2. 元数据：子 CONTEXT = 父快照（宿主完整上下文，含 XSAVE）改写为
+    //    「clone 已返回 0」形态——CONTEXT 布局与 flags 细节由宿主封装（T1.2）
+    let ctx_bytes = st.host.fork_child_context(frame);
 
     let meta = Meta {
-        ppid: current_pid(),
+        ppid: st.host.current_pid(),
         uid: st.proc.uid,
         gid: st.proc.gid,
         fs_base: st.proc.fs_base,
@@ -558,19 +538,19 @@ pub fn do_fork(st: &mut GuestState, args: &[u64; 6], ctx: &mut Context) -> Resul
     let payload = encode(&meta);
 
     // 3. 元数据管道（inheritable）+ 长度帧
-    let (wmeta, rmeta) = match create_inherit_pipe() {
+    let (wmeta, rmeta) = match st.host.create_inherit_pipe() {
         Ok(x) => x,
         Err(e) => bail!("create_inherit_pipe", e),
     };
-    if let Err(e) = set_handle_inherit(wmeta) {
+    if let Err(e) = st.host.set_inherit(wmeta) {
         bail!("inherit(wmeta)", e);
     }
-    if let Err(e) = set_handle_inherit(rmeta) {
+    if let Err(e) = st.host.set_inherit(rmeta) {
         bail!("inherit(rmeta)", e);
     }
-    let mut frame = Vec::with_capacity(8 + payload.len());
-    frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-    frame.extend_from_slice(&payload);
+    let mut frame_meta = Vec::with_capacity(8 + payload.len());
+    frame_meta.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    frame_meta.extend_from_slice(&payload);
 
     // 4. spawn vela 自身：完整透传父命令行 + --internal-fork <读端句柄>
     let mut cmd = match std::env::current_exe() {
@@ -586,23 +566,23 @@ pub fn do_fork(st: &mut GuestState, args: &[u64; 6], ctx: &mut Context) -> Resul
     // 子进程内 stdio/stderr 继承；元数据写与 spawn 的次序说明：管道缓冲
     //（64KiB）足够容纳元数据（映像内容在 section，不在元数据），先写后
     // spawn 不会阻塞。
-    if let Err(e) = pipe_write_all(wmeta, &frame) {
+    if let Err(e) = st.host.pipe_write_all(wmeta, &frame_meta) {
         bail!("pipe_write_all", e);
     }
-    let child = match create_child_process(&cmd) {
+    let (child_pid, child_handle) = match st.host.spawn_self(&cmd) {
         Ok(c) => c,
         Err(e) => bail!("create_child_process", e),
     };
     // 写端关闭后子进程读到 EOF；读端句柄归子进程，父侧关闭
-    close_handle(wmeta);
-    close_handle(rmeta);
+    st.host.close_handle(wmeta);
+    st.host.close_handle(rmeta);
     for r in &meta.ranges {
-        close_handle(r.sec);
+        st.host.close_handle(r.sec);
     }
 
     // 5. 记入子进程表（wait4/kill 用），返回子 pid
-    st.children.borrow_mut().insert(child.pid, child.handle);
-    Ok(child.pid)
+    st.children.borrow_mut().insert(child_pid, child_handle);
+    Ok(child_pid)
 }
 
 // ---------------------------------------------------------------- 子侧
@@ -612,20 +592,21 @@ pub fn do_fork(st: &mut GuestState, args: &[u64; 6], ctx: &mut Context) -> Resul
 pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
     #[cfg(windows)]
     {
+        use vela_sys::HostTrap;
         let host = crate::PlatformHost::new();
         vela_sys::windows::set_console_utf8();
 
         // 1. 读元数据（长度帧 + payload）
         let mut lenb = [0u8; 8];
-        if pipe_read_exact(meta_handle, &mut lenb).is_err() {
+        if host.pipe_read_exact(meta_handle, &mut lenb).is_err() {
             return 1;
         }
         let len = u64::from_le_bytes(lenb) as usize;
         let mut payload = vec![0u8; len];
-        if pipe_read_exact(meta_handle, &mut payload).is_err() {
+        if host.pipe_read_exact(meta_handle, &mut payload).is_err() {
             return 1;
         }
-        close_handle(meta_handle);
+        host.close_handle(meta_handle);
         let meta = match decode(&payload) {
             Ok(m) => m,
             Err(_) => return 1,
@@ -640,7 +621,7 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
                 MemKind::Reserve
             };
             // SAFETY: base 在本进程为空闲地址；section 由父继承
-            if map_section_at(r.sec, r.start, r.len).is_err() {
+            if unsafe { host.map_section_at(r.sec, r.start) }.is_err() {
                 return 1;
             }
             let range = if kind == MemKind::FileView {
@@ -687,7 +668,7 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
         }
 
         // 4. 组装 GuestProcess（pid = 真实 Windows pid；ppid 来自父）
-        let mut proc = GuestProcess::new(current_pid(), load);
+        let mut proc = GuestProcess::new(host.current_pid(), load);
         proc.ppid = meta.ppid;
         proc.uid = meta.uid;
         proc.gid = meta.gid;
@@ -713,17 +694,17 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
                         _ => GuestFd::Host(s.stderr),
                     }
                 }
-                FdSer::Disk { path, handle } => GuestFd::Host(HostFile(HostFileKind::Disk {
-                    file: unsafe {
-                        std::fs::File::from_raw_handle(*handle as std::os::windows::io::RawHandle)
-                    },
-                    path: std::path::PathBuf::from(path),
-                })),
+                FdSer::Disk { path, handle } => {
+                    // SAFETY: handle 为父进程继承而来的有效文件句柄
+                    GuestFd::Host(unsafe {
+                        HostFile::disk_from_raw_handle(*handle, std::path::PathBuf::from(path))
+                    })
+                }
                 FdSer::PipeRead { handle } => GuestFd::PipeRead(HostFile(HostFileKind::Pipe(
-                    pipe_from_raw_handle(*handle, true),
+                    host.pipe_end_from_raw(*handle, true),
                 ))),
                 FdSer::PipeWrite { handle } => GuestFd::PipeWrite(HostFile(HostFileKind::Pipe(
-                    pipe_from_raw_handle(*handle, false),
+                    host.pipe_end_from_raw(*handle, false),
                 ))),
                 FdSer::HostDir { path, entries } => GuestFd::HostDir(HostDir::from_parts(
                     std::path::PathBuf::from(path),
@@ -784,33 +765,32 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
         });
         let ptr = Box::into_raw(state);
         crate::GUEST.store(ptr, std::sync::atomic::Ordering::Relaxed);
-        let mut exec_ranges = unsafe { &*ptr }.proc.load.exec_ranges.clone();
-        if let Some(i) = &unsafe { &*ptr }.proc.load.interp {
+        let st = unsafe { &*ptr };
+        let mut exec_ranges = st.proc.load.exec_ranges.clone();
+        if let Some(i) = &st.proc.load.interp {
             exec_ranges.extend(i.exec_ranges.iter().copied());
         }
-        vela_sys::windows::replace_guest_exec_ranges(&exec_ranges);
-        vela_sys::windows::set_trap_fn(crate::trap);
-        if vela_sys::windows::install_syscall_trap().is_err() {
+        st.host.replace_exec_ranges(&exec_ranges);
+        if st.host.install_trap(crate::trap).is_err() {
             return 1;
         }
         if meta.soft_tls {
-            vela_sys::windows::enable_soft_tls();
+            st.host.enable_soft_tls();
             if meta.fs_base != 0 {
-                vela_sys::windows::set_soft_tls_base(meta.fs_base);
+                st.host.set_soft_tls_base(meta.fs_base);
             }
-        } else if vela_sys::windows::fs_base_supported() && meta.fs_base != 0 {
+        } else if st.host.fs_base_supported() && meta.fs_base != 0 {
             // 真实 TLS 基址一次到位；commit 强制内核按此值重建保存状态
-            let _ = vela_sys::windows::set_thread_fs_base_now(meta.fs_base);
-            vela_sys::windows::commit_fs_base_after_preset();
+            let _ = st.host.preset_fs_base(meta.fs_base);
+            st.host.commit_fs_base();
         }
 
         // 9. 注入 CONTEXT 从 fork 返回点继续（rax=0 = 子返回值）
         if meta.ctx.len() != 0x4D0 {
             return 1;
         }
-        let ctx: Context = unsafe { std::ptr::read_unaligned(meta.ctx.as_ptr() as *const Context) };
         // SAFETY: 客户栈/代码/堆均已恢复到原地址且登记
-        unsafe { continue_with(&ctx) }
+        unsafe { st.host.resume_child(&meta.ctx) }
     }
     #[cfg(not(windows))]
     {
@@ -847,7 +827,7 @@ pub fn do_wait4(st: &mut GuestState, args: &[u64; 6]) -> i64 {
 
     const INFINITE: u32 = 0xFFFF_FFFF;
     let timeout = if opts & WNOHANG != 0 { 0 } else { INFINITE };
-    let code = match wait_child(handle, timeout) {
+    let code = match st.host.wait(handle, timeout) {
         Ok(Some(c)) => c,
         Ok(None) => return 0, // WNOHANG 无子退出 → 返回 0
         Err(_) => return -(abi::ECHILD as i64),
@@ -870,7 +850,7 @@ pub fn do_wait4(st: &mut GuestState, args: &[u64; 6]) -> i64 {
         let _ = vela_runtime::write_guest(&st.proc, rusage, &[0u8; 144]);
     }
     st.children.borrow_mut().remove(&child);
-    close_handle(handle);
+    st.host.close_handle(handle);
     child as i64
 }
 
@@ -887,9 +867,9 @@ pub fn do_kill(st: &mut GuestState, pid: u64, sig: u64) -> i64 {
         if st.children.borrow().contains_key(&pid) {
             return 0;
         }
-        return match open_process_handle(pid) {
+        return match st.host.open_process(pid) {
             Ok(h) => {
-                close_handle(h);
+                st.host.close_handle(h);
                 0
             }
             Err(vela_sys::HostError::NotFound) => -(abi::ESRCH as i64),
@@ -903,14 +883,14 @@ pub fn do_kill(st: &mut GuestState, pid: u64, sig: u64) -> i64 {
     // 优先子进程表（常驻句柄）；否则按 pid 打开
     let h = match st.children.borrow().get(&pid) {
         Some(h) => Some(*h),
-        None => open_process_handle(pid).ok(),
+        None => st.host.open_process(pid).ok(),
     };
     match h {
         Some(h) => {
-            let r = terminate_child(h, 128 + sig as u32);
+            let r = st.host.kill(h, 128 + sig as u32);
             // open 出来的句柄用完即关；children 里的句柄留给 wait4 回收
             if !st.children.borrow().contains_key(&pid) {
-                close_handle(h);
+                st.host.close_handle(h);
             }
             match r {
                 Ok(()) => 0,
@@ -925,6 +905,6 @@ pub fn do_kill(st: &mut GuestState, pid: u64, sig: u64) -> i64 {
 #[allow(dead_code)] // M3 接线 SetConsoleCtrlHandler 时启用
 pub fn terminate_all_children(st: &GuestState) {
     for h in st.children.borrow().values() {
-        let _ = terminate_child(*h, 128 + 15); // SIGTERM 惯例码
+        let _ = st.host.kill(*h, 128 + 15); // SIGTERM 惯例码
     }
 }

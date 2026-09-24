@@ -25,7 +25,7 @@ pub struct LoadedImage {
     pub phnum: u16,
     pub phentsize: u16,
     pub segments: Vec<Segment>,
-    /// 客户可执行范围（VEH Rip 过滤用）。
+    /// 客户可执行范围（trap 过滤 Rip 用）。
     pub exec_ranges: Vec<(u64, u64)>,
     /// 整块映射范围（用于内存登记）。
     pub span: MemRange,

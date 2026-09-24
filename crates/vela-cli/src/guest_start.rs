@@ -1,43 +1,9 @@
-//! 构造 Linux 进程初始栈（规格 4.2）并切入客户（规格 6）。
+//! 构造 Linux 进程初始栈（规格 4.2）。切入客户由 `HostTrap::enter_guest`
+//! 承担（0.1.0 T1.1：汇编已迁入 vela-sys::windows）。
 
 use vela_abi as abi;
 use vela_runtime::mem::{LoadedImage, MemRange};
 use vela_sys::{Host, HostError, HostProt};
-
-/// 切换到客户栈并跳入客户入口；不返回（exit_group 直接结束进程，规格 6）。
-///
-/// # Safety
-/// entry/rsp 必须来自 loader 的映射结果；调用后本线程宿主栈作废。
-pub unsafe fn enter_guest(entry: u64, rsp: u64) -> ! {
-    unsafe { vela_enter_guest(entry, rsp) }
-}
-
-// Win64 ABI：参数在 rcx(entry)/rdx(rsp)。Vela 自身汇编边界用 Win64；客户内部用 SysV（规格 6）。
-#[cfg(all(target_arch = "x86_64", windows))]
-core::arch::global_asm!(
-    ".globl vela_enter_guest",
-    "vela_enter_guest:",
-    "    mov rsp, rdx",
-    "    xor ebp, ebp",
-    "    xor ebx, ebx",
-    "    jmp rcx",
-);
-
-// SysV ABI（linux dev 构建仅用于逻辑检查，不真正执行客户）
-#[cfg(all(target_arch = "x86_64", not(windows)))]
-core::arch::global_asm!(
-    ".globl vela_enter_guest",
-    "vela_enter_guest:",
-    "    mov %rsi, %rsp",
-    "    xor %rbp, %rbp",
-    "    xor %rbx, %rbx",
-    "    jmp *%rdi",
-    options(att_syntax)
-);
-
-extern "C" {
-    fn vela_enter_guest(entry: u64, rsp: u64) -> !;
-}
 
 /// 按 Linux ELF 启动约定建栈：rsp 指向 argc，之后 argv[]/NULL/envp[]/NULL/auxv。
 /// ELF `_start` 时 rsp % 16 == 0（规格 4.2，注意不是 Win64 约定）。

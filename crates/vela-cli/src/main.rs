@@ -17,12 +17,12 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use vela_loader as loader;
 use vela_runtime::{GuestProcess, InterpImage};
 #[cfg(windows)]
-use vela_sys::HostMem;
+use vela_sys::{HostMem, HostProc, HostTrap, TrapFrame};
 
 #[cfg(target_os = "linux")]
 use vela_sys::linux_dev::LinuxDevHost;
 #[cfg(windows)]
-use vela_sys::windows::{install_syscall_trap, set_console_utf8, set_trap_fn, WindowsHost};
+use vela_sys::windows::{set_console_utf8, WindowsHost};
 
 #[cfg(windows)]
 type PlatformHost = WindowsHost;
@@ -386,14 +386,14 @@ fn do_execve(st: &mut GuestState, args: &[u64; 6]) -> Result<(u64, u64), i64> {
     st.proc.fs_base = 0;
     st.proc.gs_base = 0;
     st.proc.fs_apply_pending = None;
-    vela_sys::windows::set_soft_tls_base(0);
+    st.host.set_soft_tls_base(0);
 
     // 7. 原地重注册新可执行范围，返回新入口
     let mut ranges = st.proc.load.exec_ranges.clone();
     if let Some(i) = &st.proc.load.interp {
         ranges.extend(i.exec_ranges.iter().copied());
     }
-    vela_sys::windows::replace_guest_exec_ranges(&ranges);
+    st.host.replace_exec_ranges(&ranges);
     let entry = match &st.proc.load.interp {
         Some(i) => i.entry,
         None => st.proc.load.entry,
@@ -575,7 +575,7 @@ fn run_elf(
         }
     }
 
-    let mut proc = GuestProcess::new(vela_sys::windows::current_pid(), img);
+    let mut proc = GuestProcess::new(host.current_pid(), img);
     proc.attach_stdio(&host);
     proc.fs = fs;
     if let Some(u) = opts.uid {
@@ -619,7 +619,7 @@ fn run_elf(
     {
         // --soft-tls：FSGSBASE 缺失环境的实验回退（PLAN-0.0.4 T4.1/T4.2）
         if opts.soft_tls {
-            vela_sys::windows::enable_soft_tls();
+            host.enable_soft_tls();
             eprintln!(
                 "[vela] soft-tls enabled: fs-prefixed guest accesses will be emulated (slow; diagnostics/CI only)"
             );
@@ -634,10 +634,10 @@ fn run_elf(
         });
         let ptr = Box::into_raw(state);
         GUEST.store(ptr, Ordering::Relaxed);
-        set_trap_fn(trap);
+        let st = unsafe { &*ptr };
         // exec-range 原地注册（T1.1）：初始装载与后续 execve 重载共用同一路径
-        vela_sys::windows::replace_guest_exec_ranges(&exec_ranges);
-        if let Err(e) = install_syscall_trap() {
+        st.host.replace_exec_ranges(&exec_ranges);
+        if let Err(e) = st.host.install_trap(trap) {
             eprintln!("vela: failed to install exception trap: {e}");
             return Err(1);
         }
@@ -646,20 +646,20 @@ fn run_elf(
         // 的可能）。占位页取堆前 4KiB（已 RW 且登记），初始全零——即便内核在
         // arch_prctl 之前发生一次 fs 解引用也只是读到 0，不会 AV；arch_prctl
         // (SET_FS) 后由 trampoline 切到真实 TLS 区。
-        if vela_sys::windows::fs_base_supported() {
+        if st.host.fs_base_supported() {
             if let Some(hs) = heap_start {
-                let _ = vela_sys::windows::set_thread_fs_base_now(hs);
+                let _ = st.host.preset_fs_base(hs);
                 // 强制内核按已预切的基址重建保存值：此后偶发还原的也是客户侧
                 // 基址，而非线程创建时保存的 0（CI 实测的崩溃根源）。
                 // 注意必须在 VEH 安装之后调用（commit stub 依赖 VEH 吸收 UD2）。
-                vela_sys::windows::commit_fs_base_after_preset();
+                st.host.commit_fs_base();
                 if logx::enabled() {
                     eprintln!("[vela] fs preset → {hs:#x} (committed)");
                 }
             }
         }
         // SAFETY: 客户映像、堆、栈均已映射且登记；本调用不返回
-        unsafe { guest_start::enter_guest(entry, rsp) }
+        unsafe { st.host.enter_guest(entry, rsp) }
     }
     #[cfg(not(windows))]
     {
@@ -669,26 +669,23 @@ fn run_elf(
     }
 }
 
-/// VEH → dispatch 的桥接（规格 5.3 方法 C）。与客户同线程执行。
+/// 陷阱 → dispatch 的桥接（规格 5.3 方法 C）。与客户同线程执行。
+/// 0.1.0 T1.1：签名改为宿主无关的 TrapFrame（M2 岛页路径无 VEH 上下文）。
 #[cfg(windows)]
-unsafe extern "system" fn trap(
-    nr: u64,
-    args: &[u64; 6],
-    rip: u64,
-    ctx: &mut vela_sys::windows::Context,
-) -> i64 {
+unsafe extern "system" fn trap(nr: u64, args: &[u64; 6], frame: &mut TrapFrame) -> i64 {
     let p = GUEST.load(Ordering::Relaxed);
     if p.is_null() {
         return -(vela_abi::ENOSYS as i64);
     }
-    // SAFETY: GUEST 在进入客户前设置一次；VEH 与客户代码同线程
+    // SAFETY: GUEST 在进入客户前设置一次；陷阱回调与客户代码同线程
     let st = unsafe { &mut *p };
-    // soft-tls：同步客户 TLS 基址到 VEH 模拟器（arch_prctl 记录后即生效）
+    let rip = frame.regs.rip;
+    // soft-tls：同步客户 TLS 基址到模拟器（arch_prctl 记录后即生效）
     if st.proc.fs_base != 0 {
-        vela_sys::windows::set_soft_tls_base(st.proc.fs_base);
+        st.host.set_soft_tls_base(st.proc.fs_base);
     }
     if logx::enabled() {
-        if vela_sys::windows::stub_hit() {
+        if st.host.soft_tls_stub_hit() {
             eprintln!("[vela] stub HIT ✓");
         }
         // strace 风格：name(args...) + rip，便于与 Linux 侧 strace 对照及
@@ -711,9 +708,9 @@ unsafe extern "system" fn trap(
         // 编排（loader/栈构建在此 crate）；成功路径直接改写上下文返回。
         match do_execve(st, args) {
             Ok((entry, rsp)) => {
-                ctx.rax = 0;
-                ctx.rip = entry;
-                ctx.rsp = rsp;
+                frame.regs.rax = 0;
+                frame.regs.rip = entry;
+                frame.regs.rsp = rsp;
                 if logx::enabled() {
                     eprintln!("[vela] execve → reloaded, entry {entry:#x} rsp {rsp:#x}");
                 }
@@ -721,18 +718,19 @@ unsafe extern "system" fn trap(
             }
             Err(e) => e,
         }
-    } else if nr == vela_abi::SYS_FORK || nr == vela_abi::SYS_VFORK
+    } else if nr == vela_abi::SYS_FORK
+        || nr == vela_abi::SYS_VFORK
         || (nr == vela_abi::SYS_CLONE && args[0] == fork::SIGCHLD_FLAGS)
     {
         // fork（0.0.6 M1）：musl x86_64 fork() 走 SYS_FORK(57)；线程类
         // clone（CLONE_VM 等 flags）维持拒绝（单线程契约，NONGOALS）。
-        match fork::do_fork(st, args, ctx) {
+        match fork::do_fork(st, args, frame) {
             Ok(pid) => {
                 // 模拟 syscall 副作用：父返回子 pid
-                ctx.rax = pid as u64;
-                ctx.rcx = rip + 2;
-                ctx.r11 = ctx.e_flags as u64;
-                ctx.rip = rip + 2;
+                frame.regs.rax = pid as u64;
+                frame.regs.rcx = rip + 2;
+                frame.regs.r11 = frame.e_flags;
+                frame.regs.rip = rip + 2;
                 if logx::enabled() {
                     eprintln!("[vela] fork → child pid {pid}");
                 }
@@ -766,11 +764,11 @@ unsafe extern "system" fn trap(
         );
     }
     // 模拟硬件 syscall 固定副作用：Rax=返回值、Rcx=返回地址、R11=RFLAGS、Rip+=2
-    ctx.rax = r as u64;
-    ctx.rcx = rip + 2;
-    ctx.r11 = ctx.e_flags as u64;
-    ctx.rip = rip + 2;
-    // SET_FS：FS 切换必须在异常返回后的用户态完成（NtContinue 会还原处理器内
+    frame.regs.rax = r as u64;
+    frame.regs.rcx = rip + 2;
+    frame.regs.r11 = frame.e_flags;
+    frame.regs.rip = rip + 2;
+    // SET_FS：FS 切换必须在异常返回后的用户态完成（宿主机制会还原处理器内
     // 的旧基址），改跳 trampoline：wrfsbase r10（新基址）; jmp rcx（客户返回地址）。
     // 自愈：内核在某些转换路径会把用户 fs 基址恢复为旧值——每次 syscall 返回时
     // 校验当前基址，不一致就再跳一次 trampoline 重设（rdfsbase 一条指令的成本）。
@@ -778,16 +776,16 @@ unsafe extern "system" fn trap(
         if logx::enabled() {
             eprintln!("[vela] fs trampoline → {v:#x}");
         }
-        ctx.r10 = v;
-        ctx.rip = vela_sys::windows::set_fs_stub_addr() as u64;
+        frame.regs.r10 = v;
+        frame.regs.rip = st.host.fs_trampoline_addr() as u64;
     } else if st.proc.fs_base != 0 {
-        if let Some(cur) = vela_sys::windows::read_fs_base() {
+        if let Some(cur) = st.host.read_fs_base() {
             if cur != st.proc.fs_base {
                 if logx::enabled() {
                     eprintln!("[vela] fs heal: {cur:#x} → {:#x}", st.proc.fs_base);
                 }
-                ctx.r10 = st.proc.fs_base;
-                ctx.rip = vela_sys::windows::set_fs_stub_addr() as u64;
+                frame.regs.r10 = st.proc.fs_base;
+                frame.regs.rip = st.host.fs_trampoline_addr() as u64;
             }
         }
     }

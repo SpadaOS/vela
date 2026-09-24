@@ -1420,8 +1420,8 @@ fn sys_arch_prctl(proc: &mut GuestProcess, host: &dyn Host, code: u64, addr: u64
     match code {
         abi::ARCH_SET_FS => {
             // 记录新基址；宿主支持时标记待应用，由 CLI 在异常返回后的
-            // 用户态 trampoline 实际切换（wrfsbase 在 VEH 处理器内会被
-            // NtContinue 还原）。两种情况都返回 0（规格 5.1 允许）。
+            // 用户态 trampoline 实际切换（wrfsbase 在异常处理器内会被
+            // 内核还原）。两种情况都返回 0（规格 5.1 允许）。
             proc.fs_base = addr;
             if host.set_fs_base(addr).is_ok() {
                 proc.fs_apply_pending = Some(addr);

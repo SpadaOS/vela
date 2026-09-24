@@ -70,6 +70,41 @@ pub(crate) enum PipeEndInner {
     Mem(std::sync::Arc<PipeMem>, bool),
 }
 
+/// 磁盘文件的不透明 token（PLAN-0.1.0 T1.3）：宿主私有存储，
+/// runtime/CLI 不得解包；对外仅暴露 `raw_handle` / 构造方法
+/// （fork 协议的句柄序列化/重建）与文件路径查询。
+#[derive(Debug)]
+pub struct DiskFile(pub(crate) std::fs::File);
+
+impl DiskFile {
+    /// 构造（宿主实现与测试宿主用）。
+    pub fn new(file: std::fs::File) -> Self {
+        DiskFile(file)
+    }
+    /// 底层 std 文件（读写元数据用；测试宿主复用）。
+    /// 注意：不得经它提取平台句柄做 fork 序列化——统一走 `raw_handle`。
+    pub fn as_std_file(&self) -> &std::fs::File {
+        &self.0
+    }
+    /// fork 协议序列化：底层宿主原始句柄（Windows HANDLE；继承后子进程同值）。
+    #[cfg(windows)]
+    pub fn raw_handle(&self) -> isize {
+        use std::os::windows::io::AsRawHandle;
+        self.0.as_raw_handle() as isize
+    }
+    /// fork 协议重建：由继承句柄构造磁盘文件 token（句柄所有权移交）。
+    ///
+    /// # Safety
+    /// `h` 必须是调用方拥有所有权的有效文件句柄（继承而来的值）。
+    #[cfg(windows)]
+    pub unsafe fn from_raw_handle(h: isize) -> Self {
+        use std::os::windows::io::FromRawHandle;
+        DiskFile(std::fs::File::from_raw_handle(
+            h as std::os::windows::io::RawHandle,
+        ))
+    }
+}
+
 /// 内存管道共享态（仅测试与逻辑构建路径使用）。
 #[derive(Debug, Default)]
 pub struct PipeMem {
@@ -99,8 +134,9 @@ pub enum HostFileKind {
     StdOut,
     StdErr,
     /// 打开时记录宿主路径：fstat 需要稳定的 ino（路径哈希），std::fs::File 不携带路径。
+    /// 文件本体为宿主私有 token（T1.3）。
     Disk {
-        file: std::fs::File,
+        file: DiskFile,
         path: PathBuf,
     },
     /// 匿名管道一端（pipe2 产物；fstat = S_IFIFO）。
@@ -117,6 +153,38 @@ impl HostFileKind {
             HostFileKind::Pipe(e) => HostFileKind::Pipe(e.clone()),
             HostFileKind::Disk { .. } => unreachable!("dup_file handles Disk via try_clone"),
         }
+    }
+}
+
+impl HostFile {
+    /// fork 协议序列化：底层宿主原始句柄（磁盘文件与管道端有值）。
+    #[cfg(windows)]
+    pub fn raw_handle(&self) -> Option<isize> {
+        match &self.0 {
+            HostFileKind::Disk { file, .. } => Some(file.raw_handle()),
+            HostFileKind::Pipe(e) => e.raw_handle(),
+            _ => None,
+        }
+    }
+
+    /// fork 协议序列化：磁盘文件的宿主路径。
+    pub fn disk_path(&self) -> Option<&Path> {
+        match &self.0 {
+            HostFileKind::Disk { path, .. } => Some(path.as_path()),
+            _ => None,
+        }
+    }
+
+    /// fork 协议重建：由继承句柄构造磁盘文件 token（路径由元数据携带）。
+    ///
+    /// # Safety
+    /// `h` 必须是调用方拥有所有权的有效文件句柄（继承而来的值）。
+    #[cfg(windows)]
+    pub unsafe fn disk_from_raw_handle(h: isize, path: PathBuf) -> HostFile {
+        HostFile(HostFileKind::Disk {
+            file: unsafe { DiskFile::from_raw_handle(h) },
+            path,
+        })
     }
 }
 
@@ -259,6 +327,233 @@ impl std::error::Error for HostError {}
 // HOST.md 契约按 SpadaOS 内核能力分五组：map / file / time / thread / futex。
 // 每组一个 supertrait，SpadaOS 实现者可逐组填实；`Host` 为集合 trait，
 // runtime 只见 `&dyn Host`（规格 2.4：宿主差异全部收敛在本 crate）。
+// 0.1.0 新增 trap / proc 两组（PLAN-0.1.0 T1.1/T1.2）：客户执行与
+// 进程生命周期原语；目前唯一实现 windows（SpadaOS/macOS 走默认桩）。
+
+/// 客户寄存器视图（宿主无关，PLAN-0.1.0 T1.1）：syscall 陷阱与故障路径
+/// 共用的整数现场。字段顺序刻意与 Win64 CONTEXT 的 RAX..RIP 连续段一致
+/// （windows.rs 有布局断言），VEH 路径零拷贝重解释；其他宿主布局自由。
+#[repr(C)]
+pub struct GuestRegs {
+    pub rax: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rbx: u64,
+    pub rsp: u64,
+    pub rbp: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rip: u64,
+}
+
+/// 一次 syscall 陷阱的完整现场：寄存器视图 + 宿主私有上下文。
+/// `regs` 可写（dispatch 写回返回值/副作用），宿主上下文只读快照
+/// （fork 协议经 `HostProc::fork_child_context` 解释）。
+pub struct TrapFrame<'a> {
+    pub regs: &'a mut GuestRegs,
+    /// 陷阱时的 EFLAGS（syscall 约定 R11 = 旧 RFLAGS；只读）。
+    pub e_flags: u64,
+    opaque: *const u8,
+    opaque_len: usize,
+}
+
+impl TrapFrame<'_> {
+    pub(crate) fn new(
+        regs: &mut GuestRegs,
+        e_flags: u64,
+        opaque: *const u8,
+        opaque_len: usize,
+    ) -> TrapFrame<'_> {
+        TrapFrame {
+            regs,
+            e_flags,
+            opaque,
+            opaque_len,
+        }
+    }
+
+    /// 宿主完整上下文的只读字节视图（布局宿主私有；Windows = CONTEXT
+    /// 全量 0x4D0，含 XSAVE 状态——fork 快照正确性的前提）。仅在陷阱
+    /// 回调执行期间有效。
+    pub fn opaque_bytes(&self) -> &[u8] {
+        // SAFETY: 构造自宿主异常上下文，回调期间有效
+        unsafe { std::slice::from_raw_parts(self.opaque, self.opaque_len) }
+    }
+}
+
+/// syscall dispatch 回调（宿主无关签名，PLAN-0.1.0 T1.1）：
+/// 返回 syscall 结果；寄存器写回（Rax/Rcx/R11/Rip 推进、控制流改写）
+/// 由回调直接操作 `frame.regs` 完成。
+pub type TrapFn = unsafe extern "system" fn(nr: u64, args: &[u64; 6], frame: &mut TrapFrame) -> i64;
+
+/// 组 6 trap：客户执行与 syscall 陷阱机制（VEH / 岛页 / 未来宿主机制）。
+/// 默认全部未实现——仅真正能执行客户的宿主填实。
+pub trait HostTrap: Send + Sync + 'static {
+    /// 安装陷阱机制并注册 dispatch 回调。幂等。
+    fn install_trap(&self, f: TrapFn) -> Result<(), HostError> {
+        let _ = f;
+        Err(HostError::Unimplemented)
+    }
+
+    /// 用新集合整体替换客户可执行范围（trap 过滤用；execve 原地重注册）。
+    fn replace_exec_ranges(&self, ranges: &[(u64, u64)]) {
+        let _ = ranges;
+    }
+
+    /// 切入客户（不返回）。
+    ///
+    /// # Safety
+    /// entry/rsp 必须来自已映射且登记的客户映像；调用后宿主栈作废。
+    unsafe fn enter_guest(&self, entry: u64, rsp: u64) -> ! {
+        let _ = (entry, rsp);
+        panic!("guest execution not supported on this host")
+    }
+
+    // ---- FS 基址机制（客户 TLS；0.1.0 唯一实现 windows）----
+
+    /// FSGSBASE 能力探测（CPU + OS），结果缓存。
+    fn fs_base_supported(&self) -> bool {
+        false
+    }
+    /// 预切当前线程 FS 基址（仅进入客户前使用）。
+    fn preset_fs_base(&self, v: u64) -> Result<(), HostError> {
+        let _ = v;
+        Err(HostError::Unimplemented)
+    }
+    /// 预切后强制一次内核侧 FS 基址刷新（吸收一次自身 UD2）。
+    fn commit_fs_base(&self) {}
+    /// 读取当前线程 FS 基址（不支持 → None）。
+    fn read_fs_base(&self) -> Option<u64> {
+        None
+    }
+    /// FS 切换 trampoline 的宿主地址（0 = 不可用）。
+    fn fs_trampoline_addr(&self) -> usize {
+        0
+    }
+
+    // ---- soft-tls（FSGSBASE 缺失环境的软件模拟）----
+
+    fn enable_soft_tls(&self) {}
+    fn set_soft_tls_base(&self, v: u64) {
+        let _ = v;
+    }
+    /// trampoline 是否被实际执行过（诊断观测）。
+    fn soft_tls_stub_hit(&self) -> bool {
+        false
+    }
+}
+
+/// 组 7 proc：进程生命周期原语（用户态 fork 协议的宿主侧，T1.2）。
+/// 句柄 token 为 isize（宿主原始值，仅可传回同宿主方法；跨进程继承后同值）。
+pub trait HostProc: Send + Sync + 'static {
+    fn current_pid(&self) -> u32 {
+        std::process::id()
+    }
+
+    // ---- 共享内存 section（fork 快照通道）----
+
+    /// 页文件 backed section（跨进程共享，调用方负责置继承）。
+    fn shared_section(&self, size: u64) -> Result<isize, HostError> {
+        let _ = size;
+        Err(HostError::Unimplemented)
+    }
+    /// 任意基址映射 section 视图（父侧拷贝快照用）。
+    ///
+    /// # Safety: 返回的视图由调用方独占使用（同进程）。
+    unsafe fn map_section_anywhere(&self, sec: isize) -> Result<usize, HostError> {
+        let _ = sec;
+        Err(HostError::Unimplemented)
+    }
+    /// 固定基址映射（子进程回原地址——fork 指针一致性前提）。
+    ///
+    /// # Safety: base 必须为本进程空闲地址且区间足够容纳 section。
+    unsafe fn map_section_at(&self, sec: isize, base: u64) -> Result<usize, HostError> {
+        let _ = (sec, base);
+        Err(HostError::Unimplemented)
+    }
+    fn unmap_section_view(&self, addr: usize) -> Result<(), HostError> {
+        let _ = addr;
+        Err(HostError::Unimplemented)
+    }
+
+    // ---- 句柄与子进程 ----
+
+    /// 句柄置继承标志（fork 前提：pipe/section/disk fd）。
+    fn set_inherit(&self, handle: isize) -> Result<(), HostError> {
+        let _ = handle;
+        Err(HostError::Unimplemented)
+    }
+    /// spawn 自身（命令行透传；句柄继承由调用方预先 set_inherit）。
+    /// 返回 (pid, 进程句柄)。
+    fn spawn_self(&self, cmdline: &str) -> Result<(u32, isize), HostError> {
+        let _ = cmdline;
+        Err(HostError::Unimplemented)
+    }
+    /// 等待子进程：timeout_ms = 0xFFFF_FFFF 阻塞 / 0 轮询；Ok(None) = 超时。
+    fn wait(&self, proc: isize, timeout_ms: u32) -> Result<Option<u32>, HostError> {
+        let _ = (proc, timeout_ms);
+        Err(HostError::Unimplemented)
+    }
+    /// 终止子进程（kill SIGKILL/SIGTERM 的诚实近似）。
+    fn kill(&self, proc: isize, code: u32) -> Result<(), HostError> {
+        let _ = (proc, code);
+        Err(HostError::Unimplemented)
+    }
+    /// 按 pid 打开进程（探测/kill 的 pid 形态；不存在 → NotFound）。
+    fn open_process(&self, pid: u32) -> Result<isize, HostError> {
+        let _ = pid;
+        Err(HostError::Unimplemented)
+    }
+    fn close_handle(&self, handle: isize) {
+        let _ = handle;
+    }
+
+    // ---- fork 元数据管道 ----
+
+    /// inheritable 匿名管道，返回 (写端, 读端)。
+    fn create_inherit_pipe(&self) -> Result<(isize, isize), HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn pipe_write_all(&self, h: isize, data: &[u8]) -> Result<(), HostError> {
+        let _ = (h, data);
+        Err(HostError::Unimplemented)
+    }
+    fn pipe_read_exact(&self, h: isize, buf: &mut [u8]) -> Result<(), HostError> {
+        let _ = (h, buf);
+        Err(HostError::Unimplemented)
+    }
+    /// 由继承句柄构造管道端（fd 表重建）。
+    fn pipe_end_from_raw(&self, h: isize, is_read: bool) -> PipeEnd {
+        let _ = (h, is_read);
+        unreachable!("pipe_end_from_raw not supported on this host")
+    }
+
+    // ---- fork 上下文 ----
+
+    /// fork 子进程的恢复上下文（Linux「clone 返回 0」形态）：
+    /// 父 trap 现场的宿主完整快照 + syscall 副作用改写（Rax=0、
+    /// Rip/Rcx=返回地址、R11=RFLAGS、恢复所需 flags）。
+    fn fork_child_context(&self, frame: &TrapFrame) -> Vec<u8> {
+        let _ = frame;
+        panic!("fork not supported on this host")
+    }
+    /// 注入完整上下文进入客户（fork 子进程恢复现场；不返回）。
+    ///
+    /// # Safety
+    /// ctx 必须来自本宿主 `fork_child_context`；客户内存已按快照恢复并登记。
+    unsafe fn resume_child(&self, ctx: &[u8]) -> ! {
+        let _ = ctx;
+        panic!("fork not supported on this host")
+    }
+}
 
 /// 组 1 map：客户地址空间管理。
 ///
@@ -377,8 +672,8 @@ pub trait HostTls: Send + Sync + 'static {
     }
 }
 
-/// 集合 trait：五组能力 + 线程生命周期（thread/futex 组，v0 桩）。
-pub trait Host: HostMem + HostFileOps + HostTime + HostTls {
+/// 集合 trait：五组能力 + trap/proc（客户执行与进程原语）+ 线程生命周期桩。
+pub trait Host: HostMem + HostFileOps + HostTime + HostTls + HostTrap + HostProc {
     fn thread_exit(&self, code: i32) -> !;
     fn process_exit(&self, code: i32) -> !;
 

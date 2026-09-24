@@ -153,7 +153,7 @@ pub struct GuestProcess {
     pub fs_base: u64,
     pub gs_base: u64,
     /// 待应用的 FS 基址：宿主支持时由 SET_FS 记录，CLI 在异常返回后
-    /// 通过 trampoline 实际切换（wrfsbase 在 VEH 处理器内会被内核还原）。
+    /// 通过 trampoline 实际切换（wrfsbase 在异常处理器内会被内核还原）。
     pub fs_apply_pending: Option<u64>,
     pub brk_start: u64,
     pub brk: u64,

@@ -4,7 +4,7 @@
 
 use crate::{
     Host, HostDir, HostError, HostFile, HostFileKind, HostFileOps, HostMem, HostOpen, HostPath,
-    HostProt, HostStat, HostTime, HostTls, StdioHandles,
+    HostProc, HostProt, HostStat, HostTime, HostTls, HostTrap, StdioHandles,
 };
 
 /// 占位实现：所有方法返回 Unimplemented。
@@ -102,6 +102,10 @@ impl HostTime for SpadaOsHost {
 }
 
 impl HostTls for SpadaOsHost {}
+
+// trap/proc 组（0.1.0 T1.5）：全部走默认 Unimplemented 桩，不写假实现。
+impl HostTrap for SpadaOsHost {}
+impl HostProc for SpadaOsHost {}
 
 impl Host for SpadaOsHost {
     fn thread_exit(&self, code: i32) -> ! {

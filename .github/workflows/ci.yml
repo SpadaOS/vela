@@ -20,6 +20,13 @@ jobs:
         run: cargo fmt --check
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace -- -D warnings
+      - name: Host gate (PLAN-0.1.0 T1.4 — runtime/loader/fs must not touch host internals)
+        shell: pwsh
+        run: |
+          $pat = 'vela_sys::windows|NtContinue|CreateProcessW|AddVectoredExceptionHandler|VEH|os::windows|cfg\(windows\)|cfg\(target_os = "windows"\)'
+          $hits = Get-ChildItem crates/vela-runtime/src, crates/vela-loader/src, crates/vela-fs/src -Recurse -Filter *.rs |
+            Select-String -Pattern $pat
+          if ($hits) { $hits; throw "host-internal references leaked into guest-side crates" }
       - name: Build
         run: cargo build --workspace --verbose
       - name: Generate guest images (no prebuilt binaries, PLAN-0.0.2 T4.2)
