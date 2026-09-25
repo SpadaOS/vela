@@ -85,23 +85,24 @@ cargo build -p vela-cli --release
 
 ## 能力矩阵
 
-v0.0.6 实测（CI 在 Windows runner 上自动验收全部 ✅ 项）：
+v0.1.0 实测（CI 在 Windows runner 上自动验收全部 ✅ 项）：
 
 | 能力 | 状态 | 说明 |
 |---|:---:|---|
 | 无 libc 汇编程序 | ✅ | 任何 Linux x86_64 静态 PIE |
 | 静态 musl C 程序 | ✅ | 文件 IO 全链路（stat/getdents64/fcntl） |
 | **动态链接** | ✅ | `ld-musl` 解释器全权重定位（0.0.4 起）；glibc 诚实拒绝 |
-| **busybox 子集** | ✅ | echo/ls/cat/true/false/nproc/env/printf（0.0.5 起） |
-| **用户态 fork** | ✅ | fork+waitpid 全语义：子进程从返回点继续、独立 pid、fd 继承（0.0.6 起） |
-| busybox shell | 🟨 | ash 已构建入白名单；`sh -c` 执行流在 CI 出现编译器陷阱问题，实验性（顺延 0.0.7） |
-| mmap | ✅ | 匿名 + 文件映射（COW，写不回宿主文件） |
+| **busybox 子集** | ✅ | echo/ls/cat/true/false/nproc/env/printf 等 30+ applet |
+| **用户态 fork** | ✅ | fork+waitpid 全语义；不可变段 section 跨 fork 共享，快照体积可观测（0.1.0 起） |
+| **busybox shell** | ✅ | `sh -c` 管道/命令替换/变量展开/重定向 CI 硬门禁（0.1.0 起） |
 | **execve** | ✅ | 进程内重载，fd 跨重载保留；pipe2 管道 |
+| **syscall 热路径** | ✅ | 岛页跳板（`--trap=auto`），UD2+VEH 兜底；陷阱全程宿主栈 |
+| mmap | ✅ | 匿名 + 文件映射（COW，写不回宿主文件）；SHARED 诚实 ENOSYS |
 | TLS | ✅ | FSGSBASE 硬件路径，缺失时 `--soft-tls` 软件模拟 |
-| 时间 / 熵 / 进程身份 | ✅ | clock/getrandom/uname/auxv 完整 |
-| fork / 信号投递 | 🟨 | fork ✅（0.0.6 用户态快照实现）；信号投递 ❌（kill SIGKILL/SIGTERM 可用） |
+| 时间 / 熵 / 进程身份 | ✅ | clock/getrandom/uname/auxv/utimensat |
+| 信号投递 | ❌ | rt_sigaction/procmask 记账；kill SIGKILL/SIGTERM；SIGCHLD 仅记账；Ctrl+C 杀子进程树（控制台近似） |
 | socket / epoll / GUI | ❌ | 返回 `-ENOSYS`，libc 有降级路径 |
-| Go 程序 / 32 位 / ARM | ❌ | 见 [docs/NONGOALS.md](docs/NONGOALS.md) |
+| Go 程序 / 32 位 / ARM / 非 Windows 宿主 | ❌ | 见 [docs/NONGOALS.md](docs/NONGOALS.md) |
 
 未实现的 syscall 一律返回 Linux 风格 `-ENOSYS`——行为可预期，而不是崩溃。
 逐条兼容矩阵（约 60 条）见 [docs/SYSCALLS.md](docs/SYSCALLS.md)。
@@ -122,16 +123,18 @@ Vela 的定位不是替代 WSL，而是给 **SpadaOS** 这类自主内核 OS 提
 
 ## 工作原理
 
-1. **patch**：loader 解析 ELF 后，把代码段里所有 `syscall`（`0F 05`）改写为
-   `UD2`（`0F 0B`）。
-2. **陷阱**：客户执行到 `UD2` 触发异常，Vela 注册的 VEH 捕获，取出原始
-   `syscall` 号与六个参数。
+1. **patch**：loader 解析 ELF 后，线性走查代码段指令流，把指令边界上的
+   `syscall`（`0F 05`）改写为 `UD2`（`0F 0B`）——不做裸字节匹配，避免
+   误伤指令内部的相同字节。
+2. **陷阱**：`--trap=auto` 时为每个通过校验的 syscall 站点建 RX 岛页
+   跳板（2 字节短跳，保存现场后切宿主栈直调分发器）；校验不过的站点
+   与真实故障走 UD2 + VEH 异常兜底。
 3. **翻译**：`vela-runtime::dispatch` 按 Linux 语义执行——路径交给
    `vela-fs` 翻译，文件/内存/时钟操作落到 `vela-sys` 的 `Host` trait。
-4. **返回**：结果按 Linux ABI 写回寄存器，`NtContinue` 回到客户。
+4. **返回**：结果按 Linux ABI 写回寄存器，异常返回 / 岛内续接回到客户。
 
-安全边界、COW 文件映射、软 TLS、execve 重载的实现细节与决策记录：
-[docs/DESIGN.md](docs/DESIGN.md)。
+安全边界、COW 文件映射、软 TLS、execve 重载、fork 快照的实现细节与决策
+记录：[docs/DESIGN.md](docs/DESIGN.md)。
 
 ## CLI 速查
 
@@ -207,12 +210,13 @@ Vela 当沙箱用。杀毒软件可能对"进程内改可执行内存再执行"�
 
 ## 路线
 
-- **v0.0.6（当前）**：多进程之门——用户态 fork + wait4 真实化 + kill
-  最小集 + busybox ash shell 解锁 + Release 挂产物
-- v0.0.7 候选：fork 脏页快照优化、MAP_SHARED、信号投递地基（SIGCHLD/
-  handler 帧）、utimensat
-- v1：SpadaOS `Host` 填满（map/file/time/thread/futex 五组）、外部 X server
-  通路
+- **v0.1.0（当前）**：Windows 一等运行时——岛页 syscall 热路径、陷阱走
+  宿主栈、fork 不可变段共享 + mprotect 账本、busybox `sh -c` 闭环
+  （CI 硬门禁）、utimensat、SIGCHLD 记账、Host Trap/Proc 契约收口、
+  doctor 2.0、Ctrl+C 进程树、SECURITY.md。唯一可运行宿主：Windows
+- 下一步候选：fork 脏页跟踪、MAP_SHARED 匿名共享、信号投递地基
+- v1：SpadaOS `Host` 填满（等 SpadaOS 内核具备用户态 map/file 能力后）、
+  外部 X server 通路
 
 版本计划与历史决策：[docs/plans/](docs/plans/)、[docs/DESIGN.md](docs/DESIGN.md)。
 

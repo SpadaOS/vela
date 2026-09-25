@@ -12,7 +12,7 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"
-version = "0.0.6"
+version = "0.1.0"
 
 # 低内存机器：关闭增量编译，减少磁盘/内存占用
 [profile.dev]

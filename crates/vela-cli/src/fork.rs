@@ -1202,8 +1202,7 @@ pub fn do_kill(st: &mut GuestState, pid: u64, sig: u64) -> i64 {
     }
 }
 
-/// Ctrl+C：终止全部子进程（控制台进程组近似）。
-#[allow(dead_code)] // M3 接线 SetConsoleCtrlHandler 时启用
+/// Ctrl+C：终止全部子进程（控制台进程组近似，T5.3 由控制台事件回调接线）。
 pub fn terminate_all_children(st: &GuestState) {
     for h in st.children.borrow().values() {
         let _ = st.host.kill(*h, 128 + 15); // SIGTERM 惯例码

@@ -1,11 +1,14 @@
-# HOST 契约（五组，SpadaOS 就绪）
+# HOST 契约（五组 + Trap/Proc，SpadaOS 就绪）
 
 `vela-sys` 是 runtime 与宿主之间的唯一边界（规格 2.4）。0.0.3 起 `Host`
-按 SpadaOS 内核能力拆为 **五组 supertrait**（PLAN-0.0.3 T3.1）：
+按 SpadaOS 内核能力拆为 **五组 supertrait**（PLAN-0.0.3 T3.1）；0.1.0
+新增 **HostTrap / HostProc** 两组（PLAN-0.1.0 T1.1/T1.2），把 Windows
+专属的陷阱与进程机制从 cli/runtime 收进契约：
 
 ```
 Host = HostMem + HostFileOps + HostTime + HostTls
      + thread_exit / process_exit / thread_create(桩) / futex_wait/futex_wake(桩)
+     + HostTrap + HostProc（0.1.0；默认 Unimplemented）
 ```
 
 runtime 及以上禁止 `#[cfg(target_os)]` 与任何宿主类型；路径在进入 Host
@@ -21,6 +24,23 @@ runtime 及以上禁止 `#[cfg(target_os)]` 与任何宿主类型；路径在进
 | time | `HostTime` | `monotonic_ns` / `realtime` / `random` | 时钟：单调钟/实时钟；熵源 |
 | thread | `HostTls` + `Host::thread_*` | `set_fs_base` / `thread_exit` / `thread_create`(桩) | TLS 寄存器切换、线程生命周期 |
 | futex | `Host::futex_*` | `futex_wait`(桩) / `futex_wake`(桩) | 等待队列 |
+
+## Trap / Proc 契约（0.1.0 T1.1/T1.2）
+
+| 组 | trait | 方法 | 说明 |
+|---|---|---|---|
+| trap | `HostTrap` | `install_trap` / `replace_exec_ranges` / `enter_guest` / `resume_child` | syscall 陷阱机制（UD2 异常 / 岛页跳板，`--trap=auto\|veh\|island`）与客户执行进入/恢复 |
+| trap | `HostTrap`（TLS） | `fs_base_supported` / `preset_fs_base` / `commit_fs_base` / `read_fs_base` / `fs_trampoline_addr` / `enable_soft_tls` / `set_soft_tls_base` / `soft_tls_stub_hit` | FSGSBASE 能力探测与 soft-tls 软件模拟 |
+| trap | `HostTrap`（岛） | `build_islands` / `trap_backend_name` / `island_veh_counts` | 岛页计划构建与后端计数（doctor 报告） |
+| trap | `HostTrap`（fork） | `fork_child_context` | 从父陷阱帧合成子进程 CONTEXT（子返回 0 形态） |
+| proc | `HostProc` | `shared_section` / `map_section_anywhere` / `map_section_at` / `unmap_section_view` / `set_inherit` | 跨进程共享 section（fork 快照通道）与句柄继承 |
+| proc | `HostProc` | `spawn_self` / `wait` / `kill` / `open_process` / `close_handle` / `current_pid` | 子进程生命周期（fork/wait4/kill）与 pid 探测 |
+| proc | `HostProc`（管道） | `create_inherit_pipe` / `pipe_write_all` / `pipe_read_exact` / `pipe_end_from_raw` | fork 元数据通道与管道 fd 继承 |
+
+两组默认全部 `Unimplemented`/空实现——**目前唯一完整实现：windows**
+（VEH/UD2 陷阱 + 岛页跳板、`CreateProcessW` 自我 spawn、页文件
+section）。其它宿主按表逐方法填实即为接入完成；不要为尚未存在的
+内核写假实现。
 
 ## 关键约定
 
@@ -42,9 +62,9 @@ runtime 及以上禁止 `#[cfg(target_os)]` 与任何宿主类型；路径在进
 
 | 宿主 | 状态 | 说明 |
 |---|---|---|
-| windows | v0.3 完整实现 | VirtualAlloc/Protect/Free、std 文件与控制台、RtlGenRandom、VEH 陷阱 |
-| linux_dev | 逻辑测试壳 | 分配器模拟 map，仅供 loader/runtime 单元逻辑（真实执行客户 ELF 必须在 Windows） |
-| spadaos | 骨架 | 每组 `Unimplemented`；按上表五组逐组填满即为 SpadaOS 接入完成 |
+| windows | **唯一可运行宿主**（0.1.0） | VirtualAlloc/Protect/Free、std 文件与控制台、RtlGenRandom、UD2/岛页陷阱、CreateProcessW 自我 spawn、页文件 section；在非 Windows 上运行客户不在 0.1.0 目标内（NONGOALS） |
+| linux_dev | 逻辑测试壳 | 分配器模拟 map，仅供 loader/runtime 单元逻辑（Trap/Proc 走默认桩） |
+| spadaos | 骨架 | 每组 `Unimplemented`；按上表逐组填满即为 SpadaOS 接入完成 |
 
 ## 未来扩展
 

@@ -57,6 +57,15 @@ struct GuestState {
 
 static GUEST: AtomicPtr<GuestState> = AtomicPtr::new(std::ptr::null_mut());
 
+/// Ctrl+C 清理回调（T5.3）：终止全部存活客户子进程（控制台进程组近似）。
+fn on_console_ctrl() {
+    let p = GUEST.load(Ordering::SeqCst);
+    if !p.is_null() {
+        // SAFETY: GUEST 在 run 期间指向有效的 GuestState（进程退出前不释放）
+        unsafe { fork::terminate_all_children(&*p) };
+    }
+}
+
 /// execve 地址空间债（T4.5）：Reserve 块解除登记但不释放的累计字节。
 /// 本进程内可观测（-v 日志）；进程退出由 OS 回收。
 static EXECVE_LEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -506,10 +515,17 @@ fn cmd_doctor() -> i32 {
     // 路径映射约定
     println!("  path mapping : default /mnt/c -> C:\\; override with --root <dir> / --map <g>=<h>");
 
-    // 陷阱后端（0.1.0 T2.6）：island 为默认 auto 的首选，混合模式是预期形态
+    // 陷阱后端（0.1.0 T2.6/T5.2）：island 为默认 auto 的首选，混合模式是预期形态
     println!(
         "  trap         : island trampoline supported (default --trap=auto; mixed island/veh expected)"
     );
+
+    // fork / 地址空间债（0.1.0 T5.2；doctor 是独立进程，只报机制与观测方法）
+    println!("  fork         : snapshot via shared sections; immutable image regions shared across forks (copied KiB visible with -v)");
+    println!("  execve debt  : old-image Reserve blocks stay mapped until process exit (Windows cannot partially free); count with -v");
+
+    // Ctrl+C（0.1.0 T5.3）
+    println!("  ctrl+c       : kills the guest child tree (console-group approximation, not SIGINT semantics)");
 
     // 杀软提示（README 安全节）：进程内改可执行内存可能被拦截
     println!("  antivirus    : if guests are blocked, exclude vela.exe (Vela patches syscall in-process; no packing/obfuscation)");
@@ -773,6 +789,10 @@ fn run_elf(
         let ptr = Box::into_raw(state);
         GUEST.store(ptr, Ordering::Relaxed);
         let st = unsafe { &*ptr };
+        // Ctrl+C（T5.3）：控制台事件先杀客户子进程树，再走默认终止。
+        // 诚实边界：控制台进程组近似，非 SIGINT handler 语义。
+        vela_sys::windows::set_console_ctrl_callback(on_console_ctrl);
+        let _ = vela_sys::windows::install_console_ctrl_handler();
         // exec-range 原地注册（T1.1）：初始装载与后续 execve 重载共用同一路径
         st.host.replace_exec_ranges(&exec_ranges);
         if let Err(e) = st.host.install_trap(trap) {

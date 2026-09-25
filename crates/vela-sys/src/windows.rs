@@ -2294,6 +2294,46 @@ pub fn terminate_child(h: isize, code: u32) -> Result<(), HostError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------- Ctrl+C
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn SetConsoleCtrlHandler(
+        handler: Option<unsafe extern "system" fn(u32) -> i32>,
+        add: i32,
+    ) -> i32;
+}
+
+/// Ctrl+C 回调（T5.3）：CLI 层注册「终止客户子进程树」的清理函数。
+static CONSOLE_CTRL_FN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 注册控制台事件清理回调（幂等；重复调用覆盖旧回调）。
+pub fn set_console_ctrl_callback(f: fn()) {
+    CONSOLE_CTRL_FN.store(f as usize, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 安装控制台事件处理器（CTRL_C/CTRL_BREAK/关闭）。成功返回 true。
+pub fn install_console_ctrl_handler() -> bool {
+    // SAFETY: handler 为有效的系统回调
+    unsafe { SetConsoleCtrlHandler(Some(console_ctrl_handler), 1) != 0 }
+}
+
+/// 事件处理器：先跑 CLI 清理回调（杀子进程树），再返回 FALSE 让默认
+/// 终止路径继续（vela 自身退出）。诚实边界：不假装 SIGINT handler
+/// 语义——这是控制台进程组近似（T5.3）。
+unsafe extern "system" fn console_ctrl_handler(ctrl: u32) -> i32 {
+    // CTRL_C_EVENT = 0, CTRL_BREAK_EVENT = 1, CTRL_CLOSE = 2
+    if ctrl <= 2 {
+        let f = CONSOLE_CTRL_FN.load(std::sync::atomic::Ordering::SeqCst);
+        if f != 0 {
+            // SAFETY: 回调由 CLI 注册的有效 fn 指针
+            let f: fn() = unsafe { std::mem::transmute(f) };
+            f();
+        }
+    }
+    0 // FALSE：未处理 → 默认终止继续
+}
+
 /// 按 pid 打开进程（kill 的 pid 形态；不存在 → NotFound）。
 pub fn open_process_handle(pid: u32) -> Result<isize, HostError> {
     const PROCESS_TERMINATE: u32 = 0x0001;

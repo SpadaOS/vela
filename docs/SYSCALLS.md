@@ -76,7 +76,8 @@
 | 292 | dup3 | ✅ | 仅接受 O_CLOEXEC flag |
 | 293 | pipe2 | ✅ | **宿主匿名管道**（0.0.6 下沉）：真实阻塞读写、64 KiB 缓冲、fd 可跨 fork 继承；O_NONBLOCK 无效果（Linux 子集）；fstat = S_IFIFO\|0600 |
 | 22 | pipe | ✅ | ≡ pipe2(flags=0)（musl pipe() 降级路径） |
-| 56/57/58 | clone/fork/vfork | 🟨 | **用户态 fork**（0.0.6）：仅接受 fork 语义（SIGCHLD / vfork / fork 号）——快照客户地址空间（区间级 inheritable section）+ CONTEXT 传递，子进程 MapViewOfFileEx 回原地址后从 fork 返回点继续；父返回子 pid、子返回 0。⚠ 线程类 clone（CLONE_VM 等）诚实拒绝（单线程契约）；⚠ 全量快照（~24 MB/次），性能非目标；⚠ mprotect 运行时历史不传递（按映像段 prot 恢复） |
+| 56/57/58 | clone/fork/vfork | 🟨 | **用户态 fork**（0.0.6，0.1.0 减重）：仅接受 fork 语义（SIGCHLD / vfork / fork 号）——快照客户地址空间（区间级 inheritable section）+ CONTEXT 传递，子进程 MapViewOfFileEx 回原地址后从 fork 返回点继续；父返回子 pid、子返回 0。0.1.0 起：不可变区域（映像 X/R 段 + 解释器段 + 岛页）section 跨 fork 共享（kind-3），可变区域按 fork 拷贝；mprotect 运行时历史经账本（T3.2）在子进程重放，PROT_NONE 洞（mallocng donate）由拷贝侧跳过。⚠ 线程类 clone（CLONE_VM 等）诚实拒绝（单线程契约）；⚠ 性能非目标（-v 打印 copied/immutable KiB） |
+| 280 | utimensat | 🟨 | **0.1.0 新增**：文件时间戳设置（AT_FDCWD 相对 / 绝对路径）；`SetFileTime` 落地。⚠ ctime 无 Windows 对应（不触碰）；`UTIME_NOW` 取当前时钟 |
 | 62 | kill | 🟨 | 最小集（0.0.6）：SIGKILL/SIGTERM → TerminateProcess(128+sig)、sig 0 → 探测；其余信号 → ENOSYS（信号**投递**仍 NONGOALS，客户 handler 永不触发） |
 | 109/121/111 | setpgid/getpgid/getpgrp | 🟨 | 诚实近似（0.0.6）：pgid=sid=pid（单进程无会话）；setpgid 校验后返回 0 |
 | 112/124 | setsid/getsid | 🟨 | 同上：返回 pid |
@@ -96,11 +97,24 @@
 
 ## 已知不做（NONGOALS，见 docs/NONGOALS.md）
 
-socket/epoll、clone/futex/线程、信号投递（rt_sigaction 等当前 ENOSYS）、fork、
-MAP_SHARED 文件映射、glibc 动态链接（非 musl interp 诚实拒绝）、
+socket/epoll、clone/futex/线程、信号投递（rt_sigaction 等仅记账，handler
+永不触发）、MAP_SHARED 文件映射、glibc 动态链接（非 musl interp 诚实拒绝）、
 32 位 / 其他架构、Go 运行时。
+
+## 陷阱与热路径（0.1.0）
+
+- **island trampoline（`--trap=auto` 默认）**：通过校验的 syscall 站点用
+  2 字节短跳进附近 RX 岛页，岛内保存现场、切宿主栈、直调 dispatch——
+  绕过内核异常往返。校验不过的站点（迁移指令 >3 字节 / 分支目标 /
+  rip 相对窗口冲突）整图回退 VEH（混合模式，`island/veh` 计数见 doctor）。
+- **UD2 + VEH（后备/真实故障）**：异常处理全程宿主栈（T2.4 red zone
+  纪律）；裸 `syscall`（0F 05）#UD 作为漏 patch 点的兜底自愈。
+- loader patch 为线性指令走查（最小长度解码器）——0.1.0 前的裸字节
+  扫描会误伤指令内部字节（busybox ash makestrspace 现场，
+  docs/plans/ash-ud1.md §7）。
 
 ## 诊断
 
-- `vela doctor`：报告 FSGSBASE、映射约定、guest 产物状态
-- `VELA_LOG=1` / `-v`：strace 风格逐 syscall 日志（含 rip，stderr）
+- `vela doctor`：FSGSBASE、映射约定、trap 后端、fork 快照/地址空间债说明、guest 产物状态
+- `VELA_LOG=1` / `-v`：strace 风格逐 syscall 日志（含 rip，stderr）；
+  fork 打印 `copied/immutable KiB`；execve 打印 reserve debt（T4.5/T4.6）

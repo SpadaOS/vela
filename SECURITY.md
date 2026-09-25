@@ -1,31 +1,44 @@
-# Security Policy / 安全策略
+# 安全策略（Security Policy）
 
-## Supported versions / 支持版本
+## 支持的版本
 
-| Version | Supported |
-|---|---|
-| 0.0.x | ✅ |
+| 版本 | 支持状态 |
+| --- | --- |
+| 0.1.x | 支持（安全修复） |
+| < 0.1 | 仅关键缺陷回补 |
 
-## Reporting a vulnerability / 报告漏洞
+## Vela 不是沙箱（重要）
 
-**请勿通过公开 issue 报告安全漏洞。**
+**Vela 的威胁模型不隔离客户程序。** 客户 ELF 与 vela.exe 运行在同一个
+Windows 进程与同一个用户令牌下，共享地址空间与全部访问权限：
 
-请使用 GitHub 的 [Private vulnerability reporting](https://github.com/spadaos/vela/security/advisories/new)
-提交私密报告，或在 issue 中申请进一步联系方式。我们会在 72 小时内确认。
+- 客户可以读写 vela 进程能读写的任何内存（客户"系统调用"是进程内
+  跳板，不是内核边界）；
+- 客户发起的文件/路径操作经 vela 的映射表翻译，但翻译之外的宿主
+  资源不在隔离边界内；
+- 客户崩溃等同于 vela 进程崩溃（这是设计：诚实失败优于错误结果）。
 
-报告时请包含：受影响版本、复现步骤、影响评估、（如有）修复建议。
+**请勿运行不可信的二进制。** Vela 的隔离目标只有一条：把"Linux ELF
+在 Windows 上的行为差异"收敛到可预期，而不是把"恶意代码"关在门外。
+沙箱语义（限制客户系统调用面、资源配额、进程令牌降权）明确列在
+NONGOALS（见 README）。
 
-## Scope / 范围
+## 报告漏洞
 
-Vela **明确不是安全沙箱**——客户代码与 `vela.exe` 同进程同权限。以下情况
-**不属于**漏洞：
+- 渠道：GitHub Security Advisories（仓库 Security 标签 → Report a
+  vulnerability），私密披露；请勿先开公开 issue。
+- 响应目标：48 小时内确认，7 天内给出评估与修复计划。
+- 请附：vela 版本（`vela --version`）、`vela doctor` 输出、最小复现
+  （ELF 生成方式 + 命令行 + `-v` 日志）。
 
-- 客户程序可以读写宿主进程内存、执行任意宿主代码
-- 客户程序可以访问当前用户能访问的一切资源
-- guest 加载了恶意 ELF 导致的任何后果
+## 分发与运行建议
 
-以下属于漏洞：
-
-- Vela 在**未运行任何 guest** 时崩溃或越权访问
-- `vela` CLI 的参数处理（加载前路径）导致的越权
-- Host trait 实现将宿主资源意外暴露给预期的 guest 语义之外
+- **来源**：仅使用仓库 Releases 的 zip（附 SHA256，发布时校验）或
+  自行从源码构建。不要运行来路不明的 `vela.exe`。
+- **SmartScreen**：未签名的本地构建会触发 Mark-of-the-Web 提示；
+  解锁单个文件用属性面板，批量分发请自行签名。
+- **杀毒软件**：Vela 会在进程内改写客户代码页并注入异常处理器——
+  这与打包壳/注入器的行为形态相似，可能被启发式拦截。若误报，把
+  vela 所在目录加入排除，而不是关闭实时防护。
+- **运行边界**：客户程序的权限 = 运行 `vela run` 的用户权限；
+  `--root`/`--map` 是路径翻译约定，不是权限边界。
