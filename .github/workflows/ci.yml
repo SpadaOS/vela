@@ -52,8 +52,11 @@ jobs:
         run: bash tools/build-busybox.sh
       - name: ash diagnostics (PLAN-0.1.0 T3.1 — UD1 repro artifacts)
         run: |
+          (Get-Item guest/bin/busybox).Length
           cargo run -p vela-cli --bin vela -- run --soft-tls -v guest/bin/busybox sh -c "echo hello | wc -c" 2> sh-trace.log || true
-          Get-Content sh-trace.log -Tail 3
+          Get-Content sh-trace.log -Tail 60
+          cargo run -p vela-cli --bin vela -- run --soft-tls -v guest/bin/busybox sh -c 'a=b; echo $a' 2> sh-trace3.log || true
+          Get-Content sh-trace3.log -Tail 20
           cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/busybox echo applet-ok
       - name: ash shell acceptance (PLAN-0.1.0 T3.3/T3.4 — failure fails CI)
         run: |
@@ -64,11 +67,13 @@ jobs:
           cargo run -p vela-cli --bin vela -- run --soft-tls --root "$env:RUNNER_TEMP\ash-root" guest/bin/busybox sh -c 'echo x > /tmp/t && cat /tmp/t'
       - name: upload ash artifacts (busybox ELF + trace)
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: ash-ud1
           path: |
             guest/bin/busybox
             sh-trace.log
+            sh-trace3.log
           if-no-files-found: warn
       - name: Guest acceptance (spec 9.4, freshly generated images)
         run: |
