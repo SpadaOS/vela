@@ -35,6 +35,15 @@ for f in ECHO LS CAT TRUE FALSE NPROC ENV PRINTF \
   sed -i "s/^# CONFIG_${f} is not set/CONFIG_${f}=y/" .config
 done
 sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
+# 0.1.0 M3：applet 内建解析。guest 无 /bin 文件树（busybox 多调用二进制
+# 无符号链接），宿主 PATH 是 Windows 形态——ash 必须经 applet 表直接
+# 运行命令（PREFER_APPLETS + STANDALONE），`sh -c 'echo|wc'` 才可解析。
+sed -i 's/^# CONFIG_FEATURE_PREFER_APPLETS is not set/CONFIG_FEATURE_PREFER_APPLETS=y/' .config
+sed -i 's/^# CONFIG_FEATURE_SH_STANDALONE is not set/CONFIG_FEATURE_SH_STANDALONE=y/' .config
+# STANDALONE 的 ash 经 bb_busybox_exec_path 重入 busybox 跑 applet，默认
+# /proc/self/exe 在 vela 无 /proc——改指 /bin/busybox（CI --map /bin=guest/bin）。
+sed -i 's|^CONFIG_BUSYBOX_EXEC_PATH=.*|CONFIG_BUSYBOX_EXEC_PATH="/bin/busybox"|' .config
+grep -q 'CONFIG_BUSYBOX_EXEC_PATH="/bin/busybox"' .config || echo 'CONFIG_BUSYBOX_EXEC_PATH="/bin/busybox"' >> .config
 # 固化 config（非交互应答全部默认）
 yes "" | make oldconfig HOSTCC=gcc >/dev/null 2>&1 || true
 

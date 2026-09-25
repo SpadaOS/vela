@@ -8,7 +8,23 @@
 
 - 岛页 syscall 热路径（VEH 降为后备）、陷阱走宿主栈、red zone 纪律
 - fork：映像只读段共享、快照体积/地址空间债可观测、mprotect 账本恢复
-- ash 最小 `sh -c` 闭环（或按决策点正式降级）
+- **ash 最小 `sh -c` 闭环达成**（CI 硬门禁）：`echo hello | wc -c` /
+  `echo $(echo ok)` / `a=b; echo $a` / `--root` 下重定向 + cat 全部通过。
+  过程中三处根因修复：
+  1. loader syscall patch 裸字节扫描 → 线性指令走查（最小 x86-64 长度
+     解码器）。裸扫描把 `lea` rel32 位移里的 `0F 05` 误 patch 成 UD2，
+     破坏 ash `makestrspace` 的全局指针装载（CI 0x40055adf/0x40106ac8
+     精确复算）；漏 patch 点由裸 `syscall` #UD 异常兜底自愈
+  2. fork 快照拷贝跳过 mprotect 账本中 PROT_NONE 子区间（musl mallocng
+     的 donate 把堆首页转 NOACCESS，整块 memcpy 读到即宿主 AV）；
+     sys_mmap 的保护位收敛入账本
+  3. fork 子进程命令行重放剥掉 `run` token（此前吞掉全部选项，
+     子进程 fs 表/软 TLS 配置静默丢失）；imm 缓存 section 不随
+     单次 fork 关闭（跨 fork 复用句柄）；`internal_fork_main` 静默
+     失败点全部补诊断日志
+- busybox 构建：`FEATURE_PREFER_APPLETS`/`FEATURE_SH_STANDALONE` +
+  `BUSYBOX_EXEC_PATH=/bin/busybox`（CI `--map /bin` 供给），applet 经
+  内建表解析，不依赖宿主 PATH
 - `utimensat`；SIGCHLD 记账（不投递）
 - Host 增 Trap/Proc 桩；Windows 为唯一实现；runtime 去 Windows API
 - dispatch 拆分、doctor 2.0、Ctrl+C 进程树

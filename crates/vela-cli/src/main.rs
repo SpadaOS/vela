@@ -316,7 +316,11 @@ fn resolve_interp(
 /// 3. 宿主风格路径（含 \ 或 :，或不带 / 的相对宿主路径）→ 直接按宿主路径。
 fn resolve_exec_path(proc: &GuestProcess, path: &str) -> Option<std::path::PathBuf> {
     if path.starts_with('/') {
-        return proc.fs.translate(path);
+        let t = proc.fs.translate(path);
+        if logx::enabled() {
+            eprintln!("[vela] exec resolve: translate({path:?}) = {t:?}");
+        }
+        return t;
     }
     let g = format!("{}/{}", proc.cwd.trim_end_matches('/'), path);
     if let Some(hp) = proc.fs.translate(&g) {
@@ -342,6 +346,9 @@ fn do_execve(st: &mut GuestState, args: &[u64; 6]) -> Result<(u64, u64), i64> {
 
     // 1. 路径与参数读取（旧映像仍完整可读）
     let path = vela_runtime::read_cstr(&st.proc, path_ptr).map_err(err)?;
+    if logx::enabled() {
+        eprintln!("[vela] execve path: {path:?}");
+    }
     let mut argv: Vec<String> = Vec::new();
     let mut p = argv_ptr;
     loop {
@@ -847,7 +854,13 @@ unsafe extern "system" fn trap(nr: u64, args: &[u64; 6], frame: &mut TrapFrame) 
                 }
                 return 0;
             }
-            Err(e) => e,
+            Err(e) => {
+                // T3.1：fork 子进程内 execve 失败必须可诊断（ash 管道现场）
+                if logx::enabled() {
+                    eprintln!("[vela] execve failed: {e}");
+                }
+                e
+            }
         }
     } else if nr == vela_abi::SYS_FORK
         || nr == vela_abi::SYS_VFORK

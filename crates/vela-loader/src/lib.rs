@@ -221,21 +221,235 @@ pub fn parse(bytes: &[u8]) -> Result<ElfInfo, LoadError> {
 
 // ---------------------------------------------------------------- patch
 
-/// 朴素扫描：可执行段内连续的 `0F 05`（syscall）改写为 `0F 0B`（UD2）。
-/// 已知风险（规格 5.3）：紧邻数据恰好组成 0F 05 的误报概率极低，v0 接受。
-/// patch 点 VA 记入 `sites`（0.1.0 T2.1：岛页跳板只信这份清单，不认
-/// 客户自身代码里的 UD2）。返回 patch 数量。
+/// 最小 x86-64 指令长度解码（线性走查专用）：只求「长度正确或承认失败」，
+/// 不做语义分析。返回 None = 不可解码（数据 / 未覆盖编码）。
+/// 覆盖编译器产出代码的主流编码；SIB/disp/imm 与 0F 两字节表齐备。
+fn insn_len(b: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    let mut o66 = false;
+    loop {
+        match b.get(i)? {
+            0x66 => {
+                o66 = true;
+                i += 1;
+            }
+            0x67 | 0xF0 | 0xF2 | 0xF3 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65 => i += 1,
+            _ => break,
+        }
+    }
+    let mut rex_w = false;
+    let p = *b.get(i)?;
+    if p & 0xF0 == 0x40 {
+        rex_w = p & 0x08 != 0;
+        i += 1;
+    }
+    let op = *b.get(i)?;
+    // 64 位模式下这些单字节操作码无效（未被前缀消化时）
+    if matches!(
+        op,
+        0x06 | 0x07
+            | 0x0E
+            | 0x0F
+            | 0x16
+            | 0x17
+            | 0x1E
+            | 0x1F
+            | 0x27
+            | 0x2F
+            | 0x37
+            | 0x3F
+            | 0x60
+            | 0x61
+            | 0x62
+            | 0x82
+            | 0xC4
+            | 0xC5
+            | 0x9A
+            | 0xD4
+            | 0xD5
+            | 0xD6
+            | 0xEA
+            | 0xF1
+    ) {
+        return None;
+    }
+    // ModRM 系操作码（含随后 immediate 由调用方拼接）
+    let modrm = |b: &[u8]| modrm_disp_len(b);
+    // moffs64（A0-A3）：66 缩为 2
+    let moffs = if o66 { 2 } else { 8 };
+    let immz = if o66 { 2 } else { 4 };
+    // tail = ModRM+disp 之外的立即数/相对量长度；total = 全指令长度，
+    // 统一在出口做整体越界校验（截断指令按 None 处理，避免误吞后续字节）
+    let total: usize = match op {
+        // AL/AX, imm8
+        0x04 | 0x0C | 0x14 | 0x1C | 0x24 | 0x2C | 0x34 | 0x3C | 0xA8 => i + 1 + 1,
+        // eAX, immz
+        0x05 | 0x0D | 0x15 | 0x1D | 0x25 | 0x2D | 0x35 | 0x3D | 0xA9 => i + 1 + immz,
+        // moffs 形式
+        0xA0..=0xA3 => i + 1 + moffs,
+        0x68 => i + 1 + immz,
+        0x6A => i + 1 + 1,
+        0x69 => i + 1 + modrm(&b[i + 1..])? + immz,
+        0x6B => i + 1 + modrm(&b[i + 1..])? + 1,
+        0x70..=0x7F => i + 1 + 1,
+        0x80 => i + 1 + modrm(&b[i + 1..])? + 1,
+        0x81 => i + 1 + modrm(&b[i + 1..])? + immz,
+        0x83 => i + 1 + modrm(&b[i + 1..])? + 1,
+        0xB0..=0xB7 => i + 1 + 1,
+        0xB8..=0xBF => {
+            if rex_w {
+                i + 1 + 8
+            } else {
+                i + 1 + immz
+            }
+        }
+        0xC0 | 0xC1 | 0xC6 => i + 1 + modrm(&b[i + 1..])? + 1,
+        0xC2 | 0xCA => i + 1 + 2,
+        0xC7 => i + 1 + modrm(&b[i + 1..])? + immz,
+        0xC8 => i + 1 + 3,
+        0xCD => i + 1 + 1,
+        0xD7
+        | 0x90..=0x99
+        | 0x9B..=0x9F
+        | 0xA4..=0xA7
+        | 0xAA..=0xAF
+        | 0xC3
+        | 0xC9
+        | 0xCC
+        | 0xCF
+        | 0xEC..=0xEF
+        | 0xF4
+        | 0xF5
+        | 0xF8..=0xFD => i + 1,
+        0xE0..=0xE3 | 0xE4 | 0xE5 | 0xE6 | 0xE7 | 0xEB => i + 1 + 1,
+        0xE8 | 0xE9 => i + 1 + 4,
+        0xF6 => {
+            let m = *b.get(i + 1)?;
+            i + 1 + modrm(&b[i + 1..])? + if m & 0x38 == 0 { 1 } else { 0 }
+        }
+        0xF7 => {
+            let m = *b.get(i + 1)?;
+            i + 1 + modrm(&b[i + 1..])? + if m & 0x38 == 0 { immz } else { 0 }
+        }
+        // 0x00..=0x3F 的 ModRM 组（add/or/adc/sbb/and/sub/xor/cmp 两个方向）
+        0x00..=0x03
+        | 0x08..=0x0B
+        | 0x10..=0x13
+        | 0x18..=0x1B
+        | 0x20..=0x23
+        | 0x28..=0x2B
+        | 0x30..=0x33
+        | 0x38..=0x3B
+        | 0x63
+        | 0x84..=0x8F
+        | 0xD0..=0xD3
+        | 0xD8..=0xDF
+        | 0xFE
+        | 0xFF => i + 1 + modrm(&b[i + 1..])?,
+        _ => return None, // 其余单字节：64 位无效/未覆盖
+    };
+    if total <= b.len() {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+/// ModRM + SIB + displacement 长度（不含 immediate）。b 从 ModRM 字节开始。
+fn modrm_disp_len(b: &[u8]) -> Option<usize> {
+    let modrm = *b.first()?;
+    let (m, rm) = (modrm >> 6, modrm & 7);
+    let mut n = 1;
+    if m != 3 && rm == 4 {
+        // SIB 字节
+        let sib = *b.get(n)?;
+        n += 1;
+        if sib & 7 == 5 && m == 0 {
+            n += 4; // base=101, mod=0 → disp32
+        }
+    }
+    match m {
+        0 if rm == 5 => n += 4, // RIP 相对 / disp32 绝对
+        1 => n += 1,
+        2 => n += 4,
+        _ => {}
+    }
+    Some(n)
+}
+
+/// 两字节操作码（0F xx）长度。b[0] == 0x0F。
+fn insn_len_0f(b: &[u8]) -> Option<usize> {
+    let op = *b.get(1)?;
+    let modrm = |b: &[u8]| modrm_disp_len(b);
+    let total: usize = match op {
+        // syscall / ud2 / clts / invd / wbinvd / rdtsc 系：无操作数
+        0x05 | 0x06 | 0x07 | 0x08 | 0x09 | 0x0B | 0x30..=0x37 | 0xA2 | 0xAA | 0xC8..=0xCF => 2,
+        0x38 => {
+            // 0F 38 xx modrm
+            let _x = *b.get(2)?;
+            3 + modrm(&b[3..])?
+        }
+        0x3A => {
+            // 0F 3A xx modrm imm8
+            let _x = *b.get(2)?;
+            4 + modrm(&b[3..])?
+        }
+        0x80..=0x8F => 6,                                 // jcc rel32
+        0x70..=0x73 | 0xBA | 0xC2 => modrm(&b[2..])? + 3, // + imm8
+        0xA4 | 0xAC => modrm(&b[2..])? + 3,
+        0x00..=0x03
+        | 0x0D
+        | 0x0F
+        | 0x10..=0x2F
+        | 0x40..=0x6F
+        | 0x74..=0x7F
+        | 0x90..=0x9F
+        | 0xA3
+        | 0xA5..=0xA7
+        | 0xAB
+        | 0xAD..=0xAF
+        | 0xB0..=0xB7
+        | 0xB9
+        | 0xBB..=0xC1
+        | 0xC3..=0xC7
+        | 0xD0..=0xFF => 2 + modrm(&b[2..])?,
+        _ => return None,
+    };
+    if total <= b.len() {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+/// 线性指令走查扫描：只把「指令起点上的 `0F 05`」改写为 `0F 0B`（UD2）。
+/// 裸字节扫描（≤0.0.6）会把其他指令内的 `0F 05`（如 lea rel32 位移
+/// `e9 0f 05 00`）误当 syscall 破坏代码——busybox ash 的
+/// makestrspace 现场即此（ash_ptr_to_globals_memstack 读 AV，
+/// CI 产物 0x40055adf/0x40106ac8 精确复算证实）。
+/// 不可解码处逐字节滑过并放弃该处 patch——漏点由运行时陷阱后端的
+/// 裸 syscall 异常兜底自愈（vela-sys），宁可漏不可错。patch 点 VA 记入
+/// `sites`（0.1.0 T2.1：岛页跳板只信这份清单）。返回 patch 数量。
 pub fn patch_syscalls(code: &mut [u8], base: u64, sites: &mut Vec<u64>) -> usize {
     let mut n = 0;
     let mut i = 0;
     while i + 1 < code.len() {
-        if code[i] == 0x0F && code[i + 1] == 0x05 {
-            code[i + 1] = 0x0B;
-            sites.push(base + i as u64);
-            n += 1;
-            i += 2;
+        let len = if code[i] == 0x0F {
+            insn_len_0f(&code[i..])
         } else {
-            i += 1;
+            insn_len(&code[i..])
+        };
+        match len {
+            Some(l) => {
+                if l == 2 && code[i] == 0x0F && code[i + 1] == 0x05 {
+                    code[i + 1] = 0x0B;
+                    sites.push(base + i as u64);
+                    n += 1;
+                }
+                i += l;
+            }
+            // 不可解码：滑过一字节，本区域放弃 patch（诚实漏点）
+            None => i += 1,
         }
     }
     n

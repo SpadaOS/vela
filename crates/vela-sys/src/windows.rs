@@ -335,10 +335,13 @@ unsafe extern "system" fn veh_handler(ep: *mut ExceptionPointers) -> i32 {
         );
         std::process::exit(139);
     }
-    // 确认该位置确为 patch 点（UD2），避免吞掉客户真实的非法指令
+    // 确认该位置确为 patch 点（UD2），避免吞掉客户真实的非法指令。
+    // 兜底（0.1.0 M3）：裸 `syscall`（0F 05）也按 patch 点处理——loader
+    // 线性走查在不可解码区（数据混排）会诚实漏 patch，客户执行到漏点时
+    // CPU 在用户态发 #UD，此处自愈模拟（语义与 UD2 点一致：rip+2 续跑）。
     // SAFETY: rip..rip+2 已确认位于客户可执行映射内
     let code = unsafe { std::slice::from_raw_parts(rip as *const u8, 2) };
-    if code != [0x0F, 0x0B] {
+    if code != [0x0F, 0x0B] && code != [0x0F, 0x05] {
         let hb: Vec<String> = unsafe { std::slice::from_raw_parts(rip as *const u8, 16) }
             .iter()
             .map(|b| format!("{b:02x}"))

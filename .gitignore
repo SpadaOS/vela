@@ -13,3 +13,8 @@ Thumbs.db
 # musl 本地源码树（ldso 复现构建用，不入库）
 musl-1.2.5/
 /target2
+
+# busybox 构建树与本地诊断产物（CI 生成，不入库）
+.busybox-src/
+guest/bin/busybox
+sh-trace*.log

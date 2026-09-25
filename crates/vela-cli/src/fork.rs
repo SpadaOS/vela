@@ -31,6 +31,48 @@ pub const SIGCHLD_FLAGS: u64 = 17;
 
 // ---------------------------------------------------------------- 定长编解码
 
+/// 拷贝 [src, src+len) 到快照视图，跳过账本中 PROT_NONE（prot==0）子区间。
+/// 不可读页在 section 视图中保持零填充；子进程由账本重放恢复 NOACCESS。
+/// 背景：musl mallocng 的 donate 用 MAP_FIXED+PROT_NONE 把堆首等预留页
+/// 转为不可读（T3.2 账本已记录）——整块 memcpy 读到 PAGE_NOACCESS 页
+/// 会引发宿主 AV（CI ash `echo hello | wc -c` 现场）。
+/// SAFETY: 调用方保证 [src, src+len) 除 NOACCESS 洞外已登记可读，
+/// dst 为本进程刚映射的可写视图且长度 ≥ len。
+unsafe fn copy_readable(src: u64, dst: *mut u8, len: u64, ledger: &[vela_runtime::ProtOverride]) {
+    let end = src + len;
+    let mut holes: Vec<(u64, u64)> = ledger
+        .iter()
+        .filter(|p| p.prot == 0 && p.start < end && p.start + p.len > src)
+        .map(|p| (p.start.max(src), (p.start + p.len).min(end)))
+        .collect();
+    holes.sort_unstable();
+    // 合并重叠洞，顺序输出可读子区间
+    let mut cur = src;
+    for (hs, he) in holes {
+        if hs >= he || he <= cur {
+            continue;
+        }
+        let hs = hs.max(cur);
+        if hs > cur {
+            // SAFETY: [cur, hs) 已确认可读；dst 偏移区间在视图内
+            std::ptr::copy_nonoverlapping(
+                cur as *const u8,
+                dst.add((cur - src) as usize),
+                (hs - cur) as usize,
+            );
+        }
+        cur = he;
+    }
+    if cur < end {
+        // SAFETY: [cur, end) 已确认可读；dst 偏移区间在视图内
+        std::ptr::copy_nonoverlapping(
+            cur as *const u8,
+            dst.add((cur - src) as usize),
+            (end - cur) as usize,
+        );
+    }
+}
+
 struct W {
     buf: Vec<u8>,
 }
@@ -606,9 +648,10 @@ pub fn do_fork(st: &mut GuestState, args: &[u64; 6], frame: &mut TrapFrame) -> R
                     Ok(v) => v,
                     Err(e) => bail!("map_section_anywhere(imm)", e),
                 };
-                // SAFETY: 同上
+                // SAFETY: view 为本进程刚映射的可写视图；客户区间已登记可读
+                // （账本 PROT_NONE 洞跳过——mallocng donate 页）
                 unsafe {
-                    std::ptr::copy_nonoverlapping(*s as *const u8, view as *mut u8, len as usize);
+                    copy_readable(*s, view as *mut u8, len, &st.proc.prot_ledger);
                 }
                 let _ = st.host.unmap_section_view(view);
                 entries.push((sec, *s, len));
@@ -619,9 +662,14 @@ pub fn do_fork(st: &mut GuestState, args: &[u64; 6], frame: &mut TrapFrame) -> R
                 key: imm.clone(),
             });
         }
-        // 缓存命中：不可变区间直接引用 section（零拷贝）
+        // 缓存命中：不可变区间直接引用 section（零拷贝）。缓存 section
+        // 必须保持继承标志（子进程 CreateProcessW 继承的前提），且不得
+        // 随本次 fork 收尾关闭（跨 fork 复用，见下方 close 循环的排除表）。
         if let Some(c) = cache.as_ref() {
             for (sec, start, len) in &c.entries {
+                if let Err(e) = st.host.set_inherit(*sec) {
+                    bail!("inherit(section-imm-cached)", e);
+                }
                 range_sers.push(RangeSer {
                     start: *start,
                     len: *len,
@@ -653,8 +701,9 @@ pub fn do_fork(st: &mut GuestState, args: &[u64; 6], frame: &mut TrapFrame) -> R
             Err(e) => bail!("map_section_anywhere", e),
         };
         // SAFETY: view 为本进程刚映射的可写视图；客户区间已登记可读
+        // （账本 PROT_NONE 洞跳过）
         unsafe {
-            std::ptr::copy_nonoverlapping(*s as *const u8, view as *mut u8, len as usize);
+            copy_readable(*s, view as *mut u8, len, &st.proc.prot_ledger);
         }
         let _ = st.host.unmap_section_view(view);
         copied += len;
@@ -681,9 +730,9 @@ pub fn do_fork(st: &mut GuestState, args: &[u64; 6], frame: &mut TrapFrame) -> R
             Ok(v) => v,
             Err(e) => bail!("map_section_anywhere", e),
         };
-        // SAFETY: 同上
+        // SAFETY: 同上（账本 PROT_NONE 洞跳过——堆/栈含 donate 页）
         unsafe {
-            std::ptr::copy_nonoverlapping(r.start as *const u8, view as *mut u8, r.len as usize);
+            copy_readable(r.start, view as *mut u8, r.len, &st.proc.prot_ledger);
         }
         let _ = st.host.unmap_section_view(view);
         copied += r.len;
@@ -754,13 +803,19 @@ pub fn do_fork(st: &mut GuestState, args: &[u64; 6], frame: &mut TrapFrame) -> R
     frame_meta.extend_from_slice(&payload);
 
     // 4. spawn vela 自身：完整透传父命令行 + --internal-fork <读端句柄>
+    // skip(2)：剥掉 exe 与 "run" 子命令 token——子进程
+    // --internal-fork 分支按 cmd_run(&args[2..]) 重放，若把 "run" 留下
+    // 会被当作位置参数吞掉全部选项（maps/soft_tls 静默丢失，ash 管道
+    // 现场第二个子进程 execve /bin/busybox ENOENT 即此）。
+    // 已知边界：位置参数中的空格不重引号——internal-fork 分支在解析
+    // 后直接恢复快照，不消费位置参数，仅选项必须完整。
     let mut cmd = match std::env::current_exe() {
         Ok(p) => p.to_string_lossy().into_owned(),
         Err(e) => bail!("current_exe", e),
     };
     cmd.push_str(" --internal-fork ");
     cmd.push_str(&rmeta.to_string());
-    for a in std::env::args().skip(1) {
+    for a in std::env::args().skip(2) {
         cmd.push(' ');
         cmd.push_str(&a);
     }
@@ -774,10 +829,16 @@ pub fn do_fork(st: &mut GuestState, args: &[u64; 6], frame: &mut TrapFrame) -> R
         Ok(c) => c,
         Err(e) => bail!("create_child_process", e),
     };
-    // 写端关闭后子进程读到 EOF；读端句柄归子进程，父侧关闭
+    // 写端关闭后子进程读到 EOF；读端句柄归子进程，父侧关闭。
+    // section 句柄：一次性 section（kind 0/1/2）父侧同步关闭；kind 3
+    // 是 imm_cache 的跨 fork 资产，关闭会让下次 fork 传给子进程死句柄
+    //（busybox ash 双 fork 现场：第二个管道子进程 map EINVAL 静默退出）。
     st.host.close_handle(wmeta);
     st.host.close_handle(rmeta);
     for r in &meta.ranges {
+        if r.kind == 3 {
+            continue; // imm 缓存 section：跨 fork 存活，随进程退出回收
+        }
         st.host.close_handle(r.sec);
     }
 
@@ -800,17 +861,22 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
         // 1. 读元数据（长度帧 + payload）
         let mut lenb = [0u8; 8];
         if host.pipe_read_exact(meta_handle, &mut lenb).is_err() {
+            eprintln!("[vela] fork child: meta length read failed");
             return 1;
         }
         let len = u64::from_le_bytes(lenb) as usize;
         let mut payload = vec![0u8; len];
         if host.pipe_read_exact(meta_handle, &mut payload).is_err() {
+            eprintln!("[vela] fork child: meta payload read failed");
             return 1;
         }
         host.close_handle(meta_handle);
         let meta = match decode(&payload) {
             Ok(m) => m,
-            Err(_) => return 1,
+            Err(_) => {
+                eprintln!("[vela] fork child: meta decode failed");
+                return 1;
+            }
         };
 
         // 2. 区间恢复：MapViewOfFileEx 回客户原地址（指针一致性前提）
@@ -822,7 +888,12 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
                 _ => MemKind::Reserve,
             };
             // SAFETY: base 在本进程为空闲地址；section 由父继承
-            if unsafe { host.map_section_at(r.sec, r.start) }.is_err() {
+            if let Err(e) = unsafe { host.map_section_at(r.sec, r.start) } {
+                // 崩溃必须有解释：区间恢复失败 = 无法继续（地址/对齐/句柄）
+                eprintln!(
+                    "[vela] fork child: map_section_at({:#x}, len {:#x}, kind {}) failed: {e:?}",
+                    r.start, r.len, r.kind
+                );
                 return 1;
             }
             let range = match kind {
@@ -992,6 +1063,7 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
         }
         st.host.replace_exec_ranges(&exec_ranges);
         if st.host.install_trap(crate::trap).is_err() {
+            eprintln!("[vela] fork child: install_trap failed");
             return 1;
         }
         if meta.soft_tls {
@@ -1007,7 +1079,14 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
 
         // 9. 注入 CONTEXT 从 fork 返回点继续（rax=0 = 子返回值）
         if meta.ctx.len() != 0x4D0 {
+            eprintln!("[vela] fork child: ctx size {} != 0x4D0", meta.ctx.len());
             return 1;
+        }
+        if crate::logx::enabled() {
+            eprintln!(
+                "[vela] fork child: restored {} ranges, resuming",
+                meta.ranges.len()
+            );
         }
         // SAFETY: 客户栈/代码/堆均已恢复到原地址且登记
         unsafe { st.host.resume_child(&meta.ctx) }

@@ -1148,6 +1148,15 @@ fn sys_mmap(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 {
             if prot.bits() != (HostProt::READ | HostProt::WRITE).bits() {
                 let _ = unsafe { host.protect(addr as usize, len_up as usize, prot) };
             }
+            // T3.2 账本（fork 快照一致性）：mallocng 的 donate 用
+            // MAP_FIXED+PROT_NONE 把堆首/预留区页转为不可读——不记账则
+            // fork 快照整块 memcpy 读到 PAGE_NOACCESS 页 → 宿主 AV
+            //（CI ash `echo hello | wc -c` 现场，addr=堆基址精确吻合）。
+            proc.prot_ledger.push(crate::ProtOverride {
+                start: addr,
+                len: len_up,
+                prot: linux_prot as u8,
+            });
             return addr as i64;
         }
         return -(abi::ENOMEM as i64);
@@ -1172,6 +1181,12 @@ fn sys_mmap(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 {
     let prot = HostProt::from_bits(linux_prot as u32);
     if prot.bits() != (HostProt::READ | HostProt::WRITE).bits() {
         let _ = unsafe { host.protect(got as usize, len_up as usize, prot) };
+        // 同上：收敛保护位必须入账本（fork 快照/子进程重放一致性）
+        proc.prot_ledger.push(crate::ProtOverride {
+            start: got,
+            len: len_up,
+            prot: linux_prot as u8,
+        });
     }
     proc.mem.add(crate::mem::MemRange::reserve(got, len_up));
     got as i64

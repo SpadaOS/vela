@@ -28,6 +28,38 @@ fn patcher_ignores_non_syscall() {
 }
 
 #[test]
+fn patcher_never_touches_syscall_inside_displacement() {
+    // `48 8d 05 e9 0f 05 00` = lea rax,[rip+0x50fe9]——位移字节里嵌着
+    // 0F 05（CI busybox ash makestrspace 现场：裸字节扫描把位移改成
+    // e9 0f 0b 00，lea 目标偏移 +0x60000，读 ash_ptr_to_globals
+    // _memstack 变成野地址 0x40106ac8 → AV）。线性走查必须认出整条
+    // lea 并完整跳过。
+    let orig = vec![0x48, 0x8d, 0x05, 0xe9, 0x0f, 0x05, 0x00];
+    let mut buf = orig.clone();
+    let mut sites = Vec::new();
+    let n = patch_syscalls(&mut buf, 0x4000_0000, &mut sites);
+    assert_eq!(n, 0);
+    assert_eq!(buf, orig);
+}
+
+#[test]
+fn patcher_walks_over_common_encodings() {
+    // mov rax,1 / syscall / call rel32 / jmp rel8 / test + 末尾 REX 截断
+    let mut buf = vec![
+        0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // mov rax,1 (mod=3, imm32)
+        0x0F, 0x05, // syscall → patch
+        0xE8, 0x01, 0x00, 0x00, 0x00, // call rel32（rel32 内无 0F 05）
+        0xEB, 0xF9, // jmp rel8
+        0x48, // 截断 REX：不可解码，滑过
+    ];
+    let mut sites = Vec::new();
+    let n = patch_syscalls(&mut buf, 0x1000, &mut sites);
+    assert_eq!(n, 1);
+    assert_eq!(sites, vec![0x1007]);
+    assert_eq!(&buf[7..9], &[0x0F, 0x0B]);
+}
+
+#[test]
 fn parse_accepts_min_pie() {
     let bytes = common::build_min_hello();
     let info = parse(&bytes).expect("parse ok");
