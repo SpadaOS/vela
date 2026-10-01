@@ -28,7 +28,7 @@ file hello   # 应显示 ELF 64-bit LSB pie executable
 无 Linux 交叉环境时（规格 8.1 允许）：
 
 ```powershell
-cargo run -p vela-cli --bin vela-mkhello -- guest/hello
+cargo run -p vela-cli --bin vela-mkhello -- guest/bin/hello
 ```
 
 生成器产出与汇编版语义一致的最小合法 ET_DYN ELF（单 PT_LOAD、R|X、
@@ -37,8 +37,8 @@ cargo run -p vela-cli --bin vela-mkhello -- guest/hello
 ## 其他 guest（vela-mkguest 生成）
 
 ```powershell
-cargo run -p vela-cli --bin vela-mkguest -- torture guest/torture
-cargo run -p vela-cli --bin vela-mkguest -- tls     guest/tls
+cargo run -p vela-cli --bin vela-mkguest -- torture guest/bin/torture
+cargo run -p vela-cli --bin vela-mkguest -- tls     guest/bin/tls
 ```
 
 - **torture**（4.5KB，双 PT_LOAD：RX 代码段 + RW 数据段）：
@@ -55,13 +55,13 @@ cargo run -p vela-cli --bin vela-mkguest -- tls     guest/tls
 （无需 WSL / musl-gcc；解压即用）：
 
 ```powershell
-zig cc -target x86_64-linux-musl -fPIE -pie -O2 -o guest/hello-musl guest/src/hello-musl.c
+zig cc -target x86_64-linux-musl -fPIE -pie -O2 -o guest/bin/hello-musl guest/src/hello-musl.c
 ```
 
 > 注意：zig cc 会忽略 `-static-pie`（musl 目标默认静态），必须用
 > `-fPIE -pie` 显式生成 ET_DYN，否则 Vela 会以 non-PIE 拒绝加载。
 
-Linux/WSL 上等价命令：`musl-gcc -static-pie -O2 -o guest/hello-musl guest/src/hello-musl.c`。
+Linux/WSL 上等价命令：`musl-gcc -static-pie -O2 -o guest/bin/hello-musl guest/src/hello-musl.c`。
 
 ## `file-io`（0.0.2 M1 出口，文件 syscall 全链路验收）
 
@@ -124,7 +124,7 @@ vela run --soft-tls guest\bin\busybox nproc
 vela run --soft-tls guest\bin\busybox true
 ```
 
-本地复现需要 msys2（make/gcc/bzip2/curl）+ zig 0.13.0 在 PATH；脚本内
+本地复现需要 msys2（make/gcc/bzip2/diffutils/curl）+ zig 0.13.0 在 PATH；脚本内
 `cygpath` 处理 workspace 路径转换，并针对 zig 0.13 Windows 工具链做了三项
 修补（depfile 剥离、autoconf.h 强制生成、GNU ld 专属链接参数中和）——
 细节见脚本注释。

@@ -85,7 +85,7 @@ cargo build -p vela-cli --release
 
 ## 能力矩阵
 
-v0.1.0 实测（CI 在 Windows runner 上自动验收全部 ✅ 项）：
+v0.1.1 实测（CI 在 Windows runner 上自动验收全部 ✅ 项）：
 
 | 能力 | 状态 | 说明 |
 |---|:---:|---|
@@ -96,6 +96,7 @@ v0.1.0 实测（CI 在 Windows runner 上自动验收全部 ✅ 项）：
 | **用户态 fork** | ✅ | fork+waitpid 全语义；不可变段 section 跨 fork 共享，快照体积可观测（0.1.0 起） |
 | **busybox shell** | ✅ | `sh -c` 管道/命令替换/变量展开/重定向 CI 硬门禁（0.1.0 起） |
 | **execve** | ✅ | 进程内重载，fd 跨重载保留；pipe2 管道 |
+| **poll / select** | ✅ | 同步文件、标准流和 Vela pipe；fd 上限 1024 |
 | **syscall 热路径** | ✅ | 岛页跳板（`--trap=auto`），UD2+VEH 兜底；陷阱全程宿主栈 |
 | mmap | ✅ | 匿名 + 文件映射（COW，写不回宿主文件）；SHARED 诚实 ENOSYS |
 | TLS | ✅ | FSGSBASE 硬件路径，缺失时 `--soft-tls` 软件模拟 |
@@ -147,7 +148,7 @@ vela --version | --help
 | 选项 | 说明 |
 |---|---|
 | `--root <dir>` | 把宿主目录挂为客户根 `/` |
-| `--map <g>=<host>` | 追加前缀映射（默认 `/mnt/c` → `C:\`） |
+| `--map <g>=<host>` | 追加前缀映射；未指定 `--root` 时默认兼容 `/mnt/c` → `C:\`，指定 `--root` 后仅保留根映射和显式追加项 |
 | `--env K=V` | 传递/覆盖环境变量；`K=` 表示删除 |
 | `--uid <n>` / `--gid <n>` | 客户身份（默认 1000） |
 | `--interp <path>` | 显式指定动态链接解释器 |
@@ -210,7 +211,7 @@ Vela 当沙箱用。杀毒软件可能对"进程内改可执行内存再执行"�
 
 ## 路线
 
-- **v0.1.0（当前）**：Windows 一等运行时——岛页 syscall 热路径、陷阱走
+- **v0.1.1（当前）**：Windows 一等运行时——路径隔离、checked arithmetic、poll/select、岛页 syscall 热路径、陷阱走
   宿主栈、fork 不可变段共享 + mprotect 账本、busybox `sh -c` 闭环
   （CI 硬门禁）、utimensat、SIGCHLD 记账、Host Trap/Proc 契约收口、
   doctor 2.0、Ctrl+C 进程树、SECURITY.md。唯一可运行宿主：Windows

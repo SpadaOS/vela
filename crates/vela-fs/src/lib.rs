@@ -67,19 +67,17 @@ impl FsMap {
         if path.is_empty() {
             return None;
         }
-        if path.split('/').any(|c| c == "..") {
+        let normalized = path.replace('\\', "/");
+        if normalized.split('/').any(|c| c == "..") {
             return None; // 逃逸防护（与 add() 一致）
         }
         // 归一：反斜杠 → 正斜杠；含 "/./" 才折叠（罕见路径才分配）
         let norm_owned;
-        let norm: &str = if path.contains('\\') {
-            norm_owned = path.replace('\\', "/");
-            &norm_owned
-        } else if path.contains("/./") {
-            norm_owned = fold_dots(path);
+        let norm: &str = if normalized.contains("/./") || normalized.contains("//") {
+            norm_owned = fold_dots(&normalized);
             &norm_owned
         } else {
-            path
+            &normalized
         };
         if norm.is_empty() || !norm.starts_with('/') {
             return None; // 相对路径不接受（调用方负责拼接 cwd）
@@ -177,6 +175,8 @@ mod tests {
     fn rejects_dotdot_escape() {
         assert_eq!(translate("/mnt/c/../.."), None);
         assert_eq!(translate("/mnt/c/Users/../Users/foo"), None);
+        assert_eq!(translate("/mnt/c/..\\Windows"), None);
+        assert_eq!(translate("\\mnt\\c\\Users\\..\\Windows"), None);
     }
 
     #[test]
@@ -206,6 +206,10 @@ mod tests {
         assert_eq!(
             m.translate("/etc/passwd"),
             Some(PathBuf::from(r"E:\rootfs\etc\passwd"))
+        );
+        assert_eq!(
+            m.translate("/mnt/c/Windows"),
+            Some(PathBuf::from(r"E:\rootfs\mnt\c\Windows"))
         );
     }
 

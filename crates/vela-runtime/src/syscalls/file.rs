@@ -9,6 +9,234 @@ use crate::{
     host_err_to_errno, read_cstr, read_guest, read_guest_mut, write_guest, GuestFd, GuestProcess,
 };
 
+const MAX_POLL_FDS: u64 = 1024;
+
+fn poll_host_err(e: &HostError) -> i64 {
+    -(crate::host_err_to_errno(e) as i64)
+}
+
+/// Linux pollfd translation. The guest layout is { i32 fd, i16 events, i16 revents }.
+pub(super) fn sys_poll(
+    proc: &mut GuestProcess,
+    host: &dyn Host,
+    fds_ptr: u64,
+    nfds: u64,
+    timeout_ms: u64,
+) -> i64 {
+    if nfds > MAX_POLL_FDS || timeout_ms > i32::MAX as u64 && timeout_ms != u64::MAX {
+        return -(abi::EINVAL as i64);
+    }
+    let timeout = if timeout_ms == u64::MAX {
+        -1
+    } else {
+        timeout_ms as i32
+    };
+    let n = nfds as usize;
+    let mut entries: Vec<(i32, u16, u16)> = Vec::with_capacity(n);
+    let mut host_fds = Vec::new();
+    let mut host_index = Vec::new();
+    let stride = 8u64;
+    for i in 0..n {
+        let off = (i as u64) * stride;
+        let p = match fds_ptr.checked_add(off) {
+            Some(p) => p,
+            None => return -(abi::EFAULT as i64),
+        };
+        let raw = match read_guest(proc, p, 8) {
+            Ok(v) => v,
+            Err(e) => return -(e as i64),
+        };
+        let fd = i32::from_le_bytes(raw[0..4].try_into().unwrap());
+        let events = u16::from_le_bytes(raw[4..6].try_into().unwrap());
+        entries.push((fd, events, 0));
+        match proc.fds.get(fd) {
+            Some(GuestFd::Host(f)) | Some(GuestFd::PipeRead(f)) | Some(GuestFd::PipeWrite(f)) => {
+                host_index.push(i);
+                host_fds.push(vela_sys::HostPollFd {
+                    file: f,
+                    events,
+                    revents: 0,
+                });
+            }
+            Some(GuestFd::Null) | Some(GuestFd::Zero) => {
+                entries[i].2 = events & (abi::POLLIN | abi::POLLOUT);
+            }
+            _ if fd < 0 => {}
+            _ => entries[i].2 = abi::POLLNVAL,
+        }
+    }
+    if !host_fds.is_empty() {
+        let effective_timeout = if entries.iter().any(|(_, _, r)| *r != 0) {
+            0
+        } else {
+            timeout
+        };
+        if let Err(e) = host.poll(&mut host_fds, effective_timeout) {
+            return poll_host_err(&e);
+        }
+        for (j, &i) in host_index.iter().enumerate() {
+            entries[i].2 = host_fds[j].revents;
+        }
+    } else if timeout != 0 && entries.iter().all(|(_, _, r)| *r == 0) {
+        if let Err(e) = host.poll(&mut host_fds, timeout) {
+            return poll_host_err(&e);
+        }
+    }
+    let mut ready = 0i64;
+    for (i, (_, _, revents)) in entries.iter().enumerate() {
+        if *revents != 0 {
+            ready += 1;
+        }
+        let p = match fds_ptr.checked_add((i as u64) * stride) {
+            Some(p) => p,
+            None => return -(abi::EFAULT as i64),
+        };
+        let revents_ptr = match p.checked_add(6) {
+            Some(ptr) => ptr,
+            None => return -(abi::EFAULT as i64),
+        };
+        if let Err(e) = write_guest(proc, revents_ptr, &revents.to_le_bytes()) {
+            return -(e as i64);
+        }
+    }
+    ready
+}
+
+fn fdset_has(proc: &GuestProcess, ptr: u64, fd: usize) -> Result<bool, i32> {
+    if ptr == 0 {
+        return Ok(false);
+    }
+    let word = (fd / 64) as u64 * 8;
+    let p = ptr.checked_add(word).ok_or(abi::EFAULT)?;
+    let raw = read_guest(proc, p, 8)?;
+    Ok((u64::from_le_bytes(raw.try_into().unwrap()) & (1u64 << (fd % 64))) != 0)
+}
+
+fn fdset_clear(proc: &mut GuestProcess, ptr: u64, nfds: usize) -> Result<(), i32> {
+    if ptr == 0 {
+        return Ok(());
+    }
+    let bytes = nfds.div_ceil(64).checked_mul(8).ok_or(abi::EFAULT)?;
+    write_guest(proc, ptr, &vec![0u8; bytes])
+}
+
+fn fdset_set(proc: &mut GuestProcess, ptr: u64, fd: usize) -> Result<(), i32> {
+    if ptr == 0 {
+        return Ok(());
+    }
+    let word = (fd / 64) as u64 * 8;
+    let p = ptr.checked_add(word).ok_or(abi::EFAULT)?;
+    let raw = read_guest(proc, p, 8)?;
+    let mut bits = u64::from_le_bytes(raw.try_into().unwrap());
+    bits |= 1u64 << (fd % 64);
+    write_guest(proc, p, &bits.to_le_bytes())
+}
+
+/// select(2) conversion through the same host poll backend. `exceptfds` is
+/// accepted for ABI compatibility and remains empty because no OOB sources exist.
+pub(super) fn sys_select(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 {
+    let nfds = a[0];
+    if nfds > MAX_POLL_FDS {
+        return -(abi::EINVAL as i64);
+    }
+    let n = nfds as usize;
+    let (read_ptr, write_ptr, except_ptr, tv_ptr) = (a[1], a[2], a[3], a[4]);
+    let timeout = if tv_ptr == 0 {
+        -1
+    } else {
+        let raw = match read_guest(proc, tv_ptr, 16) {
+            Ok(v) => v,
+            Err(e) => return -(e as i64),
+        };
+        let sec = i64::from_le_bytes(raw[0..8].try_into().unwrap());
+        let usec = i64::from_le_bytes(raw[8..16].try_into().unwrap());
+        if sec < 0 || !(0..1_000_000).contains(&usec) {
+            return -(abi::EINVAL as i64);
+        }
+        let ms = (sec as u128 * 1000 + (usec as u128).div_ceil(1000)).min(i32::MAX as u128);
+        ms as i32
+    };
+    let (mapping, revents) = {
+        let mut host_fds = Vec::new();
+        let mut mapping = Vec::new();
+        let mut immediate = Vec::new();
+        for fd in 0..n {
+            let r = match fdset_has(proc, read_ptr, fd) {
+                Ok(v) => v,
+                Err(e) => return -(e as i64),
+            };
+            let w = match fdset_has(proc, write_ptr, fd) {
+                Ok(v) => v,
+                Err(e) => return -(e as i64),
+            };
+            if !r && !w {
+                continue;
+            }
+            let Some(gf) = proc.fds.get(fd as i32) else {
+                return -(abi::EBADF as i64);
+            };
+            let file = match gf {
+                GuestFd::Host(f) | GuestFd::PipeRead(f) | GuestFd::PipeWrite(f) => f,
+                GuestFd::Null | GuestFd::Zero => {
+                    immediate.push((fd, r, w));
+                    continue;
+                }
+                _ => return -(abi::EBADF as i64),
+            };
+            let mut events = 0;
+            if r {
+                events |= abi::POLLIN;
+            }
+            if w {
+                events |= abi::POLLOUT;
+            }
+            mapping.push((fd, r, w));
+            host_fds.push(vela_sys::HostPollFd {
+                file,
+                events,
+                revents: 0,
+            });
+        }
+        if !host_fds.is_empty() || immediate.is_empty() {
+            let poll_timeout = if immediate.is_empty() { timeout } else { 0 };
+            if let Err(e) = host.poll(&mut host_fds, poll_timeout) {
+                return poll_host_err(&e);
+            }
+        }
+        let mut results = host_fds.into_iter().map(|f| f.revents).collect::<Vec<_>>();
+        for item in immediate {
+            mapping.push(item);
+            results.push(abi::POLLIN | abi::POLLOUT);
+        }
+        (mapping, results)
+    };
+    for ptr in [read_ptr, write_ptr, except_ptr] {
+        if let Err(e) = fdset_clear(proc, ptr, n) {
+            return -(e as i64);
+        }
+    }
+    let mut ready = 0i64;
+    for (j, &(fd, want_r, want_w)) in mapping.iter().enumerate() {
+        let re = revents[j];
+        let r = want_r && re & (abi::POLLIN | abi::POLLHUP | abi::POLLERR) != 0;
+        let w = want_w && re & (abi::POLLOUT | abi::POLLERR) != 0;
+        if r {
+            if let Err(e) = fdset_set(proc, read_ptr, fd) {
+                return -(e as i64);
+            }
+        }
+        if w {
+            if let Err(e) = fdset_set(proc, write_ptr, fd) {
+                return -(e as i64);
+            }
+        }
+        if r || w {
+            ready += 1;
+        }
+    }
+    ready
+}
+
 // ---------------------------------------------------------------- 读写
 
 pub(super) fn sys_write(
@@ -160,7 +388,7 @@ fn open_common(
     flags: u64,
 ) -> i64 {
     let path = match read_cstr(proc, path_ptr) {
-        Ok(p) => p,
+        Ok(p) => p.replace('\\', "/"),
         Err(e) => return -(e as i64),
     };
     // 解析为宿主路径：绝对路径走 vela-fs 翻译；相对路径按 dirfd（AT_FDCWD→cwd，
@@ -240,10 +468,11 @@ fn decode_status(encoded: u32) -> u32 {
 
 /// 相对路径拼 cwd；绝对路径原样（vela-fs 只接受 Linux 风格路径）。
 fn resolve_rel(proc: &GuestProcess, path: &str) -> String {
-    if path.starts_with('/') {
-        path.to_string()
+    let normalized = path.replace('\\', "/");
+    if normalized.starts_with('/') {
+        normalized
     } else {
-        format!("{}/{}", proc.cwd.trim_end_matches('/'), path)
+        format!("{}/{}", proc.cwd.trim_end_matches('/'), normalized)
     }
 }
 
@@ -304,7 +533,7 @@ pub(super) fn sys_stat(
     statbuf: u64,
 ) -> i64 {
     let path = match read_cstr(proc, path_ptr) {
-        Ok(p) => p,
+        Ok(p) => p.replace('\\', "/"),
         Err(e) => return -(e as i64),
     };
     // v0 无 symlink 语义，lstat ≡ stat（NONGOALS：不做真实 symlink）
@@ -748,6 +977,8 @@ pub(super) fn sys_lseek(
 
 /// 路径解析（dirfd 支持，与 open_common 同一规则），返回宿主路径。
 fn resolve_path(proc: &GuestProcess, dirfd: i32, path: &str) -> Result<std::path::PathBuf, i32> {
+    let normalized = path.replace('\\', "/");
+    let path = normalized.as_str();
     if path.starts_with('/') {
         return proc.fs.translate(path).ok_or(abi::ENOENT);
     }

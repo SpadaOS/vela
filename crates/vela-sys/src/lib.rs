@@ -56,6 +56,13 @@ pub struct HostPath(pub PathBuf);
 #[derive(Debug)]
 pub struct HostFile(pub HostFileKind);
 
+/// Host-side poll descriptor. `revents` is filled by `HostFileOps::poll`.
+pub struct HostPollFd<'a> {
+    pub file: &'a HostFile,
+    pub events: u16,
+    pub revents: u16,
+}
+
 /// 匿名管道的一端（0.0.6 M1：pipe2 下沉为宿主管道，跨进程可继承）。
 /// Windows 为真实句柄（ReadFile/WriteFile，阻塞语义）；内存实现供
 /// 测试宿主/逻辑构建使用（空且写端开 → EAGAIN 假非阻塞）。
@@ -65,7 +72,7 @@ pub struct PipeEnd(pub(crate) PipeEndInner);
 #[derive(Debug, Clone)]
 pub(crate) enum PipeEndInner {
     /// Windows HANDLE（inheritable；fork 后子进程同值）。
-    Handle(isize),
+    Handle(isize, bool),
     /// 内存管道（MockHost / linux_dev 逻辑测试）；bool = 是否读端。
     Mem(std::sync::Arc<PipeMem>, bool),
 }
@@ -655,6 +662,12 @@ pub trait HostFileOps: Send + Sync + 'static {
     fn dup_file(&self, f: &HostFile) -> Result<HostFile, HostError>;
     fn read(&self, f: &HostFile, buf: &mut [u8]) -> Result<usize, HostError>;
     fn write(&self, f: &HostFile, buf: &[u8]) -> Result<usize, HostError>;
+    /// Wait for readiness. Hosts without a native implementation retain the
+    /// default `Unimplemented` result; guest-side code remains platform-neutral.
+    fn poll(&self, fds: &mut [HostPollFd<'_>], timeout_ms: i32) -> Result<usize, HostError> {
+        let _ = (fds, timeout_ms);
+        Err(HostError::Unimplemented)
+    }
     fn seek(&self, f: &HostFile, off: i64, whence: i32) -> Result<u64, HostError>;
     fn stat_path(&self, path: &HostPath) -> Result<HostStat, HostError>;
     /// 对已打开句柄取元数据（fstat 语义）；stdio 为字符设备。

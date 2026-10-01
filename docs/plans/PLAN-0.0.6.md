@@ -106,7 +106,7 @@ busybox 解锁 ash shell 与 coreutils 扩容。
 | # | 任务 | 要点 | 验收 |
 |---|---|---|---|
 | T6.1 | **Release 挂产物** | 新增 release workflow：tag 触发 release 构建 → 上传 `vela.exe`（release profile，附 SHA256）到 GitHub Release；不含 PDB | Release 页可直接下载运行 hello |
-| T6.2 | **bench 基线更新** | guest/bench 补 0.0.5/0.0.6 取样（getpid 纯往返 + fork 往返新基准项）；结论节更新 | docs/bench.md 三版本对照表 |
+| T6.2 | **bench 基线更新** | guest/bin/bench 补 0.0.5/0.0.6 取样（getpid 纯往返 + fork 往返新基准项）；结论节更新 | docs/bench.md 三版本对照表 |
 | T6.3 | **文档五件套** | SYSCALLS（clone/fork/wait4/kill/getpgrp 全量改写）、DESIGN（「用户态 fork」新节：快照协议图）、NONGOALS（信号投递/fork 语义边界重写）、README（能力矩阵+路线+快速开始加 sh -c 示例）、CHANGELOG 0.0.6 | 与代码事实逐条对齐 |
 | T6.4 | **版本与发版** | Cargo.toml 0.0.6、tag v0.0.6、Release（验收输出 + vela.exe） | tag+Release 页上线 |
 

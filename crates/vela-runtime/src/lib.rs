@@ -214,11 +214,15 @@ impl GuestProcess {
 
     /// 预留连续堆区域并把断点置于区域起点（规格 5.4 brk 说明）。
     pub fn init_heap(&mut self, host: &dyn Host, hint: u64, size: u64) -> Result<u64, HostError> {
+        let size_usize = usize::try_from(size).map_err(|_| HostError::NoMemory)?;
+        if size == 0 {
+            return Err(HostError::Invalid);
+        }
         // SAFETY: host.map 契约保证返回零填充可写内存
         let addr = unsafe {
             host.map(
                 hint as usize,
-                size as usize,
+                size_usize,
                 HostProt::READ | HostProt::WRITE,
                 true,
             )
@@ -282,7 +286,7 @@ pub fn read_cstr(proc: &GuestProcess, addr: u64) -> Result<String, i32> {
         if out.len() >= 4096 {
             return Err(abi::ENAMETOOLONG);
         }
-        let page_end = (cur | 0xFFF) + 1; // 本页尾（含）
+        let page_end = (cur | 0xFFF).checked_add(1).ok_or(abi::EFAULT)?; // 本页尾（含）
         let want = (page_end - cur).min((4096 - out.len()) as u64);
         // 在请求长度内找最大合法前缀（正常情况 want 即合法；跨界时退化）
         let mut n = want;
@@ -301,7 +305,7 @@ pub fn read_cstr(proc: &GuestProcess, addr: u64) -> Result<String, i32> {
             }
             None => {
                 out.extend_from_slice(slice);
-                cur += n;
+                cur = cur.checked_add(n).ok_or(abi::EFAULT)?;
             }
         }
     }

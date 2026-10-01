@@ -1,5 +1,5 @@
 //! vela-mkhello：生成最小合法 Linux x86_64 静态 PIE ELF（打印 "hello from linux elf"）。
-//! 用于没有 Linux/musl 交叉编译环境时生成 guest/hello（规格 8.1 允许的生成器路径）。
+//! 用于没有 Linux/musl 交叉编译环境时生成 guest/bin/hello（规格 8.1 允许的生成器路径）。
 //! 用 musl-gcc/clang 重编请看 guest/README.md。
 
 fn main() {

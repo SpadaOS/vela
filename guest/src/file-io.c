@@ -3,8 +3,8 @@
 // 全链路。操作固定落 /mnt/c/Windows/Temp（vela-fs 映射到 C:\Windows\Temp），
 // 测试运行后由宿主侧清理产物文件。
 //
-// 编译（Windows）：zig cc -target x86_64-linux-musl -fPIE -pie -O2 -o guest/file-io guest/src/file-io.c
-// Linux/WSL：    musl-gcc -static-pie -O2 -o guest/file-io guest/src/file-io.c
+// 编译（Windows）：zig cc -target x86_64-linux-musl -fPIE -pie -O2 -o guest/bin/file-io guest/src/file-io.c
+// Linux/WSL：    musl-gcc -static-pie -O2 -o guest/bin/file-io guest/src/file-io.c
 //
 // 失败时向 stdout 打印 "file-io FAIL <step>" 并 exit 1；
 // 全部通过打印 "file-io all ok" 并 exit 0。

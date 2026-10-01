@@ -347,7 +347,7 @@ fn build_torture() -> Vec<u8> {
 /// bench guest（PLAN-0.0.3 T1.1）：纯翻译 syscall 吞吐基准。
 /// 循环 N 次 getpid(39)（无内存/路径/IO 参与，纯 VEH→dispatch→返回往返），
 /// 后 exit_group(0)。host 侧用外部计时（进程含固定 ~10ms 启动开销）：
-///   Measure-Command { vela run guest/bench }  →  ns/op ≈ (elapsed - 启动) / N
+///   Measure-Command { vela run guest/bin/bench }  →  ns/op ≈ (elapsed - 启动) / N
 /// r12 做计数器（callee-saved，syscall 语义不触碰；VEH 只改 rax/rcx/rip/r11）。
 fn build_bench() -> Vec<u8> {
     const N: i32 = 2_000_000;

@@ -24,7 +24,7 @@
 
 | # | 任务 | 要点 | 验收 |
 |---|---|---|---|
-| T1.1 | **bench guest + 基线** | `vela-mkguest` 新增 `bench` 变体：clock_gettime 围绕 `N=100万` 次 getpid（纯翻译）与 write→Null（含 IO）循环，客户侧输出 ns/op；`vela run guest/bench` 直接读数。**先跑 0.0.2 基线存档** | 基线数字进 CHANGELOG 与 docs/bench.md |
+| T1.1 | **bench guest + 基线** | `vela-mkguest` 新增 `bench` 变体：clock_gettime 围绕 `N=100万` 次 getpid（纯翻译）与 write→Null（含 IO）循环，客户侧输出 ns/op；`vela run guest/bin/bench` 直接读数。**先跑 0.0.2 基线存档** | 基线数字进 CHANGELOG 与 docs/bench.md |
 | T1.2 | **dispatch 分发表** | 现状 dispatch 是 300+ 行稀疏 match（LLVM 编译为二分+跳转混合）。改为 `static DISPATCH: [Handler; 512]`（编译期初始化函数指针表，高频号 O(1) 直调），>512 号回退 match 尾部 | bench 对比：getpid 路径可测收益 |
 | T1.3 | **VEH exec_ranges 查找** | 32 槽 AtomicU64 对每对 load+比较。改：start 有序登记 + 找到即停（现状是全扫）+ 常用段前置（loader 按地址排序注入） | bench 对比；汇编检查热循环 |
 | T1.4 | **热路径去分配** | ① getdents64 每条 `vec![0u8; reclen]` → 复用栈上缓冲 ② `FsMap::translate` 每次 `split` 产生 Vec<String> → 改零分配组件迭代（PathBuf 输出仍需一次分配，可接受）③ build_envp/路径拼接无回归 | bench：文件类 syscall 路径改善 |

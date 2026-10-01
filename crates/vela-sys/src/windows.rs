@@ -9,8 +9,8 @@ use std::time::Instant;
 use crate::file_ops;
 use crate::{
     GuestRegs, Host, HostDir, HostError, HostFile, HostFileKind, HostFileOps, HostMem, HostOpen,
-    HostPath, HostProc, HostProt, HostStat, HostTime, HostTls, HostTrap, PipeEnd, StdioHandles,
-    TrapFn, TrapFrame,
+    HostPath, HostPollFd, HostProc, HostProt, HostStat, HostTime, HostTls, HostTrap, PipeEnd,
+    StdioHandles, TrapFn, TrapFrame,
 };
 
 // ---------------------------------------------------------------- Win32 FFI
@@ -196,6 +196,13 @@ pub fn replace_guest_exec_ranges(ranges: &[(u64, u64)]) {
             ranges.len() - MAX_GUEST_RANGES
         );
     }
+}
+
+pub fn guest_exec_range_count() -> usize {
+    RANGE_START
+        .iter()
+        .take_while(|s| s.load(Ordering::Relaxed) != 0)
+        .count()
 }
 
 /// 注册 syscall dispatch 回调并安装 VEH（HostTrap::install_trap 的实现体）。
@@ -1026,6 +1033,9 @@ impl HostFileOps for WindowsHost {
     }
     fn write(&self, f: &HostFile, buf: &[u8]) -> Result<usize, HostError> {
         file_ops::write(f, buf)
+    }
+    fn poll(&self, fds: &mut [HostPollFd<'_>], timeout_ms: i32) -> Result<usize, HostError> {
+        file_ops::poll(fds, timeout_ms)
     }
     fn seek(&self, f: &HostFile, off: i64, whence: i32) -> Result<u64, HostError> {
         file_ops::seek(f, off, whence)
@@ -2110,8 +2120,8 @@ pub fn create_inherit_pipe() -> Result<(isize, isize), HostError> {
 }
 
 /// 由原始句柄构造管道端（fork 元数据管道的 CLI 侧读写包装）。
-pub fn pipe_from_raw_handle(h: isize, _is_read: bool) -> crate::PipeEnd {
-    crate::PipeEnd(crate::PipeEndInner::Handle(h))
+pub fn pipe_from_raw_handle(h: isize, is_read: bool) -> crate::PipeEnd {
+    crate::PipeEnd(crate::PipeEndInner::Handle(h, is_read))
 }
 
 pub fn close_handle(h: isize) {

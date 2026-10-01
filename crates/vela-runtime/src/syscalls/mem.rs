@@ -8,6 +8,14 @@ use crate::{host_err_to_errno, write_guest, GuestFd, GuestProcess};
 
 const PAGE: u64 = 4096;
 
+fn page_align(len: u64) -> Option<u64> {
+    len.checked_add(PAGE - 1).map(|v| v & !(PAGE - 1))
+}
+
+fn host_len(len: u64) -> Option<usize> {
+    usize::try_from(len).ok()
+}
+
 pub(super) fn sys_mmap(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 {
     let (addr, len, linux_prot, flags) = (a[0], a[1], a[2], a[3]);
     if len == 0 {
@@ -27,7 +35,12 @@ pub(super) fn sys_mmap(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) ->
     if !anon {
         return sys_mmap_file(proc, host, a);
     }
-    let len_up = (len + PAGE - 1) & !(PAGE - 1);
+    let Some(len_up) = page_align(len) else {
+        return -(abi::EINVAL as i64);
+    };
+    let Some(len_usize) = host_len(len_up) else {
+        return -(abi::ENOMEM as i64);
+    };
     let fixed = flags & abi::MAP_FIXED as u64 != 0 && addr != 0;
     if fixed && proc.mem.overlaps(addr, len_up) {
         // Linux 语义：MAP_FIXED 替换既有映射。vela 无法部分释放 Windows 预留块；
@@ -39,19 +52,14 @@ pub(super) fn sys_mmap(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) ->
                 == Some(crate::mem::MemKind::Reserve)
         {
             let prot = HostProt::from_bits(linux_prot as u32);
-            let _ = unsafe {
-                host.protect(
-                    addr as usize,
-                    len_up as usize,
-                    HostProt::READ | HostProt::WRITE,
-                )
-            };
+            let _ =
+                unsafe { host.protect(addr as usize, len_usize, HostProt::READ | HostProt::WRITE) };
             // SAFETY: 区间已登记且此刻可写
             unsafe {
-                std::ptr::write_bytes(addr as *mut u8, 0, len_up as usize);
+                std::ptr::write_bytes(addr as *mut u8, 0, len_usize);
             }
             if prot.bits() != (HostProt::READ | HostProt::WRITE).bits() {
-                let _ = unsafe { host.protect(addr as usize, len_up as usize, prot) };
+                let _ = unsafe { host.protect(addr as usize, len_usize, prot) };
             }
             // T3.2 账本（fork 快照一致性）：mallocng 的 donate 用
             // MAP_FIXED+PROT_NONE 把堆首/预留区页转为不可读——不记账则
@@ -68,24 +76,17 @@ pub(super) fn sys_mmap(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) ->
     }
     let hint = if fixed { addr as usize } else { 0 };
     // 先 RW 提交（host.map 契约），再收敛到请求保护位
-    let got = match unsafe {
-        host.map(
-            hint,
-            len_up as usize,
-            HostProt::READ | HostProt::WRITE,
-            true,
-        )
-    } {
+    let got = match unsafe { host.map(hint, len_usize, HostProt::READ | HostProt::WRITE, true) } {
         Ok(p) => p as u64,
         Err(e) => return -(host_err_to_errno(&e) as i64),
     };
     if fixed && got != addr {
-        let _ = unsafe { host.unmap(got as usize, len_up as usize) };
+        let _ = unsafe { host.unmap(got as usize, len_usize) };
         return -(abi::ENOMEM as i64);
     }
     let prot = HostProt::from_bits(linux_prot as u32);
     if prot.bits() != (HostProt::READ | HostProt::WRITE).bits() {
-        let _ = unsafe { host.protect(got as usize, len_up as usize, prot) };
+        let _ = unsafe { host.protect(got as usize, len_usize, prot) };
         // 同上：收敛保护位必须入账本（fork 快照/子进程重放一致性）
         proc.prot_ledger.push(crate::ProtOverride {
             start: got,
@@ -119,7 +120,12 @@ pub(super) fn sys_mmap_file(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6
         | Some(GuestFd::PipeWrite(_)) => return -(abi::ENODEV as i64),
         None | Some(GuestFd::Reserved) => return -(abi::EBADF as i64),
     };
-    let len_up = (len + PAGE - 1) & !(PAGE - 1);
+    let Some(len_up) = page_align(len) else {
+        return -(abi::EINVAL as i64);
+    };
+    let Some(len_usize) = host_len(len_up) else {
+        return -(abi::ENOMEM as i64);
+    };
     let fixed = flags & abi::MAP_FIXED as u64 != 0 && addr != 0;
     let prot = HostProt::from_bits(linux_prot as u32);
 
@@ -140,7 +146,7 @@ pub(super) fn sys_mmap_file(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6
             offset.is_multiple_of(MAP_VIEW_GRAN) && (!fixed || addr.is_multiple_of(MAP_VIEW_GRAN));
         if can_view {
             let hint = if fixed { addr as usize } else { 0 };
-            match unsafe { host.map_file(f, offset, len_up as usize, hint, prot) } {
+            match unsafe { host.map_file(f, offset, len_usize, hint, prot) } {
                 Ok(base) if !fixed || base == addr as usize => {
                     proc.mem
                         .add(crate::mem::MemRange::view(base as u64, len_up));
@@ -157,7 +163,7 @@ pub(super) fn sys_mmap_file(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6
 
     // 阶段 1：文件内容读入本地缓冲（此后不再持有 fd 借用）。EOF 之后保持
     // 零填充（mmap 对文件尾之外的页保证读到 0）。
-    let mut data = vec![0u8; len_up as usize];
+    let mut data = vec![0u8; len_usize];
     if let Err(e) = read_file_at(host, f, offset, &mut data) {
         return -(host_err_to_errno(&e) as i64);
     }
@@ -165,13 +171,7 @@ pub(super) fn sys_mmap_file(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6
     // 阶段 2：进程状态变更
     if carve {
         // 预留区可能处于 PROT_NONE：先放开为 RW，写入后收敛到请求保护位
-        let _ = unsafe {
-            host.protect(
-                addr as usize,
-                len_up as usize,
-                HostProt::READ | HostProt::WRITE,
-            )
-        };
+        let _ = unsafe { host.protect(addr as usize, len_usize, HostProt::READ | HostProt::WRITE) };
         if let Err(e) = write_guest(proc, addr, &data) {
             return -(e as i64);
         }
@@ -193,7 +193,7 @@ pub(super) fn sys_mmap_file(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6
         Err(e) => return -(host_err_to_errno(&e) as i64),
     };
     if fixed && got != addr {
-        let _ = unsafe { host.unmap(got as usize, len_up as usize) };
+        let _ = unsafe { host.unmap(got as usize, len_usize) };
         return -(abi::ENOMEM as i64);
     }
     proc.mem.add(crate::mem::MemRange::reserve(got, len_up));
@@ -201,7 +201,7 @@ pub(super) fn sys_mmap_file(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6
         return -(e as i64);
     }
     if prot.bits() != (HostProt::READ | HostProt::WRITE).bits() {
-        let _ = unsafe { host.protect(got as usize, len_up as usize, prot) };
+        let _ = unsafe { host.protect(got as usize, len_usize, prot) };
     }
     got as i64
 }
@@ -255,7 +255,10 @@ pub(super) fn sys_mprotect(
     if view && prot.bits() == 0 {
         return 0;
     }
-    match unsafe { host.protect(addr as usize, len as usize, prot) } {
+    let Some(len_usize) = host_len(len) else {
+        return -(abi::ENOMEM as i64);
+    };
+    match unsafe { host.protect(addr as usize, len_usize, prot) } {
         Ok(()) => {
             // T3.2 账本：记录客户请求的原值（不剥离 FileView WRITE 位——
             // fork 子进程的区间是 section 视图非 COW 文件映射，W 合法）
@@ -277,7 +280,12 @@ pub(super) fn sys_munmap(
     len_raw: u64,
 ) -> i64 {
     let addr = addr_raw & !(PAGE - 1);
-    let len = (len_raw + PAGE - 1) & !(PAGE - 1);
+    let Some(len) = page_align(len_raw) else {
+        return -(abi::EINVAL as i64);
+    };
+    let Some(len_usize) = host_len(len) else {
+        return -(abi::ENOMEM as i64);
+    };
     if len == 0 {
         return 0;
     }
@@ -291,7 +299,10 @@ pub(super) fn sys_munmap(
         let _ = match r.kind {
             crate::mem::MemKind::FileView => unsafe { host.unmap_view(r.start as usize) },
             crate::mem::MemKind::Reserve | crate::mem::MemKind::Island => unsafe {
-                host.unmap(r.start as usize, r.len as usize)
+                host.unmap(
+                    r.start as usize,
+                    usize::try_from(r.len).unwrap_or(len_usize),
+                )
             },
         };
     }
@@ -315,7 +326,10 @@ pub(super) fn sys_brk(proc: &mut GuestProcess, req: u64) -> i64 {
     let Some(heap) = proc.heap else {
         return -(abi::ENOMEM as i64);
     };
-    if req == 0 || req < heap.start || req > heap.start + heap.len {
+    let Some(heap_end) = heap.start.checked_add(heap.len) else {
+        return -(abi::ENOMEM as i64);
+    };
+    if req == 0 || req < heap.start || req > heap_end {
         // brk(0) 查询 / 越界：返回当前断点
         return proc.brk as i64;
     }

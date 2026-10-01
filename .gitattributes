@@ -7,7 +7,4 @@
 *.c text eol=lf
 
 # 预编译 Linux ELF 产物
-guest/hello binary
-guest/hello-musl binary
-guest/torture binary
-guest/tls binary
+guest/bin/* binary

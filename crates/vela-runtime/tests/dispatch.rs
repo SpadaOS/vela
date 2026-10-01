@@ -8,13 +8,14 @@ use vela_runtime::mem::{LoadedImage, MemRange, Segment};
 use vela_runtime::{dispatch, GuestFd, GuestProcess};
 use vela_sys::{
     Host, HostDir, HostDirEntry, HostError, HostFile, HostFileKind, HostFileOps, HostMem, HostOpen,
-    HostPath, HostProt, HostStat, HostTime, HostTls, StdioHandles,
+    HostPath, HostPollFd, HostProt, HostStat, HostTime, HostTls, StdioHandles,
 };
 
 // ---------------------------------------------------------------- MockHost
 
 struct MockHost {
     out: Mutex<Vec<u8>>,
+    poll_timeouts: Mutex<Vec<i32>>,
     allocs: Mutex<std::collections::HashMap<usize, std::alloc::Layout>>,
     /// map_file 分配的"视图"基址集合（跨 kind 释放原语校验用）。
     views: Mutex<std::collections::HashSet<usize>>,
@@ -24,6 +25,7 @@ impl MockHost {
     fn new() -> Self {
         MockHost {
             out: Mutex::new(Vec::new()),
+            poll_timeouts: Mutex::new(Vec::new()),
             allocs: Mutex::new(std::collections::HashMap::new()),
             views: Mutex::new(std::collections::HashSet::new()),
         }
@@ -160,6 +162,23 @@ impl HostFileOps for MockHost {
             HostFileKind::Pipe(e) => e.write(buf),
             _ => Err(HostError::Access),
         }
+    }
+    fn poll(&self, fds: &mut [HostPollFd<'_>], timeout_ms: i32) -> Result<usize, HostError> {
+        self.poll_timeouts.lock().unwrap().push(timeout_ms);
+        let mut ready = 0;
+        for fd in fds {
+            fd.revents = if matches!(&fd.file.0, HostFileKind::StdOut | HostFileKind::StdErr) {
+                fd.events & abi::POLLOUT
+            } else if matches!(&fd.file.0, HostFileKind::StdIn) {
+                fd.events & abi::POLLIN
+            } else {
+                0
+            };
+            if fd.revents != 0 {
+                ready += 1;
+            }
+        }
+        Ok(ready)
     }
     fn seek(&self, f: &HostFile, off: i64, w: i32) -> Result<u64, HostError> {
         match &f.0 {
@@ -343,7 +362,7 @@ fn brk_grows_within_heap() {
         &mut proc,
         &host,
         abi::SYS_BRK,
-        [(heap + 0x100) as u64, 0, 0, 0, 0, 0],
+        [heap + 0x100, 0, 0, 0, 0, 0],
     );
     assert_eq!(r1, (heap + 0x100) as i64);
     // 越界增长失败，返回当前断点
@@ -351,7 +370,7 @@ fn brk_grows_within_heap() {
         &mut proc,
         &host,
         abi::SYS_BRK,
-        [(heap + 0x10000) as u64, 0, 0, 0, 0, 0],
+        [heap + 0x10000, 0, 0, 0, 0, 0],
     );
     assert_eq!(r2, (heap + 0x100) as i64);
 }
@@ -823,7 +842,7 @@ fn newfstatat_empty_path_with_at_empty_path_falls_back_to_fstat() {
     let p = (addr + 0x200) as u64;
     // SAFETY: p 为 mock 分配的可写内存
     unsafe {
-        std::ptr::copy_nonoverlapping(b"\0".as_ptr(), p as *mut u8, 1);
+        std::ptr::write(p as *mut u8, 0);
     }
     let buf = (addr + 0x100) as u64;
     let r = dispatch(
@@ -1182,7 +1201,7 @@ fn openat_dirfd_relative_rejects_escape_and_bad_fd() {
         &mut proc,
         &host,
         abi::SYS_OPENAT,
-        [fd as u64, p, abi::O_RDONLY as u64, 0, 0, 0],
+        [fd as u64, p, abi::O_RDONLY, 0, 0, 0],
     );
     assert_eq!(r, -(abi::EINVAL as i64));
     // 相对路径 + 坏 dirfd → EBADF
@@ -1195,7 +1214,7 @@ fn openat_dirfd_relative_rejects_escape_and_bad_fd() {
         &mut proc,
         &host,
         abi::SYS_OPENAT,
-        [99, p, abi::O_RDONLY as u64, 0, 0, 0],
+        [99, p, abi::O_RDONLY, 0, 0, 0],
     );
     assert_eq!(r, -(abi::EBADF as i64));
     // 相对路径 + 非目录 fd（Null）→ EBADF
@@ -1204,7 +1223,7 @@ fn openat_dirfd_relative_rejects_escape_and_bad_fd() {
         &mut proc,
         &host,
         abi::SYS_OPENAT,
-        [nullfd as u64, p, abi::O_RDONLY as u64, 0, 0, 0],
+        [nullfd as u64, p, abi::O_RDONLY, 0, 0, 0],
     );
     assert_eq!(r, -(abi::EBADF as i64));
 }
@@ -1354,11 +1373,100 @@ fn ioctl_is_not_tty() {
 fn fd_alloc_and_close() {
     let (host, mut proc, _addr) = setup(4096);
     assert!(matches!(proc.fds.get(1), Some(GuestFd::Host(_))));
-    assert!(matches!(proc.fds.get(99), None));
+    assert!(proc.fds.get(99).is_none());
     let fd = proc.fds.alloc_fd(GuestFd::Null);
     assert_eq!(fd, 3); // 0/1/2 被占用
     let r = dispatch(&mut proc, &host, abi::SYS_CLOSE, [3, 0, 0, 0, 0, 0]);
     assert_eq!(r, 0);
     let r = dispatch(&mut proc, &host, abi::SYS_CLOSE, [77, 0, 0, 0, 0, 0]);
     assert_eq!(r, -(abi::EBADF as i64));
+}
+
+#[test]
+fn poll_reports_stdout_writable_and_invalid_fd() {
+    let (host, mut proc, addr) = setup(4096);
+    let p = (addr + 0x200) as u64;
+    unsafe {
+        std::ptr::copy_nonoverlapping(&1i32.to_le_bytes() as *const u8, p as *mut u8, 4);
+        std::ptr::copy_nonoverlapping(
+            &abi::POLLOUT.to_le_bytes() as *const u8,
+            (p + 4) as *mut u8,
+            2,
+        );
+        std::ptr::write_bytes((p + 6) as *mut u8, 0, 2);
+        std::ptr::copy_nonoverlapping(&99i32.to_le_bytes() as *const u8, (p + 8) as *mut u8, 4);
+        std::ptr::copy_nonoverlapping(
+            &abi::POLLIN.to_le_bytes() as *const u8,
+            (p + 12) as *mut u8,
+            2,
+        );
+        std::ptr::write_bytes((p + 14) as *mut u8, 0, 2);
+    }
+    let r = dispatch(&mut proc, &host, abi::SYS_POLL, [p, 2, 0, 0, 0, 0]);
+    assert_eq!(r, 2);
+    let re0 = unsafe { std::ptr::read_unaligned((p + 6) as *const u16) };
+    let re1 = unsafe { std::ptr::read_unaligned((p + 14) as *const u16) };
+    assert_eq!(re0, abi::POLLOUT);
+    assert_eq!(re1, abi::POLLNVAL);
+}
+
+#[test]
+fn select_translates_write_fdset() {
+    let (host, mut proc, addr) = setup(4096);
+    let set = (addr + 0x200) as u64;
+    unsafe {
+        std::ptr::write_unaligned(set as *mut u64, 1u64 << 1);
+    }
+    let r = dispatch(&mut proc, &host, abi::SYS_SELECT, [2, 0, set, 0, 0, 0]);
+    assert_eq!(r, 1);
+    let bits = unsafe { std::ptr::read_unaligned(set as *const u64) };
+    assert_eq!(bits, 1u64 << 1);
+}
+
+#[test]
+fn poll_waits_with_only_negative_fds() {
+    let (host, mut proc, addr) = setup(4096);
+    let p = (addr + 0x200) as u64;
+    unsafe {
+        std::ptr::write_unaligned(p as *mut i32, -1);
+        std::ptr::write_unaligned((p + 4) as *mut u16, abi::POLLIN);
+        std::ptr::write_unaligned((p + 6) as *mut u16, 0);
+    }
+    let r = dispatch(&mut proc, &host, abi::SYS_POLL, [p, 1, u64::MAX, 0, 0, 0]);
+    assert_eq!(r, 0);
+    assert_eq!(*host.poll_timeouts.lock().unwrap(), vec![-1]);
+}
+
+#[test]
+fn select_zero_descriptors_waits_for_timeval() {
+    let (host, mut proc, addr) = setup(4096);
+    let tv = (addr + 0x200) as u64;
+    unsafe {
+        std::ptr::write_unaligned(tv as *mut i64, 0);
+        std::ptr::write_unaligned((tv + 8) as *mut i64, 2_500);
+    }
+    let r = dispatch(&mut proc, &host, abi::SYS_SELECT, [0, 0, 0, 0, tv, 0]);
+    assert_eq!(r, 0);
+    assert_eq!(*host.poll_timeouts.lock().unwrap(), vec![3]);
+}
+
+#[test]
+fn mmap_and_munmap_length_overflow_return_errors() {
+    let (host, mut proc, _addr) = setup(4096);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_MMAP,
+        [
+            0,
+            u64::MAX,
+            abi::PROT_READ.into(),
+            (abi::MAP_PRIVATE | abi::MAP_ANONYMOUS) as u64,
+            !0,
+            0,
+        ],
+    );
+    assert_eq!(r, -(abi::EINVAL as i64));
+    let r = dispatch(&mut proc, &host, abi::SYS_MUNMAP, [0, u64::MAX, 0, 0, 0, 0]);
+    assert_eq!(r, -(abi::EINVAL as i64));
 }

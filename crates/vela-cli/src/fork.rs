@@ -25,7 +25,7 @@ use vela_sys::{
 use crate::GuestState;
 
 const META_MAGIC: u32 = 0x5645_4C46; // "VELF"
-const META_VERSION: u32 = 2; // 0.1.0 T3.2：+mprotect 账本
+const META_VERSION: u32 = 3; // 0.1.0 T3.2：+mprotect 账本
 /// Linux SIGCHLD；musl fork() = clone(SIGCHLD, 0)。
 pub const SIGCHLD_FLAGS: u64 = 17;
 
@@ -200,6 +200,8 @@ struct Meta {
     heap_mb: u64,
     soft_tls: bool,
     cwd: String,
+    exec_guest_path: String,
+    exec_host_path: String,
     heap_start: u64,
     heap_len: u64,
     /// 父 trap 时的客户 CONTEXT（已改写为「clone 已返回 0」形态）。
@@ -296,6 +298,8 @@ fn encode(meta: &Meta) -> Vec<u8> {
     w.u32(meta.heap_mb as u32);
     w.u32(meta.soft_tls as u32);
     w.str(&meta.cwd);
+    w.str(&meta.exec_guest_path);
+    w.str(&meta.exec_host_path);
     w.u64(meta.heap_start);
     w.u64(meta.heap_len);
     w.bytes(&meta.ctx);
@@ -367,6 +371,8 @@ fn decode(b: &[u8]) -> Result<Meta, ()> {
     let heap_mb = r.u32()? as u64;
     let soft_tls = r.u32()? != 0;
     let cwd = r.str()?;
+    let exec_guest_path = r.str()?;
+    let exec_host_path = r.str()?;
     let heap_start = r.u64()?;
     let heap_len = r.u64()?;
     let ctx = r.bytes()?.to_vec();
@@ -435,6 +441,8 @@ fn decode(b: &[u8]) -> Result<Meta, ()> {
         heap_mb,
         soft_tls,
         cwd,
+        exec_guest_path,
+        exec_host_path,
         heap_start,
         heap_len,
         ctx,
@@ -601,6 +609,34 @@ fn ser_img(l: &LoadedImage) -> LoadSer {
 
 /// fork(2)（CLI trap 层拦截 SYS_CLONE 的 SIGCHLD 形态）。
 /// 返回子进程 pid（写入 regs.rax 由 trap 返回路径完成）。
+fn quote_windows_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(|c| c.is_whitespace() || c == '"') {
+        return arg.to_string();
+    }
+    let mut out = String::from("\"");
+    let mut slashes = 0usize;
+    for c in arg.chars() {
+        if c == '\\' {
+            slashes += 1;
+        } else if c == '"' {
+            out.push_str(&"\\".repeat(slashes * 2 + 1));
+            out.push('"');
+            slashes = 0;
+        } else {
+            if slashes != 0 {
+                out.push_str(&"\\".repeat(slashes));
+                slashes = 0;
+            }
+            out.push(c);
+        }
+    }
+    if slashes != 0 {
+        out.push_str(&"\\".repeat(slashes * 2));
+    }
+    out.push('"');
+    out
+}
+
 pub fn do_fork(st: &mut GuestState, args: &[u64; 6], frame: &mut TrapFrame) -> Result<u32, i64> {
     let _ = args;
     let eio = -(vela_abi::EIO as i64);
@@ -772,6 +808,8 @@ pub fn do_fork(st: &mut GuestState, args: &[u64; 6], frame: &mut TrapFrame) -> R
         heap_mb: st.heap_mb,
         soft_tls: st.soft_tls,
         cwd: st.proc.cwd.clone(),
+        exec_guest_path: st.exec_guest_path.clone(),
+        exec_host_path: st.exec_host_path.to_string_lossy().into_owned(),
         heap_start: st.proc.heap.map(|h| h.start).unwrap_or(0),
         heap_len: st.proc.heap.map(|h| h.len).unwrap_or(0),
         ctx: ctx_bytes,
@@ -809,26 +847,30 @@ pub fn do_fork(st: &mut GuestState, args: &[u64; 6], frame: &mut TrapFrame) -> R
     // 现场第二个子进程 execve /bin/busybox ENOENT 即此）。
     // 已知边界：位置参数中的空格不重引号——internal-fork 分支在解析
     // 后直接恢复快照，不消费位置参数，仅选项必须完整。
-    let mut cmd = match std::env::current_exe() {
+    let exe = match std::env::current_exe() {
         Ok(p) => p.to_string_lossy().into_owned(),
         Err(e) => bail!("current_exe", e),
     };
-    cmd.push_str(" --internal-fork ");
-    cmd.push_str(&rmeta.to_string());
+    let mut cmd_parts = vec![
+        quote_windows_arg(&exe),
+        quote_windows_arg("--internal-fork"),
+        quote_windows_arg(&rmeta.to_string()),
+    ];
     for a in std::env::args().skip(2) {
-        cmd.push(' ');
-        cmd.push_str(&a);
+        cmd_parts.push(quote_windows_arg(&a));
     }
+    let cmd = cmd_parts.join(" ");
     // 子进程内 stdio/stderr 继承；元数据写与 spawn 的次序说明：管道缓冲
     //（64KiB）足够容纳元数据（映像内容在 section，不在元数据），先写后
     // spawn 不会阻塞。
-    if let Err(e) = st.host.pipe_write_all(wmeta, &frame_meta) {
-        bail!("pipe_write_all", e);
-    }
     let (child_pid, child_handle) = match st.host.spawn_self(&cmd) {
         Ok(c) => c,
         Err(e) => bail!("create_child_process", e),
     };
+    if let Err(e) = st.host.pipe_write_all(wmeta, &frame_meta) {
+        let _ = st.host.kill(child_handle, 1);
+        bail!("pipe_write_all", e);
+    }
     // 写端关闭后子进程读到 EOF；读端句柄归子进程，父侧关闭。
     // section 句柄：一次性 section（kind 0/1/2）父侧同步关闭；kind 3
     // 是 imm_cache 的跨 fork 资产，关闭会让下次 fork 传给子进程死句柄
@@ -864,7 +906,14 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
             eprintln!("[vela] fork child: meta length read failed");
             return 1;
         }
-        let len = u64::from_le_bytes(lenb) as usize;
+        let len64 = u64::from_le_bytes(lenb);
+        let len = match usize::try_from(len64) {
+            Ok(v) if v <= 64 * 1024 * 1024 => v,
+            _ => {
+                eprintln!("[vela] fork child: metadata length out of bounds ({len64})");
+                return 1;
+            }
+        };
         let mut payload = vec![0u8; len];
         if host.pipe_read_exact(meta_handle, &mut payload).is_err() {
             eprintln!("[vela] fork child: meta payload read failed");
@@ -1001,10 +1050,12 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
         proc.fds = fds;
 
         // 6. fs 映射表：从父命令行重放（--root/--map 语义一致）
-        let mut fs = vela_fs::FsMap::legacy();
-        if let Some(root) = &opts.root {
-            let _ = fs.add("/", std::path::Path::new(root));
-        }
+        let mut fs = opts
+            .root
+            .as_deref()
+            .map(std::path::Path::new)
+            .map(vela_fs::FsMap::root)
+            .unwrap_or_else(vela_fs::FsMap::legacy);
         for m in &opts.maps {
             if let Some((g, h)) = m.split_once('=') {
                 let _ = fs.add(g, std::path::Path::new(h));
@@ -1045,6 +1096,9 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
         let state = Box::new(GuestState {
             proc,
             host,
+            exec_guest_path: meta.exec_guest_path.clone(),
+            exec_host_path: std::path::PathBuf::from(&meta.exec_host_path),
+            exec_pending_release: Vec::new(),
             stack_mb: meta.stack_mb,
             heap_mb: meta.heap_mb,
             soft_tls: meta.soft_tls,

@@ -3,8 +3,8 @@
 use std::time::Instant;
 
 use crate::{
-    HostDir, HostDirEntry, HostError, HostFile, HostFileKind, HostOpen, HostPath, HostStat,
-    PipeEnd, PipeEndInner, StdioHandles,
+    HostDir, HostDirEntry, HostError, HostFile, HostFileKind, HostOpen, HostPath, HostPollFd,
+    HostStat, PipeEnd, PipeEndInner, StdioHandles,
 };
 
 pub(crate) fn io_err(e: &std::io::Error) -> HostError {
@@ -163,6 +163,97 @@ pub(crate) fn write(f: &HostFile, buf: &[u8]) -> Result<usize, HostError> {
             .map_err(|e| io_err(&e)),
         HostFileKind::Pipe(e) => e.write(buf),
         HostFileKind::StdIn => Err(HostError::Access),
+    }
+}
+
+/// Poll host files without exposing platform APIs to the runtime crate.
+pub(crate) fn poll(fds: &mut [HostPollFd<'_>], timeout_ms: i32) -> Result<usize, HostError> {
+    if timeout_ms < -1 {
+        return Err(HostError::Invalid);
+    }
+    let start = std::time::Instant::now();
+    loop {
+        let mut ready = 0usize;
+        for fd in fds.iter_mut() {
+            let mut revents = 0u16;
+            match &fd.file.0 {
+                HostFileKind::Disk { .. } | HostFileKind::StdIn => {
+                    revents |= fd.events & 0x0001;
+                    revents |= fd.events & 0x0004;
+                }
+                HostFileKind::StdOut | HostFileKind::StdErr => {
+                    revents |= fd.events & 0x0004;
+                }
+                HostFileKind::Pipe(end) => {
+                    #[cfg(windows)]
+                    {
+                        if let PipeEndInner::Handle(h, is_read) = &end.0 {
+                            if !is_read {
+                                revents |= fd.events & 0x0004;
+                                fd.revents = revents;
+                                if revents != 0 {
+                                    ready += 1;
+                                }
+                                continue;
+                            }
+                            let mut available = 0u32;
+                            let ok = unsafe {
+                                PeekNamedPipe(
+                                    *h,
+                                    std::ptr::null_mut(),
+                                    0,
+                                    std::ptr::null_mut(),
+                                    &mut available,
+                                    std::ptr::null_mut(),
+                                )
+                            };
+                            if ok == 0 {
+                                let error = unsafe { GetLastError() };
+                                if error == 109 || error == 232 {
+                                    revents |= 0x0010;
+                                } else {
+                                    revents |= 0x0008;
+                                }
+                            } else if available > 0 {
+                                revents |= fd.events & 0x0001;
+                            } else {
+                                // An empty read end is not writable.  Write readiness is
+                                // reported by the write-end branch above; leave this end
+                                // quiet until data arrives or the writer closes.
+                            }
+                        }
+                    }
+                    if let PipeEndInner::Mem(m, is_read) = &end.0 {
+                        let nonempty = !m.buf.lock().unwrap_or_else(|p| p.into_inner()).is_empty();
+                        if *is_read {
+                            if nonempty {
+                                revents |= fd.events & 0x0001;
+                            }
+                            if !m.write_open.load(std::sync::atomic::Ordering::SeqCst) && !nonempty
+                            {
+                                revents |= 0x0010;
+                            }
+                        } else if m.read_open.load(std::sync::atomic::Ordering::SeqCst) {
+                            revents |= fd.events & 0x0004;
+                        } else {
+                            revents |= 0x0008 | 0x0010;
+                        }
+                    }
+                }
+            }
+            fd.revents = revents;
+            if revents != 0 {
+                ready += 1;
+            }
+        }
+        if ready != 0 || timeout_ms == 0 {
+            return Ok(ready);
+        }
+        if timeout_ms > 0 && start.elapsed() >= std::time::Duration::from_millis(timeout_ms as u64)
+        {
+            return Ok(0);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 
@@ -384,8 +475,8 @@ pub(crate) fn create_pipe() -> Result<(HostFile, HostFile), HostError> {
     {
         let (r, w) = pipe_handles()?;
         Ok((
-            HostFile(HostFileKind::Pipe(PipeEnd(PipeEndInner::Handle(r)))),
-            HostFile(HostFileKind::Pipe(PipeEnd(PipeEndInner::Handle(w)))),
+            HostFile(HostFileKind::Pipe(PipeEnd(PipeEndInner::Handle(r, true)))),
+            HostFile(HostFileKind::Pipe(PipeEnd(PipeEndInner::Handle(w, false)))),
         ))
     }
     #[cfg(not(windows))]
@@ -405,7 +496,7 @@ impl PipeEnd {
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, HostError> {
         match &self.0 {
             #[cfg(windows)]
-            PipeEndInner::Handle(h) => {
+            PipeEndInner::Handle(h, _is_read) => {
                 let mut got: u32 = 0;
                 // SAFETY: h 为 CreatePipe 返回的有效读句柄；buf/n 配对
                 let ok = unsafe {
@@ -428,7 +519,7 @@ impl PipeEnd {
                 Ok(got as usize)
             }
             #[cfg(not(windows))]
-            PipeEndInner::Handle(_) => Err(HostError::Unimplemented),
+            PipeEndInner::Handle(..) => Err(HostError::Unimplemented),
             PipeEndInner::Mem(m, _is_read) => {
                 let mut b = m.buf.lock().unwrap_or_else(|p| p.into_inner());
                 if b.is_empty() {
@@ -449,7 +540,7 @@ impl PipeEnd {
     pub fn write(&self, buf: &[u8]) -> Result<usize, HostError> {
         match &self.0 {
             #[cfg(windows)]
-            PipeEndInner::Handle(h) => {
+            PipeEndInner::Handle(h, _is_read) => {
                 let mut put: u32 = 0;
                 // SAFETY: h 为 CreatePipe 返回的有效写句柄；buf/n 配对
                 let ok = unsafe {
@@ -468,7 +559,7 @@ impl PipeEnd {
                 Ok(put as usize)
             }
             #[cfg(not(windows))]
-            PipeEndInner::Handle(_) => Err(HostError::Unimplemented),
+            PipeEndInner::Handle(..) => Err(HostError::Unimplemented),
             PipeEndInner::Mem(m, _is_read) => {
                 if !m.read_open.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err(HostError::Other(32)); // EPIPE
@@ -486,7 +577,7 @@ impl PipeEnd {
     pub fn close_half(&self) -> Result<(), HostError> {
         match &self.0 {
             #[cfg(windows)]
-            PipeEndInner::Handle(h) => {
+            PipeEndInner::Handle(h, _is_read) => {
                 // SAFETY: h 为本端独占句柄，close 后不再使用
                 if unsafe { CloseHandle(*h) } == 0 {
                     return Err(HostError::Other(os_to_errno(
@@ -496,7 +587,7 @@ impl PipeEnd {
                 Ok(())
             }
             #[cfg(not(windows))]
-            PipeEndInner::Handle(_) => Err(HostError::Unimplemented),
+            PipeEndInner::Handle(..) => Err(HostError::Unimplemented),
             PipeEndInner::Mem(m, is_read) => {
                 use std::sync::atomic::Ordering;
                 if *is_read {
@@ -515,7 +606,7 @@ impl PipeEnd {
     pub fn dup(&self) -> Result<PipeEnd, HostError> {
         match &self.0 {
             #[cfg(windows)]
-            PipeEndInner::Handle(h) => {
+            PipeEndInner::Handle(h, is_read) => {
                 const DUPLICATE_SAME_ACCESS: u32 = 2;
                 let mut nh: isize = 0;
                 // SAFETY: -1 = 伪当前进程句柄；h/nh 均为有效句柄位址
@@ -535,10 +626,10 @@ impl PipeEnd {
                         unsafe { GetLastError() } as i32
                     )));
                 }
-                Ok(PipeEnd(PipeEndInner::Handle(nh)))
+                Ok(PipeEnd(PipeEndInner::Handle(nh, *is_read)))
             }
             #[cfg(not(windows))]
-            PipeEndInner::Handle(_) => Err(HostError::Unimplemented),
+            PipeEndInner::Handle(..) => Err(HostError::Unimplemented),
             PipeEndInner::Mem(m, is_read) => Ok(PipeEnd(PipeEndInner::Mem(m.clone(), *is_read))),
         }
     }
@@ -547,9 +638,9 @@ impl PipeEnd {
     pub fn raw_handle(&self) -> Option<isize> {
         match &self.0 {
             #[cfg(windows)]
-            PipeEndInner::Handle(h) => Some(*h),
+            PipeEndInner::Handle(h, _) => Some(*h),
             #[cfg(not(windows))]
-            PipeEndInner::Handle(_) => None,
+            PipeEndInner::Handle(..) => None,
             PipeEndInner::Mem(..) => None,
         }
     }
@@ -646,6 +737,44 @@ pub(crate) fn pipe_read_raw(h: isize, buf: &mut [u8]) -> Result<usize, u32> {
     Ok(got as usize)
 }
 
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipe_poll_keeps_read_end_non_writable() {
+        let (read_end, write_end) = create_pipe().expect("CreatePipe");
+
+        let mut read_poll = [HostPollFd {
+            file: &read_end,
+            events: 0x0004, // POLLOUT
+            revents: 0,
+        }];
+        assert_eq!(poll(&mut read_poll, 0).unwrap(), 0);
+        assert_eq!(read_poll[0].revents, 0);
+
+        let mut write_poll = [HostPollFd {
+            file: &write_end,
+            events: 0x0004, // POLLOUT
+            revents: 0,
+        }];
+        assert_eq!(poll(&mut write_poll, 0).unwrap(), 1);
+        assert_eq!(write_poll[0].revents, 0x0004);
+
+        write(&write_end, b"x").unwrap();
+        let mut read_data_poll = [HostPollFd {
+            file: &read_end,
+            events: 0x0001, // POLLIN
+            revents: 0,
+        }];
+        assert_eq!(poll(&mut read_data_poll, 0).unwrap(), 1);
+        assert_eq!(read_data_poll[0].revents, 0x0001);
+
+        close(read_end).unwrap();
+        close(write_end).unwrap();
+    }
+}
+
 #[cfg(windows)]
 #[link(name = "kernel32")]
 extern "system" {
@@ -662,6 +791,14 @@ extern "system" {
         n: u32,
         written: *mut u32,
         overlapped: *mut core::ffi::c_void,
+    ) -> i32;
+    fn PeekNamedPipe(
+        h: isize,
+        buf: *mut u8,
+        n: u32,
+        read: *mut u32,
+        available: *mut u32,
+        left: *mut u32,
     ) -> i32;
     fn CloseHandle(h: isize) -> i32;
     fn GetLastError() -> u32;

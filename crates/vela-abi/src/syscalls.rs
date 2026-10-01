@@ -7,6 +7,7 @@ pub const SYS_CLOSE: u64 = 3;
 pub const SYS_STAT: u64 = 4;
 pub const SYS_FSTAT: u64 = 5;
 pub const SYS_LSTAT: u64 = 6;
+pub const SYS_POLL: u64 = 7;
 pub const SYS_LSEEK: u64 = 8;
 pub const SYS_MMAP: u64 = 9;
 pub const SYS_MPROTECT: u64 = 10;
@@ -33,6 +34,7 @@ pub const SYS_PWRITE64: u64 = 18;
 pub const SYS_WRITEV: u64 = 20;
 pub const SYS_ACCESS: u64 = 21;
 pub const SYS_PIPE: u64 = 22;
+pub const SYS_SELECT: u64 = 23;
 pub const SYS_DUP: u64 = 32;
 pub const SYS_DUP2: u64 = 33;
 pub const SYS_GETPID: u64 = 39;
@@ -97,6 +99,7 @@ pub fn syscall_name(nr: u64) -> &'static str {
         SYS_STAT => "stat",
         SYS_FSTAT => "fstat",
         SYS_LSTAT => "lstat",
+        SYS_POLL => "poll",
         SYS_LSEEK => "lseek",
         SYS_MMAP => "mmap",
         SYS_MPROTECT => "mprotect",
@@ -163,6 +166,7 @@ pub fn syscall_name(nr: u64) -> &'static str {
         SYS_STATX => "statx",
         SYS_SOCKET => "socket",
         SYS_PIPE => "pipe",
+        SYS_SELECT => "select",
         SYS_TRUNCATE => "truncate",
         SYS_FTRUNCATE => "ftruncate",
         SYS_CHMOD => "chmod",
@@ -186,7 +190,7 @@ pub fn syscall_name(nr: u64) -> &'static str {
 mod name_coverage_tests {
     use super::*;
 
-    const DISPATCHED: [u64; 60] = [
+    const DISPATCHED: [u64; 62] = [
         SYS_READ,
         SYS_WRITE,
         SYS_WRITEV,
@@ -194,6 +198,7 @@ mod name_coverage_tests {
         SYS_CLOSE,
         SYS_STAT,
         SYS_LSTAT,
+        SYS_POLL,
         SYS_FSTAT,
         SYS_NEWFSTATAT,
         SYS_LSEEK,
@@ -247,6 +252,7 @@ mod name_coverage_tests {
         SYS_EXECVE,
         SYS_SOCKET,
         SYS_PIPE,
+        SYS_SELECT,
     ];
 
     #[test]

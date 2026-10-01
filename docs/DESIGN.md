@@ -45,7 +45,7 @@ vela.exe (PE)
   dispatch 记录 `fs_apply_pending` → trap 改写 CONTEXT（Rip 指向 vela.exe 内的
   trampoline `wrfsbase r10; jmp rcx`，R10=新基址）→ 客户无内核参与地完成切换；
   之后的每次异常，内核保存/恢复的都已是客户基址，保持稳定。
-- `guest/tls` 用「普通寻址写 marker + fs 相对读回」做决定性验证（`mmap 1t1 ok`）。
+- `guest/bin/tls` 用「普通寻址写 marker + fs 相对读回」做决定性验证（`mmap 1t1 ok`）。
 - VELA 自身代码不使用 FS（Windows x64 用户态 TEB 在 GS），切换后无需恢复。
 - R10 在 trampoline 路径被借用一次（SysV caller-saved，musl syscall 包装器不依赖）。
 - **TLS/FS 的硬件前提（重要）**：FS 基址切换依赖 CPU+OS 的 **FSGSBASE**（CPUID
@@ -182,5 +182,5 @@ vela-cli → vela-loader → vela-runtime → vela-fs
 - `munmap` 只移除完全被覆盖的登记项（Windows 不能部分 VirtualFree）。
 - `mmap` 无 MAP_SHARED（返回 ENOSYS）；文件映射仅限条件满足的 fd
   （offset/hint 64K 对齐，否则退化为匿名映射 + 读入）。
-- execve 重载不释放旧 Reserve 块（Windows 内核路径致死，见 execve 节）。
+- execve 重载释放旧 Reserve/FileView/Island；仅释放失败进入有上限的诊断债务。
 - VEH 处理器在客户栈上执行（见上文 red zone 风险）。

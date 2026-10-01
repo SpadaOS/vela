@@ -5,11 +5,13 @@
 set -euo pipefail
 
 BB_VER=1.36.1
+BB_SHA256=b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314
 WS="${GITHUB_WORKSPACE:-$(pwd)}"
 # msys2：GITHUB_WORKSPACE 是 Windows 形式（D:\a\vela\vela），直接拼进 tar/mv
 # 参数会被 msys2 转换搅坏（D\:\a\vela\vela），先显式转成 POSIX 形式
 WS="$(cygpath -u "$WS")"
 BB_SRC="$WS/.busybox-src"
+BB_MARKER="$BB_SRC/.vela-source-sha256"
 
 command -v make >/dev/null || { echo "make not in PATH"; exit 1; }
 command -v gcc >/dev/null || { echo "gcc not in PATH (HOSTCC)"; exit 1; }
@@ -19,10 +21,19 @@ command -v zig >/dev/null || { echo "zig not in PATH"; exit 1; }
 export MSYS2_ARG_CONV_EXCL="*"
 export MSYS2_ENV_CONV_EXCL="*"
 
-if [ ! -d "$BB_SRC" ]; then
+if [ -d "$BB_SRC" ] && [ -f "$BB_MARKER" ] && [ "$(cat "$BB_MARKER")" = "$BB_SHA256" ]; then
+  echo "using verified BusyBox source $BB_VER"
+else
+  rm -rf "$BB_SRC"
   curl -sSL -o /tmp/bb.tar.bz2 "https://busybox.net/downloads/busybox-$BB_VER.tar.bz2"
+  actual="$(sha256sum /tmp/bb.tar.bz2 | awk '{print $1}')"
+  if [ "$actual" != "$BB_SHA256" ]; then
+    echo "FATAL: busybox checksum mismatch: $actual" >&2
+    exit 1
+  fi
   tar -xjf /tmp/bb.tar.bz2 -C "$WS"
   mv "$WS/busybox-$BB_VER" "$BB_SRC"
+  printf '%s\n' "$BB_SHA256" > "$BB_MARKER"
 fi
 cd "$BB_SRC"
 

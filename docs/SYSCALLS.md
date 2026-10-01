@@ -1,4 +1,4 @@
-# Vela syscall 兼容矩阵（0.0.6）
+# Vela syscall 兼容矩阵（0.1.1）
 
 > 状态约定（效仿 Gramine 的诚实标注）：
 > - ✅ 完整翻译
@@ -19,6 +19,7 @@
 | 4 | stat | ✅ | ino 为路径哈希（同进程稳定，stat/getdents 一致） |
 | 5 | fstat | ✅ | 目录 fd / FIFO（S_IFIFO）支持 |
 | 6 | lstat | 🟨 | ≡ stat（无 symlink 语义） |
+| 7 | poll | ✅ | 普通文件立即就绪；标准流与 Vela pipe 支持 IN/OUT/ERR/HUP/NVAL；nfds ≤ 1024，超时遵循 -1/0/正数 |
 | 8 | lseek | ✅ | 目录 fd 返回 ESPIPE |
 | 9 | mmap | 🟨 | MAP_PRIVATE 匿名 + **文件映射**（fd 背书，COW 语义）；MAP_FIXED 落在已登记 Reserve 内就地覆盖（musl donate 模式）；MAP_SHARED = ENOSYS。文件视图条件：offset/hint 64K 对齐，否则退化为匿名映射 + 读入（EOF 后零填充）。⚠ 旧 Reserve 块内的"就地覆盖"保留原页内容（Linux 为匿名零页）——musl 仅对未写入的 brk 尾页这样做 |
 | 10 | mprotect | ✅ | 文件视图区间剥离 WRITE（VirtualProtect RW 会关闭 COW 穿透宿主文件） |
@@ -29,11 +30,12 @@
 | 17 | pread64 | ✅ | seek→io→seek-back（单线程契约） |
 | 18 | pwrite64 | ✅ | 同上 |
 | 21 | access | 🟨 | W_OK 按宿主只读位；X_OK 语义简化 |
+| 23 | select | ✅ | fd_set 转换到 poll；nfds ≤ 1024；ppoll/pselect6 返回 ENOSYS |
 | 26 | msync | ⭕ | 参数校验后恒成功（MAP_PRIVATE 无回写语义） |
 | 28 | madvise | ⭕ | no-op |
 | 32 | dup | ✅ | 管道端复制共享缓冲 |
 | 33 | dup2 | ✅ | |
-| 59 | execve | 🟨 | **进程内重载**（CLI 层编排）：新映像装载成功后卸载旧地址空间、重建堆/栈/auxv；CLOEXEC fd 关闭，其余 fd 跨重载保留。⚠ Windows 上旧 Reserve 块解除登记但不 VirtualFree（含 musl donate NOACCESS 页的块会内核致死），泄漏至进程退出。失败路径返回 -errno，原映像继续 |
+| 59 | execve | 🟨 | **进程内重载**（CLI 层编排）：新映像装载成功后释放旧 Reserve/FileView/Island，重建堆/栈/auxv；CLOEXEC fd 关闭，其余 fd 跨重载保留。释放失败才计入有上限的诊断债务。失败路径返回 -errno，原映像继续 |
 | 61 | wait4 | ✅ | **真实等待**（0.0.6）：WaitForSingleObject 阻塞 / WNOHANG 轮询；status 按 Linux 编码（退出码 <128 = WIFEXITED，≥128 = WIFSIGNALED）；孤儿无 init 收养 → -ECHILD；rusage 填零 |
 | 74 | fsync | ✅ | stdio/伪设备 no-op |
 | 75 | fdatasync | ✅ | |

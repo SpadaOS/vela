@@ -35,6 +35,11 @@ const GUEST_HINT: u64 = 0x0000_4000_0000;
 struct GuestState {
     proc: GuestProcess,
     host: PlatformHost,
+    /// Initial executable identity used when a guest execve re-execs argv[0].
+    exec_guest_path: String,
+    exec_host_path: std::path::PathBuf,
+    /// Old mappings are released on the first syscall after an exec context switch.
+    exec_pending_release: Vec<vela_runtime::MemRange>,
     /// execve 重载时重建堆/栈所需（PLAN-0.0.4 T3.1）。
     stack_mb: u64,
     heap_mb: u64,
@@ -117,7 +122,7 @@ fn print_usage() {
     eprintln!("       vela --help");
     eprintln!("options:");
     eprintln!("  --root <dir>       把宿主目录挂为客户根（guest / = <dir>）");
-    eprintln!("  --map <g>=<host>   追加前缀映射（可多次；默认 /mnt/c -> C:\\）");
+    eprintln!("  --map <g>=<host>   追加前缀映射（可多次；无 --root 时默认 /mnt/c -> C:\\，有 --root 时仅根映射+显式项）");
     eprintln!("  --env K=V          传递/覆盖环境变量；K= 表示删除（默认继承宿主全部）");
     eprintln!("  --uid <n> --gid <n>  客户 uid/gid（默认 1000）");
     eprintln!("  --interp <host-path> 动态链接解释器（默认：fs 映射解析 PT_INTERP 路径，");
@@ -264,6 +269,11 @@ fn cmd_run(rest: &[String], internal_fork: Option<isize>) -> i32 {
     if opts.verbose {
         logx::enable();
     }
+    if let Some(root) = &opts.root {
+        if !std::path::Path::new(root).is_absolute() {
+            return usage_err("--root requires an absolute host path");
+        }
+    }
     // fork 子进程分支（0.0.6 M1）：跳过 ELF 读/装载，直接从快照恢复现场
     if let Some(h) = internal_fork {
         #[cfg(windows)]
@@ -324,30 +334,61 @@ fn resolve_interp(
 /// 2. POSIX 相对路径 → cwd 拼接后 fs 翻译；
 /// 3. 宿主风格路径（含 \ 或 :，或不带 / 的相对宿主路径）→ 直接按宿主路径。
 fn resolve_exec_path(proc: &GuestProcess, path: &str) -> Option<std::path::PathBuf> {
-    if path.starts_with('/') {
-        let t = proc.fs.translate(path);
+    let normalized = path.replace('\\', "/");
+    if normalized.starts_with('/') {
+        let t = proc.fs.translate(&normalized);
         if logx::enabled() {
-            eprintln!("[vela] exec resolve: translate({path:?}) = {t:?}");
+            eprintln!("[vela] exec resolve: translate({normalized:?}) = {t:?}");
         }
         return t;
     }
-    let g = format!("{}/{}", proc.cwd.trim_end_matches('/'), path);
+    let g = format!("{}/{}", proc.cwd.trim_end_matches('/'), normalized);
     if let Some(hp) = proc.fs.translate(&g) {
         if hp.exists() {
             return Some(hp);
         }
     }
-    let p = std::path::PathBuf::from(path);
-    if p.exists() {
-        return Some(p);
-    }
-    proc.fs.translate(path)
+    None
 }
 
 /// execve(59) 的进程内重载（PLAN-0.0.4 T3.1）。vela 无 fork，重载是唯一
 /// 诚实路径：新映像装载成功后，卸载全部旧客户内存（含映像/堆/栈/解释器）、
 /// 关闭 CLOEXEC fd（管道等跨重载保留）、重建堆/栈/auxv，返回新入口与新栈。
 /// 失败返回 -errno，客户继续运行原映像（与 Linux execve 失败语义一致）。
+#[cfg(windows)]
+fn read_exec_vector(
+    proc: &GuestProcess,
+    ptr: u64,
+    total_bytes: &mut usize,
+) -> Result<Vec<String>, i64> {
+    let mut values = Vec::new();
+    let mut cursor = ptr;
+    for _ in 0..=guest_start::MAX_ARG_ENV_ENTRIES {
+        let ent = vela_runtime::read_guest(proc, cursor, 8).map_err(|e| -(e as i64))?;
+        let value_ptr = u64::from_le_bytes(ent.try_into().map_err(|_| -(vela_abi::EFAULT as i64))?);
+        if value_ptr == 0 {
+            return Ok(values);
+        }
+        if values.len() >= guest_start::MAX_ARG_ENV_ENTRIES {
+            return Err(-(vela_abi::E2BIG as i64));
+        }
+        let value = vela_runtime::read_cstr(proc, value_ptr).map_err(|e| -(e as i64))?;
+        let value_bytes = value
+            .len()
+            .checked_add(1)
+            .ok_or(-(vela_abi::E2BIG as i64))?;
+        *total_bytes = total_bytes
+            .checked_add(value_bytes)
+            .ok_or(-(vela_abi::E2BIG as i64))?;
+        if *total_bytes > guest_start::MAX_ARG_ENV_BYTES {
+            return Err(-(vela_abi::E2BIG as i64));
+        }
+        values.push(value);
+        cursor = cursor.checked_add(8).ok_or(-(vela_abi::EFAULT as i64))?;
+    }
+    Err(-(vela_abi::E2BIG as i64))
+}
+
 #[cfg(windows)]
 fn do_execve(st: &mut GuestState, args: &[u64; 6]) -> Result<(u64, u64), i64> {
     let (path_ptr, argv_ptr, envp_ptr) = (args[0], args[1], args[2]);
@@ -358,35 +399,20 @@ fn do_execve(st: &mut GuestState, args: &[u64; 6]) -> Result<(u64, u64), i64> {
     if logx::enabled() {
         eprintln!("[vela] execve path: {path:?}");
     }
-    let mut argv: Vec<String> = Vec::new();
-    let mut p = argv_ptr;
-    loop {
-        let ent = vela_runtime::read_guest(&st.proc, p, 8).map_err(err)?;
-        let ptr = u64::from_le_bytes(ent[0..8].try_into().unwrap());
-        if ptr == 0 {
-            break;
-        }
-        argv.push(vela_runtime::read_cstr(&st.proc, ptr).map_err(err)?);
-        p += 8;
-    }
+    let mut exec_string_bytes = 0usize;
+    let mut argv = read_exec_vector(&st.proc, argv_ptr, &mut exec_string_bytes)?;
     if argv.is_empty() {
         argv.push(path.clone());
     }
-    let mut envp: Vec<String> = Vec::new();
-    p = envp_ptr;
-    loop {
-        let ent = vela_runtime::read_guest(&st.proc, p, 8).map_err(err)?;
-        let ptr = u64::from_le_bytes(ent[0..8].try_into().unwrap());
-        if ptr == 0 {
-            break;
-        }
-        envp.push(vela_runtime::read_cstr(&st.proc, ptr).map_err(err)?);
-        p += 8;
-    }
+    let envp = read_exec_vector(&st.proc, envp_ptr, &mut exec_string_bytes)?;
 
     // 2. 路径解析：绝对走 fs 翻译；POSIX 相对按 cwd 拼接；argv[0] 为
     //    宿主风格路径（vela 常见用法）时直接按宿主路径接受
-    let host_path = resolve_exec_path(&st.proc, &path).ok_or(err(vela_abi::ENOENT))?;
+    let host_path = if path == st.exec_guest_path && !st.exec_host_path.as_os_str().is_empty() {
+        st.exec_host_path.clone()
+    } else {
+        resolve_exec_path(&st.proc, &path).ok_or(err(vela_abi::ENOENT))?
+    };
 
     // 3. 读文件 + 装载新映像（失败即 execve 失败，旧映像不动）
     let bytes = std::fs::read(&host_path).map_err(|_| err(vela_abi::ENOENT))?;
@@ -419,25 +445,7 @@ fn do_execve(st: &mut GuestState, args: &[u64; 6]) -> Result<(u64, u64), i64> {
     // 4. 卸载旧客户地址空间（新映像仍在 host 内存中，不受影响；
     //    exec-range 表由第 7 步 replace 原地重注册覆盖）
     let old: Vec<vela_runtime::MemRange> = st.proc.mem.ranges.values().copied().collect();
-    for r in old {
-        // Reserve 块（映像/堆/栈）不调用 VirtualFree：实测对含 musl donate
-        // PROT_NONE 页的堆块做 free/decommit 会让进程在内核路径死亡（无 VEH、
-        // 无诊断）。解除登记后保留地址空间，进程退出时由 OS 统一回收——
-        // 单 guest 进程内存寿命有限，泄漏代价可接受（记录于 SYSCALLS.md）。
-        // FileView 的 UnmapViewOfFile 是安全的，正常释放。
-        if r.kind == vela_runtime::mem::MemKind::FileView {
-            let _ = unsafe { st.host.unmap_view(r.start as usize) };
-        } else if r.kind != vela_runtime::mem::MemKind::Island {
-            // T4.5：地址空间债可见——Reserve 不释放的字节计数（岛页同理）
-            EXECVE_LEAK.fetch_add(r.len, Ordering::Relaxed);
-        }
-    }
-    if logx::enabled() {
-        eprintln!(
-            "[vela] execve reserve debt: {} KiB (address space not freed until process exit)",
-            EXECVE_LEAK.load(Ordering::Relaxed) / 1024
-        );
-    }
+    st.exec_pending_release = old;
     st.proc.mem = vela_runtime::mem::MemRegistry::default();
     st.proc.heap = None;
 
@@ -461,9 +469,16 @@ fn do_execve(st: &mut GuestState, args: &[u64; 6]) -> Result<(u64, u64), i64> {
     st.proc
         .init_heap(&st.host, 0, st.heap_mb * 1024 * 1024)
         .map_err(|_| err(vela_abi::ENOMEM))?;
-    let (rsp, stack_range) =
-        guest_start::build_stack(&st.host, &st.proc.load, &argv, &envp, st.stack_mb)
-            .map_err(|_| err(vela_abi::ENOMEM))?;
+    let (rsp, stack_range) = guest_start::build_stack(
+        &st.host,
+        &st.proc.load,
+        &argv,
+        &envp,
+        st.stack_mb,
+        st.proc.uid,
+        st.proc.gid,
+    )
+    .map_err(|_| err(vela_abi::ENOMEM))?;
     st.proc.mem.add(stack_range);
 
     // execve 清空线程指针：新程序需重新 arch_prctl(SET_FS)
@@ -471,6 +486,8 @@ fn do_execve(st: &mut GuestState, args: &[u64; 6]) -> Result<(u64, u64), i64> {
     st.proc.gs_base = 0;
     st.proc.fs_apply_pending = None;
     st.host.set_soft_tls_base(0);
+    st.exec_guest_path = argv.first().cloned().unwrap_or_else(|| path.clone());
+    st.exec_host_path = host_path;
 
     // 7. 原地重注册新可执行范围，返回新入口
     let mut ranges = st.proc.load.exec_ranges.clone();
@@ -483,6 +500,47 @@ fn do_execve(st: &mut GuestState, args: &[u64; 6]) -> Result<(u64, u64), i64> {
         None => st.proc.load.entry,
     };
     Ok((entry, rsp))
+}
+
+#[cfg(windows)]
+fn release_pending_exec(st: &mut GuestState) {
+    if st.exec_pending_release.is_empty() {
+        return;
+    }
+    let pending = std::mem::take(&mut st.exec_pending_release);
+    let mut failed = 0u64;
+    for r in pending {
+        let result = match r.kind {
+            vela_runtime::mem::MemKind::FileView => unsafe { st.host.unmap_view(r.start as usize) },
+            vela_runtime::mem::MemKind::Reserve | vela_runtime::mem::MemKind::Island => unsafe {
+                usize::try_from(r.len)
+                    .map_err(|_| vela_sys::HostError::Invalid)
+                    .and_then(|len| st.host.unmap(r.start as usize, len))
+            },
+        };
+        if result.is_err() {
+            failed = failed.saturating_add(r.len);
+        }
+    }
+    if failed != 0 {
+        const MAX_EXECVE_DEBT: u64 = 1 << 30;
+        let _ = EXECVE_LEAK.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_add(failed).min(MAX_EXECVE_DEBT))
+        });
+        if logx::enabled() {
+            eprintln!(
+                "[vela] execve release failed for {} KiB (debt cap {} KiB)",
+                failed / 1024,
+                MAX_EXECVE_DEBT / 1024
+            );
+        }
+    }
+    if logx::enabled() {
+        eprintln!(
+            "[vela] execve release debt: {} KiB",
+            EXECVE_LEAK.load(Ordering::Relaxed) / 1024
+        );
+    }
 }
 
 /// 环境自检（PLAN-0.0.2 T4.3）：排障入口，报告宿主能力与常见问题。
@@ -513,16 +571,25 @@ fn cmd_doctor() -> i32 {
     }
 
     // 路径映射约定
-    println!("  path mapping : default /mnt/c -> C:\\; override with --root <dir> / --map <g>=<h>");
+    println!("  path mapping : no --root => /mnt/c -> C:\\; --root => root-only unless --map adds prefixes");
 
     // 陷阱后端（0.1.0 T2.6/T5.2）：island 为默认 auto 的首选，混合模式是预期形态
     println!(
         "  trap         : island trampoline supported (default --trap=auto; mixed island/veh expected)"
     );
+    #[cfg(windows)]
+    {
+        let host = WindowsHost::new();
+        let (islands, veh) = host.island_veh_counts();
+        println!(
+            "  trap counts  : island sites={islands}, VEH sites={veh}, registered ranges={}",
+            vela_sys::windows::guest_exec_range_count()
+        );
+    }
 
     // fork / 地址空间债（0.1.0 T5.2；doctor 是独立进程，只报机制与观测方法）
     println!("  fork         : snapshot via shared sections; immutable image regions shared across forks (copied KiB visible with -v)");
-    println!("  execve debt  : old-image Reserve blocks stay mapped until process exit (Windows cannot partially free); count with -v");
+    println!("  execve debt  : failed old-image releases plus a short pending handoff window; count with -v");
 
     // Ctrl+C（0.1.0 T5.3）
     println!("  ctrl+c       : kills the guest child tree (console-group approximation, not SIGINT semantics)");
@@ -664,13 +731,18 @@ fn run_elf(
     };
 
     // 路径映射提前构建：解释器解析（T2.2）与客户运行共用同一张表
-    let mut fs = vela_fs::FsMap::legacy();
     if let Some(root) = &opts.root {
-        if let Err(e) = fs.add("/", std::path::Path::new(root)) {
-            eprintln!("vela: --root: {e}");
+        if !std::path::Path::new(root).is_absolute() {
+            eprintln!("vela: --root must be an absolute host path");
             return Err(2);
         }
     }
+    let mut fs = opts
+        .root
+        .as_deref()
+        .map(std::path::Path::new)
+        .map(vela_fs::FsMap::root)
+        .unwrap_or_else(vela_fs::FsMap::legacy);
     for m in &opts.maps {
         let Some((g, h)) = m.split_once('=') else {
             eprintln!("vela: --map 需要 <guest>=<host> 形式，得到 '{m}'");
@@ -725,6 +797,9 @@ fn run_elf(
     let mut proc = GuestProcess::new(host.current_pid(), img);
     proc.attach_stdio(&host);
     proc.fs = fs;
+    if opts.root.is_some() {
+        proc.cwd = "/".to_string();
+    }
     for (s, e) in island_ranges {
         proc.mem.add(vela_runtime::mem::MemRange::island(s, e - s));
     }
@@ -744,14 +819,21 @@ fn run_elf(
     }
 
     let envp = build_envp(&opts.envs);
-    let (rsp, stack_range) =
-        match guest_start::build_stack(&host, &proc.load, guest_argv, &envp, opts.stack_mb) {
-            Ok(x) => x,
-            Err(e) => {
-                eprintln!("vela: stack setup failed: {e}");
-                return Err(1);
-            }
-        };
+    let (rsp, stack_range) = match guest_start::build_stack(
+        &host,
+        &proc.load,
+        guest_argv,
+        &envp,
+        opts.stack_mb,
+        proc.uid,
+        proc.gid,
+    ) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("vela: stack setup failed: {e}");
+            return Err(1);
+        }
+    };
     proc.mem.add(stack_range);
 
     // 入口语义（T2.3）：动态映像跳解释器入口（_dlstart），静态跳自身入口
@@ -777,6 +859,9 @@ fn run_elf(
         let state = Box::new(GuestState {
             proc,
             host,
+            exec_guest_path: guest_argv.first().cloned().unwrap_or_default(),
+            exec_host_path: std::path::PathBuf::from(elf_path),
+            exec_pending_release: Vec::new(),
             stack_mb: opts.stack_mb,
             heap_mb: opts.heap_mb,
             soft_tls: opts.soft_tls,
@@ -837,6 +922,7 @@ unsafe extern "system" fn trap(nr: u64, args: &[u64; 6], frame: &mut TrapFrame) 
     }
     // SAFETY: GUEST 在进入客户前设置一次；陷阱回调与客户代码同线程
     let st = unsafe { &mut *p };
+    release_pending_exec(st);
     let rip = frame.regs.rip;
     // soft-tls：同步客户 TLS 基址到模拟器（arch_prctl 记录后即生效）
     if st.proc.fs_base != 0 {
@@ -920,6 +1006,11 @@ unsafe extern "system" fn trap(nr: u64, args: &[u64; 6], frame: &mut TrapFrame) 
     } else {
         vela_runtime::dispatch(&mut st.proc, &st.host, nr, *args)
     };
+    // SET_FS updates proc.fs_base during this dispatch. Publish it before the
+    // guest resumes so soft-tls can handle the next fs-prefixed instruction.
+    if st.proc.fs_base != 0 {
+        st.host.set_soft_tls_base(st.proc.fs_base);
+    }
     if logx::enabled() {
         eprintln!(
             "[vela] {} = {r} ({:#x})",
