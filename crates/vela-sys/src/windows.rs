@@ -2120,8 +2120,8 @@ pub fn create_inherit_pipe() -> Result<(isize, isize), HostError> {
 }
 
 /// 由原始句柄构造管道端（fork 元数据管道的 CLI 侧读写包装）。
-pub fn pipe_from_raw_handle(h: isize, _is_read: bool) -> crate::PipeEnd {
-    crate::PipeEnd(crate::PipeEndInner::Handle(h))
+pub fn pipe_from_raw_handle(h: isize, is_read: bool) -> crate::PipeEnd {
+    crate::PipeEnd(crate::PipeEndInner::Handle(h, is_read))
 }
 
 pub fn close_handle(h: isize) {

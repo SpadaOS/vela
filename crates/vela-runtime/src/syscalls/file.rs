@@ -78,10 +78,8 @@ pub(super) fn sys_poll(
             entries[i].2 = host_fds[j].revents;
         }
     } else if timeout != 0 && entries.iter().all(|(_, _, r)| *r == 0) {
-        if timeout > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(timeout as u64));
-        } else {
-            return 0;
+        if let Err(e) = host.poll(&mut host_fds, timeout) {
+            return poll_host_err(&e);
         }
     }
     let mut ready = 0i64;
@@ -199,7 +197,7 @@ pub(super) fn sys_select(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) 
                 revents: 0,
             });
         }
-        if !host_fds.is_empty() {
+        if !host_fds.is_empty() || immediate.is_empty() {
             let poll_timeout = if immediate.is_empty() { timeout } else { 0 };
             if let Err(e) = host.poll(&mut host_fds, poll_timeout) {
                 return poll_host_err(&e);

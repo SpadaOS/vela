@@ -72,7 +72,7 @@ pub struct PipeEnd(pub(crate) PipeEndInner);
 #[derive(Debug, Clone)]
 pub(crate) enum PipeEndInner {
     /// Windows HANDLE（inheritable；fork 后子进程同值）。
-    Handle(isize),
+    Handle(isize, bool),
     /// 内存管道（MockHost / linux_dev 逻辑测试）；bool = 是否读端。
     Mem(std::sync::Arc<PipeMem>, bool),
 }

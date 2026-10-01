@@ -15,6 +15,7 @@ use vela_sys::{
 
 struct MockHost {
     out: Mutex<Vec<u8>>,
+    poll_timeouts: Mutex<Vec<i32>>,
     allocs: Mutex<std::collections::HashMap<usize, std::alloc::Layout>>,
     /// map_file 分配的"视图"基址集合（跨 kind 释放原语校验用）。
     views: Mutex<std::collections::HashSet<usize>>,
@@ -24,6 +25,7 @@ impl MockHost {
     fn new() -> Self {
         MockHost {
             out: Mutex::new(Vec::new()),
+            poll_timeouts: Mutex::new(Vec::new()),
             allocs: Mutex::new(std::collections::HashMap::new()),
             views: Mutex::new(std::collections::HashSet::new()),
         }
@@ -161,7 +163,8 @@ impl HostFileOps for MockHost {
             _ => Err(HostError::Access),
         }
     }
-    fn poll(&self, fds: &mut [HostPollFd<'_>], _timeout_ms: i32) -> Result<usize, HostError> {
+    fn poll(&self, fds: &mut [HostPollFd<'_>], timeout_ms: i32) -> Result<usize, HostError> {
+        self.poll_timeouts.lock().unwrap().push(timeout_ms);
         let mut ready = 0;
         for fd in fds {
             fd.revents = if matches!(&fd.file.0, HostFileKind::StdOut | HostFileKind::StdErr) {
@@ -1418,6 +1421,33 @@ fn select_translates_write_fdset() {
     assert_eq!(r, 1);
     let bits = unsafe { std::ptr::read_unaligned(set as *const u64) };
     assert_eq!(bits, 1u64 << 1);
+}
+
+#[test]
+fn poll_waits_with_only_negative_fds() {
+    let (host, mut proc, addr) = setup(4096);
+    let p = (addr + 0x200) as u64;
+    unsafe {
+        std::ptr::write_unaligned(p as *mut i32, -1);
+        std::ptr::write_unaligned((p + 4) as *mut u16, abi::POLLIN);
+        std::ptr::write_unaligned((p + 6) as *mut u16, 0);
+    }
+    let r = dispatch(&mut proc, &host, abi::SYS_POLL, [p, 1, u64::MAX, 0, 0, 0]);
+    assert_eq!(r, 0);
+    assert_eq!(*host.poll_timeouts.lock().unwrap(), vec![-1]);
+}
+
+#[test]
+fn select_zero_descriptors_waits_for_timeval() {
+    let (host, mut proc, addr) = setup(4096);
+    let tv = (addr + 0x200) as u64;
+    unsafe {
+        std::ptr::write_unaligned(tv as *mut i64, 0);
+        std::ptr::write_unaligned((tv + 8) as *mut i64, 2_500);
+    }
+    let r = dispatch(&mut proc, &host, abi::SYS_SELECT, [0, 0, 0, 0, tv, 0]);
+    assert_eq!(r, 0);
+    assert_eq!(*host.poll_timeouts.lock().unwrap(), vec![3]);
 }
 
 #[test]

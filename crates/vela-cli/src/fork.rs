@@ -25,7 +25,7 @@ use vela_sys::{
 use crate::GuestState;
 
 const META_MAGIC: u32 = 0x5645_4C46; // "VELF"
-const META_VERSION: u32 = 2; // 0.1.0 T3.2：+mprotect 账本
+const META_VERSION: u32 = 3; // 0.1.0 T3.2：+mprotect 账本
 /// Linux SIGCHLD；musl fork() = clone(SIGCHLD, 0)。
 pub const SIGCHLD_FLAGS: u64 = 17;
 
@@ -200,6 +200,8 @@ struct Meta {
     heap_mb: u64,
     soft_tls: bool,
     cwd: String,
+    exec_guest_path: String,
+    exec_host_path: String,
     heap_start: u64,
     heap_len: u64,
     /// 父 trap 时的客户 CONTEXT（已改写为「clone 已返回 0」形态）。
@@ -296,6 +298,8 @@ fn encode(meta: &Meta) -> Vec<u8> {
     w.u32(meta.heap_mb as u32);
     w.u32(meta.soft_tls as u32);
     w.str(&meta.cwd);
+    w.str(&meta.exec_guest_path);
+    w.str(&meta.exec_host_path);
     w.u64(meta.heap_start);
     w.u64(meta.heap_len);
     w.bytes(&meta.ctx);
@@ -367,6 +371,8 @@ fn decode(b: &[u8]) -> Result<Meta, ()> {
     let heap_mb = r.u32()? as u64;
     let soft_tls = r.u32()? != 0;
     let cwd = r.str()?;
+    let exec_guest_path = r.str()?;
+    let exec_host_path = r.str()?;
     let heap_start = r.u64()?;
     let heap_len = r.u64()?;
     let ctx = r.bytes()?.to_vec();
@@ -435,6 +441,8 @@ fn decode(b: &[u8]) -> Result<Meta, ()> {
         heap_mb,
         soft_tls,
         cwd,
+        exec_guest_path,
+        exec_host_path,
         heap_start,
         heap_len,
         ctx,
@@ -800,6 +808,8 @@ pub fn do_fork(st: &mut GuestState, args: &[u64; 6], frame: &mut TrapFrame) -> R
         heap_mb: st.heap_mb,
         soft_tls: st.soft_tls,
         cwd: st.proc.cwd.clone(),
+        exec_guest_path: st.exec_guest_path.clone(),
+        exec_host_path: st.exec_host_path.to_string_lossy().into_owned(),
         heap_start: st.proc.heap.map(|h| h.start).unwrap_or(0),
         heap_len: st.proc.heap.map(|h| h.len).unwrap_or(0),
         ctx: ctx_bytes,
@@ -1086,8 +1096,8 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
         let state = Box::new(GuestState {
             proc,
             host,
-            exec_guest_path: String::new(),
-            exec_host_path: std::path::PathBuf::new(),
+            exec_guest_path: meta.exec_guest_path.clone(),
+            exec_host_path: std::path::PathBuf::from(&meta.exec_host_path),
             exec_pending_release: Vec::new(),
             stack_mb: meta.stack_mb,
             heap_mb: meta.heap_mb,
