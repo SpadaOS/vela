@@ -13,7 +13,7 @@
 **验收口径（全部满足才发版）：**
 
 1. FSGSBASE 机器上：`hello-musl` 稳定运行（300 次零失败，对齐 DESIGN.md 的既有标准）
-2. 新增 `guest/file-io`（musl C 源码）端到端通过：open/read/write/stat/getdents64/getcwd 全链路
+2. 新增 `guest/bin/file-io`（musl C 源码）端到端通过：open/read/write/stat/getdents64/getcwd 全链路
 3. `vela run --root <dir>` 可将任意宿主目录挂为客户根，无硬编码 `/mnt/c`
 4. `cargo test --workspace` 全绿；文件类 syscall 有专项集成测试
 5. CI（windows-latest）完整跑通构建 + 测试 + guest 验收，且 guest 由 `vela-mkhello`/`vela-mkguest` 现场生成
@@ -49,7 +49,7 @@ getdents64, getcwd, chdir, access, readlink, uname              ← 0.0.2 补齐
 | T1.5 | **ioctl(16) 终端 stub** | `TIOCGWINSZ`→返回 80x25；`TCGETS/TCSETS`→安全默认或 `-ENOTTY`；musl stdio 探测即通过 | musl hello 的 isatty 探测路径稳定 |
 | T1.6 | **open/openat 语义补全** | openat(257) 支持 dirfd（fd 表内目录句柄，先支持目录 fd + 相对路径）；`O_CLOEXEC/O_TRUNC/O_APPEND` 语义记账；错误码映射 `ENOENT/EACCES/EISDIR/EEXIST/EINVAL` | 错误路径专项测试（当前为 0 覆盖） |
 
-**M1 出口**：`guest/file-io`（新 musl C guest，做 open/write/read/stat/mkdir/getdents64/close）端到端绿。
+**M1 出口**：`guest/bin/file-io`（新 musl C guest，做 open/write/read/stat/mkdir/getdents64/close）端到端绿。
 
 ### M2 — 进程环境：路径通用化 + envp/auxv
 
@@ -78,7 +78,7 @@ getdents64, getcwd, chdir, access, readlink, uname              ← 0.0.2 补齐
 | # | 任务 | 要点 |
 |---|---|---|
 | T4.1 | **文件 syscall 集成测试** | temp 目录内：open/write/read 回读、stat 尺寸与类型、getdents64 遍历、lseek 语义、ENOENT/EACCES 路径 —— 补上当前文件链路 0 测试的窟窿 |
-| T4.2 | **CI 现场生成 guest** | `ci.yml` 用 `vela-mkhello`/`vela-mkguest` 生成 `guest/hello`、`torture`，`hello-musl` 因 FSGSBASE 依赖走条件门（现状已 gate） |
+| T4.2 | **CI 现场生成 guest** | `ci.yml` 用 `vela-mkhello`/`vela-mkguest` 生成 `guest/bin/hello`、`guest/bin/torture`，`hello-musl` 因 FSGSBASE 依赖走条件门（现状已 gate） |
 | T4.3 | **vela doctor** | 子命令：报告 CPU FSGSBASE、版本、杀软提示（README 已述风险）、Host 能力矩阵 —— 排障入口 |
 | T4.4 | **发布流水线** | CHANGELOG.md（Keep a Changelog 格式）、版本号 0.0.2、tag `v0.0.2`、GitHub Release 附 `vela.exe` 产物（gh CLI 流程） |
 | T4.5 | **兼容性矩阵文档** | `docs/SYSCALLS.md`：全表列 已实现/部分实现/ENOSYS 三态 + 备注（效仿 Gramine），README 链接 |

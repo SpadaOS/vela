@@ -177,6 +177,20 @@ pub fn parse(bytes: &[u8]) -> Result<ElfInfo, LoadError> {
         let vaddr = u64le(bytes, p + 16)?;
         let filesz = u64le(bytes, p + 32)?;
         let memsz = u64le(bytes, p + 40)?;
+        let align = u64le(bytes, p + 48)?;
+        if align != 0 && !align.is_power_of_two() {
+            return Err(LoadError::BadLayout(
+                "PT_LOAD p_align is not a power of two",
+            ));
+        }
+        if align > (1 << 30) || (align > 1 && align < PAGE) {
+            return Err(LoadError::BadLayout("PT_LOAD p_align is unreasonable"));
+        }
+        if offset % PAGE != vaddr % PAGE {
+            return Err(LoadError::BadLayout(
+                "PT_LOAD p_offset/p_vaddr are not congruent",
+            ));
+        }
         if offset
             .checked_add(filesz)
             .map(|end| end > bytes.len() as u64)
@@ -208,6 +222,17 @@ pub fn parse(bytes: &[u8]) -> Result<ElfInfo, LoadError> {
     }
     if loads.is_empty() {
         return Err(LoadError::NoLoadSegments);
+    }
+    let mut ordered = loads.clone();
+    ordered.sort_by_key(|s| s.vaddr);
+    for pair in ordered.windows(2) {
+        let end = pair[0]
+            .vaddr
+            .checked_add(pair[0].memsz)
+            .ok_or(LoadError::BadLayout("PT_LOAD address overflow"))?;
+        if end > pair[1].vaddr {
+            return Err(LoadError::BadLayout("overlapping PT_LOAD segments"));
+        }
     }
     Ok(ElfInfo {
         entry: e_entry,

@@ -127,6 +127,34 @@ fn parse_static_pie_has_no_interp() {
     assert_eq!(parse(&bytes).expect("parse ok").interp, None);
 }
 
+#[test]
+fn parse_rejects_malformed_load_alignment() {
+    let mut bytes = common::build_min_hello();
+    bytes[0x40 + 48..0x40 + 56].copy_from_slice(&3u64.to_le_bytes());
+    assert!(matches!(parse(&bytes), Err(LoadError::BadLayout(_))));
+}
+
+#[test]
+fn parse_rejects_offset_address_mismatch() {
+    let mut bytes = common::build_min_hello();
+    bytes[0x40 + 8..0x40 + 16].copy_from_slice(&1u64.to_le_bytes());
+    assert!(matches!(parse(&bytes), Err(LoadError::BadLayout(_))));
+}
+
+#[test]
+fn parse_rejects_overlapping_load_segments() {
+    let mut bytes = common::build_min_hello();
+    bytes[0x38..0x3a].copy_from_slice(&2u16.to_le_bytes());
+    bytes.resize(0x40 + 2 * 56, 0);
+    let ph = 0x40 + 56;
+    bytes[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes());
+    bytes[ph + 8..ph + 16].copy_from_slice(&0x40u64.to_le_bytes());
+    bytes[ph + 16..ph + 24].copy_from_slice(&0x40u64.to_le_bytes());
+    bytes[ph + 40..ph + 48].copy_from_slice(&0x10u64.to_le_bytes());
+    bytes[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+    assert!(matches!(parse(&bytes), Err(LoadError::BadLayout(_))));
+}
+
 #[cfg(windows)]
 #[test]
 fn load_maps_and_patches_min_hello() {

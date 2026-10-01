@@ -1,5 +1,6 @@
 //! errno（Linux x86_64 值）。
 
+pub const E2BIG: i32 = 7;
 pub const ENOENT: i32 = 2;
 pub const EBADF: i32 = 9;
 pub const ENOMEM: i32 = 12;

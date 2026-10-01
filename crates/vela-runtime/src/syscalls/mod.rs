@@ -18,6 +18,8 @@ pub fn dispatch(proc: &mut GuestProcess, host: &dyn Host, nr: u64, a: [u64; 6]) 
     match nr {
         abi::SYS_READ => file::sys_read(proc, host, a[0], a[1], a[2]),
         abi::SYS_WRITE => file::sys_write(proc, host, a[0], a[1], a[2]),
+        abi::SYS_POLL => file::sys_poll(proc, host, a[0], a[1], a[2]),
+        abi::SYS_SELECT => file::sys_select(proc, host, a),
         abi::SYS_WRITEV => file::sys_writev(proc, host, a[0], a[1], a[2]),
         abi::SYS_OPEN => file::sys_open(proc, host, a[0], a[1]),
         abi::SYS_OPENAT => file::sys_openat(proc, host, a),

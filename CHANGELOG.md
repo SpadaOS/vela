@@ -2,7 +2,12 @@
 
 本项目的所有显著变更记录于此（Keep a Changelog 格式）。
 
-## [0.1.0] - unreleased
+## [0.1.1] - 2026-10-01
+
+- Stability and release closeout for path isolation, checked arithmetic, fork/exec, ELF validation, and verification packaging.
+- Added `poll(2)` and `select(2)` for regular files, standard streams, and Vela pipes; `ppoll(2)`/`pselect6(2)` remain `ENOSYS`.
+
+## [0.1.0] - 2026-09-25
 
 主题：Windows 一等运行时（计划见 docs/plans/PLAN-0.1.0.md）。
 
@@ -224,7 +229,7 @@
 - **CLI**：`vela doctor` 环境自检（FSGSBASE / 路径映射 / guest 产物）；
   `--uid/--gid`、`--stack-mb/--heap-mb`（护栏 1-512 / 1-1024）
 - **可观测性**：`VELA_LOG=1` 输出 strace 风格 `name(args...) = ret` 日志
-- **验收 guest**：`guest/file-io`（musl C，open/write/lseek/read/fstat/stat/
+- **验收 guest**：`guest/bin/file-io`（musl C，open/write/lseek/read/fstat/stat/
   fcntl/getdents64/getcwd 全链路，zig cc 交叉编译）
 - `docs/SYSCALLS.md` 兼容性矩阵（效仿 Gramine 按条诚实标注）
 - CI 现场用 `vela-mkhello`/`vela-mkguest` 生成 guest，移除对预编译产物的依赖

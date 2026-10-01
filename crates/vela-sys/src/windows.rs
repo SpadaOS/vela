@@ -9,8 +9,8 @@ use std::time::Instant;
 use crate::file_ops;
 use crate::{
     GuestRegs, Host, HostDir, HostError, HostFile, HostFileKind, HostFileOps, HostMem, HostOpen,
-    HostPath, HostProc, HostProt, HostStat, HostTime, HostTls, HostTrap, PipeEnd, StdioHandles,
-    TrapFn, TrapFrame,
+    HostPath, HostPollFd, HostProc, HostProt, HostStat, HostTime, HostTls, HostTrap, PipeEnd,
+    StdioHandles, TrapFn, TrapFrame,
 };
 
 // ---------------------------------------------------------------- Win32 FFI
@@ -196,6 +196,13 @@ pub fn replace_guest_exec_ranges(ranges: &[(u64, u64)]) {
             ranges.len() - MAX_GUEST_RANGES
         );
     }
+}
+
+pub fn guest_exec_range_count() -> usize {
+    RANGE_START
+        .iter()
+        .take_while(|s| s.load(Ordering::Relaxed) != 0)
+        .count()
 }
 
 /// 注册 syscall dispatch 回调并安装 VEH（HostTrap::install_trap 的实现体）。
@@ -1026,6 +1033,9 @@ impl HostFileOps for WindowsHost {
     }
     fn write(&self, f: &HostFile, buf: &[u8]) -> Result<usize, HostError> {
         file_ops::write(f, buf)
+    }
+    fn poll(&self, fds: &mut [HostPollFd<'_>], timeout_ms: i32) -> Result<usize, HostError> {
+        file_ops::poll(fds, timeout_ms)
     }
     fn seek(&self, f: &HostFile, off: i64, whence: i32) -> Result<u64, HostError> {
         file_ops::seek(f, off, whence)

@@ -119,10 +119,6 @@ fn run_torture_guest() {
 /// 仅在 CPU+OS 支持 FSGSBASE 时运行。
 #[test]
 fn run_tls_guest() {
-    if !vela_sys::windows::fs_base_supported() {
-        eprintln!("skip: FSGSBASE unavailable on this machine");
-        return;
-    }
     let dir = std::env::temp_dir().join("vela-it-tls");
     std::fs::create_dir_all(&dir).unwrap();
     let elf = dir.join("tls");
@@ -133,7 +129,11 @@ fn run_tls_guest() {
         .expect("spawn mkguest");
     assert!(gen.status.success(), "mkguest failed: {gen:?}");
 
-    let out = vela().arg("run").arg(&elf).output().expect("spawn vela");
+    let out = vela()
+        .args(["run", "--soft-tls"])
+        .arg(&elf)
+        .output()
+        .expect("spawn vela");
     assert!(
         out.status.success(),
         "exit={:?} stderr={}",
@@ -144,7 +144,7 @@ fn run_tls_guest() {
 }
 
 /// musl 静态 PIE C hello（规格 8.2 加分项）。
-/// 产物 guest/hello-musl 由 zig cc 交叉编译（见 guest/README.md）。
+/// 产物 guest/bin/hello-musl 由 zig cc 交叉编译（见 guest/README.md）。
 ///
 /// 静态 musl 需要 TLS（arch_prctl SET_FS + FS 相对寻址），而 Vela 的 FS 切换
 /// 依赖 CPU+OS 的 FSGSBASE 支持（见 docs/DESIGN.md「TLS/FS」）。在不支持的
@@ -152,18 +152,18 @@ fn run_tls_guest() {
 /// v0 门禁仍是无需 TLS 的汇编 hello。
 #[test]
 fn run_musl_hello() {
-    if !vela_sys::windows::fs_base_supported() {
-        eprintln!("skip: FSGSBASE unavailable on this machine; guest TLS cannot be switched (musl needs TLS)");
-        return;
-    }
     let elf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../guest/bin/hello-musl");
     if !elf.exists() {
-        eprintln!("skip: guest/hello-musl not built (see guest/README.md)");
+        eprintln!("skip: guest/bin/hello-musl not built (see guest/README.md)");
         return;
     }
     let mut last: Option<std::process::Output> = None;
     for attempt in 1..=3 {
-        let out = vela().arg("run").arg(&elf).output().expect("spawn vela");
+        let out = vela()
+            .args(["run", "--soft-tls"])
+            .arg(&elf)
+            .output()
+            .expect("spawn vela");
         if out.status.success()
             && String::from_utf8_lossy(&out.stdout).starts_with("hello from musl")
         {
@@ -182,17 +182,17 @@ fn run_musl_hello() {
 
 /// file-io guest（0.0.2 M1 出口）：musl C 程序验收
 /// open/write/lseek/read/fstat/stat/fcntl/opendir(getdents64)/getcwd 全链路。
-/// 产物 guest/file-io 由 zig cc 交叉编译（见 guest/src/file-io.c 头注释）。
+/// 产物 guest/bin/file-io 由 zig cc 交叉编译（见 guest/src/file-io.c 头注释）。
 /// 需要 FSGSBASE（musl TLS），缺失时跳过；写入 C:\Windows\Temp 的产物由本测试清理。
 #[test]
 fn run_file_io_guest() {
     if !vela_sys::windows::fs_base_supported() {
-        eprintln!("skip: FSGSBASE unavailable on this machine; musl guest needs TLS");
+        eprintln!("skip: FSGSBASE unavailable; file-io also requires host directory access");
         return;
     }
     let elf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../guest/bin/file-io");
     if !elf.exists() {
-        eprintln!("skip: guest/file-io not built (see guest/src/file-io.c)");
+        eprintln!("skip: guest/bin/file-io not built (see guest/src/file-io.c)");
         return;
     }
     let out = vela().arg("run").arg(&elf).output().expect("spawn vela");
@@ -207,4 +207,62 @@ fn run_file_io_guest() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(stdout.starts_with("file-io all ok"), "stdout={stdout}");
+}
+
+#[test]
+fn run_exec_and_fork_guests() {
+    for (name, expected) in [
+        ("fs-exec", "fs-exec ok: pipe-across-execve"),
+        ("fork-test", "fork-test ok:"),
+    ] {
+        let elf = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../guest/bin")
+            .join(name);
+        if !elf.exists() {
+            eprintln!("skip: {} not built", elf.display());
+            continue;
+        }
+        let out = vela()
+            .args(["run", "--soft-tls"])
+            .arg(&elf)
+            .output()
+            .expect("spawn vela");
+        assert!(out.status.success(), "{name}: {:?}", out.status.code());
+        assert!(String::from_utf8_lossy(&out.stdout).contains(expected));
+    }
+}
+
+#[test]
+fn run_pipe_guests_end_to_end() {
+    use std::process::Stdio;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../guest/bin");
+    let a_path = root.join("pipe-a");
+    let b_path = root.join("pipe-b");
+    if !a_path.exists() || !b_path.exists() {
+        eprintln!("skip: pipe guests not built");
+        return;
+    }
+    let mut a = vela()
+        .args(["run", "--soft-tls"])
+        .arg(&a_path)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn pipe-a");
+    let stdout = a.stdout.take().expect("pipe-a stdout");
+    let out = vela()
+        .args(["run", "--soft-tls"])
+        .arg(&b_path)
+        .stdin(stdout)
+        .output()
+        .expect("spawn pipe-b");
+    assert!(a.wait().expect("wait pipe-a").success());
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "pipe-b ok: 29 bytes, 3 lines\n"
+    );
 }

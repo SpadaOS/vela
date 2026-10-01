@@ -3,8 +3,8 @@
 use std::time::Instant;
 
 use crate::{
-    HostDir, HostDirEntry, HostError, HostFile, HostFileKind, HostOpen, HostPath, HostStat,
-    PipeEnd, PipeEndInner, StdioHandles,
+    HostDir, HostDirEntry, HostError, HostFile, HostFileKind, HostOpen, HostPath, HostPollFd,
+    HostStat, PipeEnd, PipeEndInner, StdioHandles,
 };
 
 pub(crate) fn io_err(e: &std::io::Error) -> HostError {
@@ -163,6 +163,89 @@ pub(crate) fn write(f: &HostFile, buf: &[u8]) -> Result<usize, HostError> {
             .map_err(|e| io_err(&e)),
         HostFileKind::Pipe(e) => e.write(buf),
         HostFileKind::StdIn => Err(HostError::Access),
+    }
+}
+
+/// Poll host files without exposing platform APIs to the runtime crate.
+pub(crate) fn poll(fds: &mut [HostPollFd<'_>], timeout_ms: i32) -> Result<usize, HostError> {
+    if timeout_ms < -1 {
+        return Err(HostError::Invalid);
+    }
+    let start = std::time::Instant::now();
+    loop {
+        let mut ready = 0usize;
+        for fd in fds.iter_mut() {
+            let mut revents = 0u16;
+            match &fd.file.0 {
+                HostFileKind::Disk { .. } | HostFileKind::StdIn => {
+                    revents |= fd.events & 0x0001;
+                    revents |= fd.events & 0x0004;
+                }
+                HostFileKind::StdOut | HostFileKind::StdErr => {
+                    revents |= fd.events & 0x0004;
+                }
+                HostFileKind::Pipe(end) => {
+                    #[cfg(windows)]
+                    {
+                        if let PipeEndInner::Handle(h) = &end.0 {
+                            let mut available = 0u32;
+                            let ok = unsafe {
+                                PeekNamedPipe(
+                                    *h,
+                                    std::ptr::null_mut(),
+                                    0,
+                                    std::ptr::null_mut(),
+                                    &mut available,
+                                    std::ptr::null_mut(),
+                                )
+                            };
+                            if ok == 0 {
+                                let error = unsafe { GetLastError() };
+                                if error == 109 || error == 232 {
+                                    revents |= 0x0010;
+                                } else {
+                                    revents |= 0x0008;
+                                }
+                            } else if available > 0 {
+                                revents |= fd.events & 0x0001;
+                            } else {
+                                // A write handle does not support PeekNamedPipe;
+                                // an open pipe writer is writable while the reader exists.
+                                revents |= fd.events & 0x0004;
+                            }
+                        }
+                    }
+                    if let PipeEndInner::Mem(m, is_read) = &end.0 {
+                        let nonempty = !m.buf.lock().unwrap_or_else(|p| p.into_inner()).is_empty();
+                        if *is_read {
+                            if nonempty {
+                                revents |= fd.events & 0x0001;
+                            }
+                            if !m.write_open.load(std::sync::atomic::Ordering::SeqCst) && !nonempty
+                            {
+                                revents |= 0x0010;
+                            }
+                        } else if m.read_open.load(std::sync::atomic::Ordering::SeqCst) {
+                            revents |= fd.events & 0x0004;
+                        } else {
+                            revents |= 0x0008 | 0x0010;
+                        }
+                    }
+                }
+            }
+            fd.revents = revents;
+            if revents != 0 {
+                ready += 1;
+            }
+        }
+        if ready != 0 || timeout_ms == 0 {
+            return Ok(ready);
+        }
+        if timeout_ms > 0 && start.elapsed() >= std::time::Duration::from_millis(timeout_ms as u64)
+        {
+            return Ok(0);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 
@@ -662,6 +745,14 @@ extern "system" {
         n: u32,
         written: *mut u32,
         overlapped: *mut core::ffi::c_void,
+    ) -> i32;
+    fn PeekNamedPipe(
+        h: isize,
+        buf: *mut u8,
+        n: u32,
+        read: *mut u32,
+        available: *mut u32,
+        left: *mut u32,
     ) -> i32;
     fn CloseHandle(h: isize) -> i32;
     fn GetLastError() -> u32;

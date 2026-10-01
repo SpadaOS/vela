@@ -12,8 +12,8 @@ jobs:
   test:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: rustfmt, clippy
       - name: Format check (PLAN-0.0.3 T3.5)
@@ -38,15 +38,15 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --verbose
       - name: Setup zig (busybox build)
-        uses: mlugg/setup-zig@v1
+        uses: mlugg/setup-zig@53fc45b17fe98b52f92ee5ea08ff48a85a3e7eb7 # v1
         with:
           version: 0.13.0
-      - name: Setup msys2 (make/gcc/bzip2 for busybox)
-        uses: msys2/setup-msys2@v2
+      - name: Setup msys2 (make/gcc/bzip2/diffutils for busybox)
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:
           update: false
           path-type: inherit
-          install: make gcc bzip2 curl
+          install: make gcc bzip2 diffutils curl
       - name: Build busybox subset (musl cross toolchain)
         shell: msys2 {0}
         run: bash tools/build-busybox.sh
@@ -68,7 +68,7 @@ jobs:
           Copy-Item "$env:GITHUB_WORKSPACE\guest\bin\busybox" "$env:RUNNER_TEMP\ash-root\bin\busybox"
           cargo run -p vela-cli --bin vela -- run --soft-tls --root "$env:RUNNER_TEMP\ash-root" guest/bin/busybox sh -c 'echo x > /tmp/t && cat /tmp/t'
       - name: upload ash artifacts (busybox ELF + trace)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         if: always()
         with:
           name: ash-ud1

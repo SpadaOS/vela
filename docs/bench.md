@@ -1,6 +1,6 @@
 # Vela 性能基准
 
-> 方法（PLAN-0.1.0 T0.2 定稿）：`guest/bench`（vela-mkguest 生成）在客户态
+> 方法（PLAN-0.1.0 T0.2 定稿）：`guest/bin/bench`（vela-mkguest 生成）在客户态
 > 循环 2,000,000 次 `getpid(39)`——纯陷阱→dispatch→返回往返，无内存/路径/IO
 > 参与。host 侧外部计时（含固定 ~10ms 进程启动开销，占比 <0.5%）。
 > **5 次取样取中位数**（0.0.6 的 3 次取样曾出 8.9s/11.1s 差 25% 的废数据）。
@@ -45,7 +45,7 @@ fork+exit+waitpid 全链路（fork-test guest，--soft-tls）：
 ## 复现
 
 ```powershell
-cargo run -p vela-cli --bin vela-mkguest -- bench guest/bench
+cargo run -p vela-cli --bin vela-mkguest -- bench guest/bin/bench
 cargo build -p vela-cli --release
-Measure-Command { .\target\release\vela.exe run guest\bench }
+Measure-Command { .\target\release\vela.exe run guest\bin\bench }
 ```

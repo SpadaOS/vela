@@ -3,8 +3,8 @@
     # 在 Linux/WSL 交叉编译：
     #   clang -static-pie -nostdlib -o hello hello.S
     #   gcc   -static-pie -nostdlib -o hello hello.S
-    # 产物应为 ELF 64-bit LSB pie executable，覆盖 guest/hello。
-    # 本机无交叉环境时可用 `cargo run -p vela-cli --bin vela-mkhello -- guest/hello`
+    # 产物应为 ELF 64-bit LSB pie executable，覆盖 guest/bin/hello。
+    # 本机无交叉环境时可用 `cargo run -p vela-cli --bin vela-mkhello -- guest/bin/hello`
     # 生成等价的最小合法 ELF（由 vela-loader 测试保证与编译产物语义一致）。
 
     .global _start

@@ -4,38 +4,113 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
-
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Build (release)
-        run: cargo build -p vela-cli --release
-      - name: Smoke check
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --workspace
+      - name: Host source gate
+        shell: pwsh
         run: |
-          cargo run -p vela-cli --bin vela --release -- --version
+          $pat = 'vela_sys::windows|NtContinue|CreateProcessW|AddVectoredExceptionHandler|VEH|os::windows|cfg\(windows\)|cfg\(target_os = "windows"\)'
+          $hits = Get-ChildItem crates/vela-runtime/src, crates/vela-loader/src, crates/vela-fs/src -Recurse -Filter *.rs | Select-String -Pattern $pat
+          if ($hits) { $hits; throw "host-internal references leaked into guest-side crates" }
+      - name: Build guest assets
+        shell: pwsh
+        run: |
+          cargo build --workspace --release
           cargo run -p vela-cli --bin vela-mkhello -- guest/bin/hello
-          cargo run -p vela-cli --bin vela --release -- run guest/bin/hello
+          cargo run -p vela-cli --bin vela-mkguest -- torture guest/bin/torture
+          cargo run -p vela-cli --bin vela-mkguest -- tls guest/bin/tls
+          cargo run -p vela-cli --bin vela-mkguest -- bench guest/bin/bench
+      - name: Setup zig
+        uses: mlugg/setup-zig@53fc45b17fe98b52f92ee5ea08ff48a85a3e7eb7 # v1
+        with:
+          version: 0.13.0
+      - name: Setup msys2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
+        with:
+          update: false
+          path-type: inherit
+          install: make gcc bzip2 diffutils curl
+      - name: Build busybox subset
+        shell: msys2 {0}
+        run: bash tools/build-busybox.sh
+      - name: Guest acceptance
+        shell: pwsh
+        run: ./scripts/verify.ps1 -RequireBusybox
+      - name: Release binary smoke
+        shell: pwsh
+        run: |
+          $exe = Join-Path $pwd "target/release/vela.exe"
+          $version = & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "release binary --version failed" }
+          if ($version -notmatch '0\.1\.1') { throw "unexpected release version: $version" }
+          & $exe run --soft-tls guest/bin/hello-musl
+          if ($LASTEXITCODE -ne 0) { throw "release binary guest smoke failed" }
       - name: Package
         shell: pwsh
         run: |
           $v = "${{ github.ref_name }}"
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $pkgVersion = ($meta.packages | Where-Object name -eq 'vela-cli' | Select-Object -First 1).version
+          if ($v -ne "v$pkgVersion") { throw "tag $v does not match workspace version $pkgVersion" }
           $dir = "vela-$v-windows-x64"
-          New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          Copy-Item target/release/vela.exe -Destination $dir/
-          Copy-Item README.md, LICENSE -Destination $dir/
+          New-Item -ItemType Directory -Force -Path "$dir/docs", "$dir/docs/plans", "$dir/guest/bin" | Out-Null
+          Copy-Item target/release/vela.exe -Destination "$dir/"
+          Copy-Item README.md, LICENSE, SECURITY.md, CHANGELOG.md, CONTRIBUTING.md -Destination "$dir/"
+          Copy-Item guest/README.md -Destination "$dir/guest/"
+          Copy-Item docs/DESIGN.md, docs/SYSCALLS.md, docs/HOST.md, docs/NONGOALS.md, docs/bench.md -Destination "$dir/docs/"
+          Copy-Item docs/plans/*.md -Destination "$dir/docs/plans/"
+          Copy-Item guest/bin/hello, guest/bin/hello-dyn, guest/bin/hello-musl, guest/bin/ld-musl-x86_64.so.1, guest/bin/torture, guest/bin/tls, guest/bin/file-io, guest/bin/fs-exec, guest/bin/fork-test, guest/bin/pipe-a, guest/bin/pipe-b, guest/bin/bench, guest/bin/busybox -Destination "$dir/guest/bin/"
+          $required = @('vela.exe', 'README.md', 'LICENSE', 'SECURITY.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'guest/README.md', 'docs/HOST.md', 'docs/NONGOALS.md', 'docs/plans/PLAN-0.1.1.md', 'guest/bin/hello', 'guest/bin/hello-musl', 'guest/bin/hello-dyn', 'guest/bin/file-io', 'guest/bin/fs-exec', 'guest/bin/fork-test', 'guest/bin/pipe-a', 'guest/bin/pipe-b', 'guest/bin/busybox')
+          foreach ($item in $required) { if (-not (Test-Path (Join-Path $dir $item))) { throw "package is missing $item" } }
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
           $h = (Get-FileHash "$dir.zip" -Algorithm SHA256).Hash
           "$h  $dir.zip" | Out-File "$dir.zip.sha256" -Encoding ascii
+          $check = Join-Path $env:RUNNER_TEMP "vela-release-check"
+          Remove-Item $check -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive "$dir.zip" -DestinationPath $check
+          $packed = Join-Path $check "$dir/vela.exe"
+          & $packed --version
+          if ($LASTEXITCODE -ne 0) { throw "packed --version failed" }
+          & $packed run (Join-Path $check "$dir/guest/bin/hello")
+          if ($LASTEXITCODE -ne 0) { throw "packed hello failed" }
+      - name: Upload package artifact
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: vela-release-package
+          path: |
+            vela-*-windows-x64.zip
+            vela-*-windows-x64.zip.sha256
+
+  publish:
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vela-release-package
       - name: Upload to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631
         with:
           files: |
             vela-*-windows-x64.zip
