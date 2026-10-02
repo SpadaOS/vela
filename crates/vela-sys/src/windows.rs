@@ -1,16 +1,19 @@
 //! Windows 宿主实现：VirtualAlloc/VirtualProtect/VirtualFree、std 文件与控制台、
 //! VEH（UD2 → dispatch）syscall 陷阱。所有 Win32 FFI 集中在本模块（规格 2.4）。
 
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::file_ops;
 use crate::{
-    GuestRegs, Host, HostDir, HostError, HostFile, HostFileKind, HostFileOps, HostMem, HostOpen,
-    HostPath, HostPollFd, HostProc, HostProt, HostStat, HostTime, HostTls, HostTrap, PipeEnd,
-    StdioHandles, TrapFn, TrapFrame,
+    GuestRegs, GuestThreadContext, Host, HostDir, HostError, HostFile, HostFileKind, HostFileOps,
+    HostMem, HostOpen, HostPath, HostPollFd, HostProc, HostProt, HostStat, HostTid, HostTime,
+    HostTls, HostTrap, PipeEnd, StdioHandles, TrapFn, TrapFrame,
 };
 
 // ---------------------------------------------------------------- Win32 FFI
@@ -83,6 +86,19 @@ extern "system" {
     ) -> *mut c_void;
     fn RemoveVectoredExceptionHandler(Handler: *mut c_void) -> u32;
     fn GetLastError() -> u32;
+    fn GetCurrentThreadId() -> u32;
+    fn TlsAlloc() -> u32;
+    fn TlsGetValue(dwTlsIndex: u32) -> *mut c_void;
+    fn TlsSetValue(dwTlsIndex: u32, lpTlsValue: *mut c_void) -> i32;
+    fn ExitThread(dwExitCode: u32) -> !;
+    fn WaitOnAddress(
+        Address: *const c_void,
+        CompareAddress: *const c_void,
+        AddressSize: usize,
+        dwMilliseconds: u32,
+    ) -> i32;
+    fn WakeByAddressSingle(Address: *const c_void);
+    fn WakeByAddressAll(Address: *const c_void);
 }
 
 extern "system" {
@@ -253,11 +269,16 @@ unsafe extern "system" fn veh_handler(ep: *mut ExceptionPointers) -> i32 {
         if guest_range_containing(ctx.rip as usize).is_some() {
             // soft-tls（--soft-tls）：fs 前缀 mov 的软件模拟（T4.1）。
             // 重入防护：模拟自身的访存再 AV（TLS 区未映射）不允许递归。
-            if SOFT_TLS_ENABLED.load(Ordering::Relaxed) == 1
-                && IN_SOFT_EMULATE.swap(1, Ordering::SeqCst) == 0
-            {
+            let reentrant = IN_SOFT_EMULATE.with(|busy| {
+                let was = busy.get();
+                if !was {
+                    busy.set(true);
+                }
+                was
+            });
+            if SOFT_TLS_ENABLED.load(Ordering::Relaxed) == 1 && !reentrant {
                 let emulated = unsafe { emulate_fs_mov(ctx) };
-                IN_SOFT_EMULATE.store(0, Ordering::SeqCst);
+                IN_SOFT_EMULATE.with(|busy| busy.set(false));
                 if emulated {
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
@@ -400,17 +421,26 @@ pub fn set_console_utf8() {
 
 static SOFT_TLS_ENABLED: AtomicU32 = AtomicU32::new(0);
 /// 客户侧 TLS 基址（proc.fs_base 由 CLI 在每次 syscall 陷阱时同步）。
-static SOFT_TLS_BASE: AtomicU64 = AtomicU64::new(0);
 /// 模拟重入防护：模拟自身的读写若再触发 AV（TLS 区未映射等），不允许递归。
-static IN_SOFT_EMULATE: AtomicU32 = AtomicU32::new(0);
 static SOFT_TLS_WARNED: AtomicU32 = AtomicU32::new(0);
+
+thread_local! {
+    static SOFT_TLS_BASE: Cell<u64> = const { Cell::new(0) };
+    static IN_SOFT_EMULATE: Cell<bool> = const { Cell::new(false) };
+    static CURRENT_GUEST_TID: Cell<u32> = const { Cell::new(0) };
+    static CURRENT_CLEAR_TID: Cell<u64> = const { Cell::new(0) };
+}
 
 pub fn enable_soft_tls() {
     SOFT_TLS_ENABLED.store(1, Ordering::Relaxed);
 }
 
 pub fn set_soft_tls_base(v: u64) {
-    SOFT_TLS_BASE.store(v, Ordering::Relaxed);
+    SOFT_TLS_BASE.with(|base| base.set(v));
+}
+
+fn soft_tls_base() -> u64 {
+    SOFT_TLS_BASE.with(Cell::get)
 }
 
 /// fs 前缀 mov 的解码结果。
@@ -593,7 +623,7 @@ unsafe fn emulate_fs_mov(ctx: &mut Context) -> bool {
     let Some(m) = decode_fs_mov(bytes) else {
         return false;
     };
-    let fs = SOFT_TLS_BASE.load(Ordering::Relaxed);
+    let fs = soft_tls_base();
     if fs == 0 {
         return false; // arch_prctl(SET_FS) 尚未发生：不是可模拟的 TLS 访问
     }
@@ -676,6 +706,28 @@ core::arch::global_asm!(
     "    mov QWORD PTR [rip + VELA_STUB_HIT], 1",
     "    wrfsbase r10",
     "    jmp rcx",
+    ".globl vela_enter_guest_context",
+    "vela_enter_guest_context:",
+    // rcx = pointer to GuestRegs. Keep it in r13 until all registers are
+    // restored; the final jump target is loaded into r11.
+    "    mov r13, rcx",
+    "    mov rax, [r13 + 0x00]",
+    "    mov rcx, [r13 + 0x08]",
+    "    mov rdx, [r13 + 0x10]",
+    "    mov rbx, [r13 + 0x18]",
+    "    mov rsp, [r13 + 0x20]",
+    "    mov rbp, [r13 + 0x28]",
+    "    mov rsi, [r13 + 0x30]",
+    "    mov rdi, [r13 + 0x38]",
+    "    mov r8,  [r13 + 0x40]",
+    "    mov r9,  [r13 + 0x48]",
+    "    mov r10, [r13 + 0x50]",
+    "    mov r12, [r13 + 0x60]",
+    "    mov r14, [r13 + 0x70]",
+    "    mov r15, [r13 + 0x78]",
+    "    mov r11, [r13 + 0x80]",
+    "    mov r13, [r13 + 0x68]",
+    "    jmp r11",
 );
 
 #[cfg(target_arch = "x86_64")]
@@ -833,12 +885,16 @@ extern "C" {
 #[derive(Debug)]
 pub struct WindowsHost {
     start: Instant,
+    guest_threads: Arc<Mutex<HashMap<u64, std::thread::JoinHandle<i32>>>>,
+    active_threads: Arc<AtomicU32>,
 }
 
 impl WindowsHost {
     pub fn new() -> Self {
         WindowsHost {
             start: Instant::now(),
+            guest_threads: Arc::new(Mutex::new(HashMap::new())),
+            active_threads: Arc::new(AtomicU32::new(1)),
         }
     }
 }
@@ -1103,15 +1159,87 @@ impl HostTls for WindowsHost {
             Err(HostError::Unimplemented)
         }
     }
+
+    fn get_fs_base(&self) -> Option<u64> {
+        let soft = soft_tls_base();
+        if soft != 0 {
+            Some(soft)
+        } else {
+            read_fs_base()
+        }
+    }
 }
 
 impl Host for WindowsHost {
     fn thread_exit(&self, code: i32) -> ! {
-        // v0 单线程模型：线程退出即进程退出（规格 2.1）
-        std::process::exit(code)
+        let remaining = self.active_threads.fetch_sub(1, Ordering::AcqRel);
+        if remaining <= 1 {
+            std::process::exit(code);
+        }
+        unsafe { ExitThread(code as u32) }
     }
     fn process_exit(&self, code: i32) -> ! {
         std::process::exit(code)
+    }
+
+    fn futex_wait(
+        &self,
+        addr: *const u32,
+        expected: u32,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<(), HostError> {
+        if addr.is_null() || !(addr as usize).is_multiple_of(std::mem::align_of::<u32>()) {
+            return Err(HostError::Invalid);
+        }
+        // SAFETY: the runtime validates the guest mapping before entering the
+        // host; this read is only the compare value required by WaitOnAddress.
+        let current = unsafe {
+            std::sync::atomic::AtomicU32::from_ptr(addr as *mut u32).load(Ordering::Acquire)
+        };
+        if current != expected {
+            return Err(HostError::Other(11)); // Linux EAGAIN
+        }
+        let millis = timeout.map_or(u32::MAX, |d| d.as_millis().min(u32::MAX as u128) as u32);
+        let ok = unsafe {
+            WaitOnAddress(
+                addr.cast::<c_void>(),
+                &expected as *const u32 as *const c_void,
+                std::mem::size_of::<u32>(),
+                millis,
+            )
+        };
+        if ok != 0 {
+            Ok(())
+        } else {
+            let error = unsafe { GetLastError() };
+            if error == 1460 {
+                Err(HostError::TimedOut)
+            } else if error == 87 {
+                Err(HostError::Invalid)
+            } else {
+                Err(HostError::Other(file_ops::os_to_errno(error as i32)))
+            }
+        }
+    }
+
+    fn futex_wake(&self, addr: *const u32, n: u32) -> Result<u32, HostError> {
+        if addr.is_null() || !(addr as usize).is_multiple_of(std::mem::align_of::<u32>()) {
+            return Err(HostError::Invalid);
+        }
+        if n == 0 {
+            return Ok(0);
+        }
+        unsafe {
+            if n == 1 {
+                WakeByAddressSingle(addr.cast::<c_void>());
+            } else {
+                WakeByAddressAll(addr.cast::<c_void>());
+            }
+        }
+        // Windows does not expose the exact number of waiters released.  A
+        // single wake is exact; WakeByAddressAll is conservatively reported as
+        // the requested count, matching Linux's useful upper-bound contract.
+        Ok(n)
     }
 }
 
@@ -1172,6 +1300,121 @@ impl HostTrap for WindowsHost {
 }
 
 impl HostProc for WindowsHost {
+    fn active_guest_threads(&self) -> u32 {
+        self.active_threads.load(Ordering::Acquire)
+    }
+
+    fn guest_thread_started(&self) {
+        self.active_threads.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn guest_thread_exited(&self) {
+        let _ = self
+            .active_threads
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+    }
+
+    fn current_tid(&self) -> u32 {
+        let guest = CURRENT_GUEST_TID.with(Cell::get);
+        if guest != 0 {
+            guest
+        } else {
+            // SAFETY: no arguments and always returns the current native tid.
+            unsafe { GetCurrentThreadId() }
+        }
+    }
+
+    fn set_clear_tid(&self, addr: u64) {
+        CURRENT_CLEAR_TID.with(|slot| slot.set(addr));
+    }
+
+    fn take_clear_tid(&self) -> Option<u64> {
+        CURRENT_CLEAR_TID.with(|slot| {
+            let addr = slot.get();
+            slot.set(0);
+            (addr != 0).then_some(addr)
+        })
+    }
+
+    fn spawn_guest_thread(&self, mut context: GuestThreadContext) -> Result<HostTid, HostError> {
+        let tid = context.tid;
+        context.regs.rip = context.entry;
+        context.regs.rsp = context.stack;
+        context.regs.rax = 0;
+        // Publish the new guest thread before starting the native thread. A
+        // very short-lived guest can reach SYS_EXIT before `spawn` returns;
+        // counting it afterwards would let that exit observe the wrong
+        // process-wide last-thread state.
+        self.guest_thread_started();
+        let handle = std::thread::Builder::new()
+            .name(format!("vela-guest-{}", tid.0))
+            .spawn(move || {
+                island::prepare_veh_scratch();
+                CURRENT_GUEST_TID.with(|slot| slot.set(tid.0 as u32));
+                set_soft_tls_base(context.tls);
+                if fs_base_supported() && context.tls != 0 {
+                    let _ = set_thread_fs_base_now(context.tls);
+                    commit_fs_base_after_preset();
+                }
+                CURRENT_CLEAR_TID.with(|slot| slot.set(context.clear_tid));
+                let regs = Box::new(context.regs);
+                // SAFETY: the caller supplied a mapped guest stack and an
+                // executable entry; the context remains allocated until the
+                // non-returning guest jump consumes it.
+                unsafe { vela_enter_guest_context(regs.as_ref() as *const GuestRegs) }
+            })
+            .map_err(|_| {
+                self.guest_thread_exited();
+                HostError::NoMemory
+            })?;
+        match self.guest_threads.lock() {
+            Ok(mut g) => {
+                g.insert(tid.0, handle);
+            }
+            Err(p) => {
+                p.into_inner().insert(tid.0, handle);
+            }
+        }
+        Ok(tid)
+    }
+
+    fn join_guest_thread(
+        &self,
+        tid: HostTid,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Option<i32>, HostError> {
+        let start = Instant::now();
+        loop {
+            let finished = match self.guest_threads.lock() {
+                Ok(g) => g
+                    .get(&tid.0)
+                    .is_some_and(std::thread::JoinHandle::is_finished),
+                Err(p) => p
+                    .into_inner()
+                    .get(&tid.0)
+                    .is_some_and(std::thread::JoinHandle::is_finished),
+            };
+            if finished {
+                let handle = match self.guest_threads.lock() {
+                    Ok(mut g) => g.remove(&tid.0),
+                    Err(p) => p.into_inner().remove(&tid.0),
+                };
+                return Ok(handle.and_then(|h| h.join().ok()));
+            }
+            if let Some(limit) = timeout {
+                if start.elapsed() >= limit {
+                    return Ok(None);
+                }
+                std::thread::sleep(std::cmp::min(
+                    Duration::from_millis(1),
+                    limit.saturating_sub(start.elapsed()),
+                ));
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
     fn shared_section(&self, size: u64) -> Result<isize, HostError> {
         create_shared_section(size)
     }
@@ -1281,6 +1524,7 @@ core::arch::global_asm!(
 #[cfg(target_arch = "x86_64")]
 extern "C" {
     fn vela_enter_guest(entry: u64, rsp: u64) -> !;
+    fn vela_enter_guest_context(regs: *const GuestRegs) -> !;
 }
 
 // ---------------------------------------------------------------- 岛页跳板（0.1.0 T2.1/T2.2）
@@ -1343,10 +1587,61 @@ mod island {
     static mut VELA_ISLAND_STACK: AlignedStack = AlignedStack([0; 4 * 1024 * 1024]);
 
     /// VEH 处理体宿主栈（T2.4）：Rust 处理（dispatch/fork/日志）不再压客户栈。
+    #[repr(C, align(16))]
+    struct VehScratch {
+        rsp: u64,
+        _pad: u64,
+        stack: AlignedStack,
+    }
+
+    static VEH_TLS_INDEX: AtomicU32 = AtomicU32::new(u32::MAX);
+
+    /// Allocate the current thread's exception scratch before guest execution
+    /// starts. The VEH entry itself stays allocation-free and async-safe.
+    pub fn prepare_veh_scratch() {
+        let mut index = VEH_TLS_INDEX.load(Ordering::Acquire);
+        if index == u32::MAX {
+            let allocated = unsafe { TlsAlloc() };
+            if allocated == u32::MAX {
+                return;
+            }
+            match VEH_TLS_INDEX.compare_exchange(
+                u32::MAX,
+                allocated,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => index = allocated,
+                Err(existing) => index = existing,
+            }
+        }
+        if unsafe { TlsGetValue(index) }.is_null() {
+            let scratch = unsafe {
+                VirtualAlloc(
+                    std::ptr::null_mut(),
+                    std::mem::size_of::<VehScratch>(),
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_READWRITE,
+                )
+            };
+            assert!(!scratch.is_null(), "VEH scratch allocation failed");
+            assert_ne!(
+                unsafe { TlsSetValue(index, scratch) },
+                0,
+                "VEH TLS registration failed"
+            );
+        }
+    }
+
     #[no_mangle]
-    static mut VELA_VEH_STACK: AlignedStack = AlignedStack([0; 4 * 1024 * 1024]);
-    #[no_mangle]
-    static mut VELA_VEH_RSP_SAVE: u64 = 0;
+    unsafe extern "C" fn vela_veh_scratch() -> *mut VehScratch {
+        let index = VEH_TLS_INDEX.load(Ordering::Acquire);
+        if index == u32::MAX {
+            std::ptr::null_mut()
+        } else {
+            unsafe { TlsGetValue(index).cast() }
+        }
+    }
 
     // VEH 入口 wrapper：保非易失寄存器（内核 ABI）→ 切宿主栈 → Rust 处理体
     // → 换回。内核自身的异常帧仍落客户栈（架构固有，量级 ~0x100 字节，
@@ -1362,15 +1657,20 @@ mod island {
         "    push r13",
         "    push r14",
         "    push r15",
+        "    mov r12, rcx",
         // RIP 相对取址（x64 无 32 位绝对重定位）
-        "    lea r10, [rip + VELA_VEH_RSP_SAVE]",
+        "    mov r13, rsp",
+        "    sub rsp, 0x28",
+        "    call {scratch}",
+        "    add rsp, 0x28",
+        "    mov r10, rax",
         "    mov [r10], rsp",
-        "    lea rsp, [rip + VELA_VEH_STACK]",
+        "    lea rsp, [r10 + 16]",
         "    add rsp, 4194304",
         "    sub rsp, 0x30",
+        "    mov rcx, r12",
         "    call {inner}",
-        "    lea r10, [rip + VELA_VEH_RSP_SAVE]",
-        "    mov rsp, [r10]",
+        "    mov rsp, r13",
         "    pop r15",
         "    pop r14",
         "    pop r13",
@@ -1381,6 +1681,7 @@ mod island {
         "    pop rbx",
         "    ret",
         inner = sym super::veh_handler,
+        scratch = sym vela_veh_scratch,
     );
 
     /// 岛页 dispatch（岛内桩 call 进来；宿主栈上执行）。
@@ -2100,6 +2401,11 @@ mod island {
         b[0xD0..0xD8].copy_from_slice(&frame.e_flags.to_le_bytes()); // r11
         b
     }
+}
+
+/// Prepare per-thread VEH storage before entering guest code.
+pub fn prepare_veh_scratch() {
+    island::prepare_veh_scratch();
 }
 
 /// CreateProcess 产物：pid 与常驻 hProcess（wait4/kill 用）。

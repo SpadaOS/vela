@@ -255,6 +255,21 @@ impl HostDir {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct HostTid(pub u64);
 
+/// Platform-neutral launch state for a guest thread.
+///
+/// `entry`/`stack` are guest virtual addresses. `regs` carries the integer
+/// register snapshot at the clone return point; hosts may ignore registers
+/// that their native launcher restores from the supplied entry/stack pair.
+#[derive(Clone, Copy, Debug)]
+pub struct GuestThreadContext {
+    pub tid: HostTid,
+    pub entry: u64,
+    pub stack: u64,
+    pub tls: u64,
+    pub clear_tid: u64,
+    pub regs: GuestRegs,
+}
+
 // ---------------------------------------------------------------- 其他类型
 
 #[derive(Debug)]
@@ -309,6 +324,8 @@ pub enum HostError {
     NoMemory,
     /// 文件已存在（O_EXCL create_new 冲突）。
     Exist,
+    /// A bounded wait elapsed without a wakeup.
+    TimedOut,
     Unimplemented,
     Other(i32),
 }
@@ -321,6 +338,7 @@ impl std::fmt::Display for HostError {
             HostError::Invalid => write!(f, "invalid argument"),
             HostError::NoMemory => write!(f, "out of memory"),
             HostError::Exist => write!(f, "file exists"),
+            HostError::TimedOut => write!(f, "timed out"),
             HostError::Unimplemented => write!(f, "unimplemented on this host"),
             HostError::Other(e) => write!(f, "host error {e}"),
         }
@@ -341,6 +359,7 @@ impl std::error::Error for HostError {}
 /// 共用的整数现场。字段顺序刻意与 Win64 CONTEXT 的 RAX..RIP 连续段一致
 /// （windows.rs 有布局断言），VEH 路径零拷贝重解释；其他宿主布局自由。
 #[repr(C)]
+#[derive(Clone, Copy, Debug)]
 pub struct GuestRegs {
     pub rax: u64,
     pub rcx: u64,
@@ -490,6 +509,51 @@ pub trait HostTrap: Send + Sync + 'static {
 pub trait HostProc: Send + Sync + 'static {
     fn current_pid(&self) -> u32 {
         std::process::id()
+    }
+
+    fn current_tid(&self) -> u32 {
+        self.current_pid()
+    }
+
+    fn set_clear_tid(&self, addr: u64) {
+        let _ = addr;
+    }
+
+    fn take_clear_tid(&self) -> Option<u64> {
+        None
+    }
+
+    /// Number of live guest threads in this process. The default host is
+    /// single threaded; Windows updates this atomically for clone/exit.
+    fn active_guest_threads(&self) -> u32 {
+        1
+    }
+
+    fn guest_thread_started(&self) {}
+
+    fn guest_thread_exited(&self) {}
+
+    /// Register and start a guest thread.  The context is deliberately
+    /// platform-neutral; Windows maps it to a native thread and the other
+    /// hosts retain the default `Unimplemented` implementation.
+    fn spawn_guest_thread(&self, _context: GuestThreadContext) -> Result<HostTid, HostError> {
+        Err(HostError::Unimplemented)
+    }
+
+    /// Wait for a guest thread to leave.  A zero timeout polls; `None` waits
+    /// indefinitely.
+    fn join_guest_thread(
+        &self,
+        _tid: HostTid,
+        _timeout: Option<Duration>,
+    ) -> Result<Option<i32>, HostError> {
+        Err(HostError::Unimplemented)
+    }
+
+    /// Request the current guest thread to leave after publishing its exit
+    /// status and clear-tid wakeup.
+    fn exit_guest_thread(&self, _code: i32) -> ! {
+        panic!("guest thread exit not supported on this host")
     }
 
     // ---- 共享内存 section（fork 快照通道）----
@@ -721,6 +785,11 @@ pub trait HostTls: Send + Sync + 'static {
     fn set_fs_base(&self, v: u64) -> Result<(), HostError> {
         let _ = v;
         Err(HostError::Unimplemented)
+    }
+
+    /// Read the current thread's guest FS base when the host keeps one.
+    fn get_fs_base(&self) -> Option<u64> {
+        None
     }
 }
 

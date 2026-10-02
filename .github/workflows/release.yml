@@ -42,6 +42,9 @@ jobs:
         uses: mlugg/setup-zig@53fc45b17fe98b52f92ee5ea08ff48a85a3e7eb7 # v1
         with:
           version: 0.13.0
+      - name: Build pthread guest
+        shell: pwsh
+        run: zig cc -target x86_64-linux-musl -fPIE -pie -O2 -pthread -o guest/bin/pthread-test guest/src/pthread-test.c
       - name: Setup msys2
         uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:
@@ -53,14 +56,14 @@ jobs:
         run: bash tools/build-busybox.sh
       - name: Guest acceptance
         shell: pwsh
-        run: ./scripts/verify.ps1 -RequireBusybox
+        run: ./scripts/verify.ps1 -RequireBusybox -RequireThreads
       - name: Release binary smoke
         shell: pwsh
         run: |
           $exe = Join-Path $pwd "target/release/vela.exe"
           $version = & $exe --version
           if ($LASTEXITCODE -ne 0) { throw "release binary --version failed" }
-          if ($version -notmatch '0\.1\.1') { throw "unexpected release version: $version" }
+          if ($version -notmatch '0\.1\.2') { throw "unexpected release version: $version" }
           & $exe run --soft-tls guest/bin/hello-musl
           if ($LASTEXITCODE -ne 0) { throw "release binary guest smoke failed" }
       - name: Package
@@ -77,8 +80,8 @@ jobs:
           Copy-Item guest/README.md -Destination "$dir/guest/"
           Copy-Item docs/DESIGN.md, docs/SYSCALLS.md, docs/HOST.md, docs/NONGOALS.md, docs/bench.md -Destination "$dir/docs/"
           Copy-Item docs/plans/*.md -Destination "$dir/docs/plans/"
-          Copy-Item guest/bin/hello, guest/bin/hello-dyn, guest/bin/hello-musl, guest/bin/ld-musl-x86_64.so.1, guest/bin/torture, guest/bin/tls, guest/bin/file-io, guest/bin/fs-exec, guest/bin/fork-test, guest/bin/pipe-a, guest/bin/pipe-b, guest/bin/bench, guest/bin/busybox -Destination "$dir/guest/bin/"
-          $required = @('vela.exe', 'README.md', 'LICENSE', 'SECURITY.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'guest/README.md', 'docs/HOST.md', 'docs/NONGOALS.md', 'docs/plans/PLAN-0.1.1.md', 'guest/bin/hello', 'guest/bin/hello-musl', 'guest/bin/hello-dyn', 'guest/bin/file-io', 'guest/bin/fs-exec', 'guest/bin/fork-test', 'guest/bin/pipe-a', 'guest/bin/pipe-b', 'guest/bin/busybox')
+          Copy-Item guest/bin/hello, guest/bin/hello-dyn, guest/bin/hello-musl, guest/bin/ld-musl-x86_64.so.1, guest/bin/torture, guest/bin/tls, guest/bin/file-io, guest/bin/fs-exec, guest/bin/fork-test, guest/bin/pipe-a, guest/bin/pipe-b, guest/bin/bench, guest/bin/busybox, guest/bin/pthread-test -Destination "$dir/guest/bin/"
+          $required = @('vela.exe', 'README.md', 'LICENSE', 'SECURITY.md', 'CHANGELOG.md', 'CONTRIBUTING.md', 'guest/README.md', 'docs/HOST.md', 'docs/NONGOALS.md', 'docs/plans/PLAN-0.1.2.md', 'guest/bin/hello', 'guest/bin/hello-musl', 'guest/bin/hello-dyn', 'guest/bin/file-io', 'guest/bin/fs-exec', 'guest/bin/fork-test', 'guest/bin/pipe-a', 'guest/bin/pipe-b', 'guest/bin/busybox', 'guest/bin/pthread-test')
           foreach ($item in $required) { if (-not (Test-Path (Join-Path $dir $item))) { throw "package is missing $item" } }
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
           $h = (Get-FileHash "$dir.zip" -Algorithm SHA256).Hash
@@ -91,6 +94,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "packed --version failed" }
           & $packed run (Join-Path $check "$dir/guest/bin/hello")
           if ($LASTEXITCODE -ne 0) { throw "packed hello failed" }
+          & $packed run --soft-tls (Join-Path $check "$dir/guest/bin/pthread-test")
+          if ($LASTEXITCODE -ne 0) { throw "packed pthread guest failed" }
       - name: Upload package artifact
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:

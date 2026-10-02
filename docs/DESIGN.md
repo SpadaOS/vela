@@ -184,3 +184,9 @@ vela-cli → vela-loader → vela-runtime → vela-fs
   （offset/hint 64K 对齐，否则退化为匿名映射 + 读入）。
 - execve 重载释放旧 Reserve/FileView/Island；仅释放失败进入有上限的诊断债务。
 - VEH 处理器在客户栈上执行（见上文 red zone 风险）。
+
+## 0.1.2 线程与并发边界
+
+Windows 运行时把 pthread 形态的 `clone` 映射到原生线程。进程映像、内存登记、文件表和路径映射属于进程共享资源；tid、FS/GS、soft-TLS、clear-tid 和退出状态属于线程资源。VEH/island scratch 和 soft-TLS 基址按宿主线程保存，futex/poll/pipe 等等待期间不持有进程共享锁。
+
+当前 flags 覆盖 musl pthread 创建路径；`CLONE_DETACHED` 作为兼容性 no-op。线程退出先清零 `clear_tid` 并执行一次 futex wake，再结束当前原生线程；`exit_group` 才终止整个 Vela 进程。多线程进程调用 fork 返回 `EAGAIN`，非主线程 execve 返回 `ENOSYS`，避免伪造不安全的 POSIX 快照语义。

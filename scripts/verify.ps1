@@ -1,5 +1,5 @@
 ﻿# verify.ps1 — Windows 本地完整验证（CI 同款命令）
-param([switch]$RequireBusybox)
+param([switch]$RequireBusybox, [switch]$RequireThreads)
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
 
@@ -29,6 +29,30 @@ if ($RequireBusybox) {
     if ($LASTEXITCODE -ne 0) { exit 1 }
     cargo run -q -p vela-cli --bin vela -- run --soft-tls guest/bin/busybox true
     if ($LASTEXITCODE -ne 0) { exit 1 }
+
+    $busyRoot = Join-Path ([System.IO.Path]::GetTempPath()) "vela-busybox-root-$PID"
+    New-Item -ItemType Directory -Force -Path (Join-Path $busyRoot "data") | Out-Null
+    Set-Content -LiteralPath (Join-Path $busyRoot "data/input.txt") -Value "needle`nother`n" -NoNewline
+    try {
+        cargo run -q -p vela-cli --bin vela -- run --soft-tls --root $busyRoot guest/bin/busybox grep needle /data/input.txt
+        if ($LASTEXITCODE -ne 0) { throw "BusyBox grep root acceptance failed" }
+        cargo run -q -p vela-cli --bin vela -- run --soft-tls --root $busyRoot guest/bin/busybox find /data -name input.txt
+        if ($LASTEXITCODE -ne 0) { throw "BusyBox find root acceptance failed" }
+        cargo run -q -p vela-cli --bin vela -- run --soft-tls --root $busyRoot guest/bin/busybox tar -cf /data/archive.tar /data/input.txt
+        if ($LASTEXITCODE -ne 0) { throw "BusyBox tar root acceptance failed" }
+        cargo run -q -p vela-cli --bin vela -- run --soft-tls --root $busyRoot guest/bin/busybox gzip -c /data/input.txt
+        if ($LASTEXITCODE -ne 0) { throw "BusyBox gzip root acceptance failed" }
+    } finally {
+        Remove-Item -LiteralPath $busyRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+if ($RequireThreads) {
+    Write-Host "==> pthread acceptance"
+    if (-not (Test-Path guest/bin/pthread-test)) { throw "guest/bin/pthread-test is required" }
+    1..3 | ForEach-Object {
+        cargo run -q -p vela-cli --bin vela -- run --soft-tls guest/bin/pthread-test
+        if ($LASTEXITCODE -ne 0) { throw "pthread guest failed on iteration $_" }
+    }
 }
 
 Write-Host "==> all checks passed"

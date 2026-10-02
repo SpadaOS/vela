@@ -124,6 +124,30 @@ vela run --soft-tls guest\bin\busybox nproc
 vela run --soft-tls guest\bin\busybox true
 ```
 
+0.1.2 ���Ȿ������ `grep`��`find`��`tar` �� `gzip`��ֻ�� root �����������ʹ�ã�
+�������ڷ���̨������һ�£�
+
+```powershell
+vela run --soft-tls --root C:\vela-root guest\bin\busybox grep needle /data/input.txt
+vela run --soft-tls --root C:\vela-root guest\bin\busybox find /data -name input.txt
+```
+
+## `pthread-test`��0.1.2 ���̻߳�׼
+
+`pthread-test` �� musl static PIE���ڻ��в��Թ��� 8 ������̡߳�ÿ�̵߳�
+`_Thread_local`����ԭ�Ӽ�����futex wait/wake��`gettid`/`getpid` �� join��
+�����Ƽ��� Windows ����ʹ�� soft-TLS �������ظ�ִ�У�
+
+```powershell
+zig cc -target x86_64-linux-musl -fPIE -pie -O2 -pthread `
+  -o guest/bin/pthread-test guest/src/pthread-test.c
+vela run --soft-tls guest/bin/pthread-test
+```
+
+����� `pthread-test ok: 8 threads, futex, tls, tid` ʱ��ʾ���̻߳�׼ͨ����
+���߳̽��� fork/exec ���������������߳� fork ���� `EAGAIN`��worker exec ����
+`ENOSYS`����
+
 本地复现需要 msys2（make/gcc/bzip2/diffutils/curl）+ zig 0.13.0 在 PATH；脚本内
 `cygpath` 处理 workspace 路径转换，并针对 zig 0.13 Windows 工具链做了三项
 修补（depfile 剥离、autoconf.h 强制生成、GNU ld 专属链接参数中和）——

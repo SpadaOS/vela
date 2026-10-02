@@ -15,6 +15,7 @@ pub mod stat;
 pub mod statx;
 pub mod structs;
 pub mod syscalls;
+pub mod thread;
 
 pub use auxv::*;
 pub use clock::*;
@@ -27,6 +28,7 @@ pub use stat::*;
 pub use statx::*;
 pub use structs::*;
 pub use syscalls::*;
+pub use thread::*;
 
 #[cfg(test)]
 mod tests {

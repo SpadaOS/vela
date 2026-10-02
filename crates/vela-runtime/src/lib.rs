@@ -8,6 +8,8 @@ pub use mem::{InterpImage, LoadedImage, MemRange, Segment};
 pub use syscalls::dispatch;
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use vela_abi as abi;
 use vela_sys::{Host, HostDir, HostError, HostFile, HostProt};
@@ -142,6 +144,107 @@ impl FdTable {
     }
 }
 
+/// State shared by all guest threads in one process.  The legacy
+/// `GuestProcess` adapter below remains available for the single-thread trap
+/// path; new thread-aware code should pass this object through `GuestContext`.
+pub struct ProcessShared {
+    pub pid: u32,
+    pub ppid: u32,
+    pub uid: AtomicU32,
+    pub gid: AtomicU32,
+    pub load: RwLock<LoadedImage>,
+    pub mem: RwLock<MemRegistry>,
+    pub fds: Mutex<FdTable>,
+    pub cwd: RwLock<String>,
+    pub fs: RwLock<vela_fs::FsMap>,
+    pub children: Mutex<BTreeMap<u32, isize>>,
+}
+
+impl ProcessShared {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        pid: u32,
+        ppid: u32,
+        uid: u32,
+        gid: u32,
+        load: LoadedImage,
+        mem: MemRegistry,
+        fds: FdTable,
+        cwd: String,
+        fs: vela_fs::FsMap,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            pid,
+            ppid,
+            uid: AtomicU32::new(uid),
+            gid: AtomicU32::new(gid),
+            load: RwLock::new(load),
+            mem: RwLock::new(mem),
+            fds: Mutex::new(fds),
+            cwd: RwLock::new(cwd),
+            fs: RwLock::new(fs),
+            children: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    pub fn uid(&self) -> u32 {
+        self.uid.load(Ordering::Acquire)
+    }
+
+    pub fn gid(&self) -> u32 {
+        self.gid.load(Ordering::Acquire)
+    }
+}
+
+/// Per-thread state that is intentionally independent from `ProcessShared`.
+pub struct GuestThread {
+    pub tid: u32,
+    pub fs_base: AtomicU64,
+    pub gs_base: AtomicU64,
+    pub soft_tls_base: AtomicU64,
+    pub clear_tid: AtomicU64,
+    pub robust_list: AtomicU64,
+    pub stack: Option<MemRange>,
+    pub exited: AtomicBool,
+    pub exit_code: Mutex<Option<i32>>,
+}
+
+impl GuestThread {
+    pub fn new(tid: u32, stack: Option<MemRange>, tls: u64) -> Arc<Self> {
+        Arc::new(Self {
+            tid,
+            fs_base: AtomicU64::new(tls),
+            gs_base: AtomicU64::new(0),
+            soft_tls_base: AtomicU64::new(tls),
+            clear_tid: AtomicU64::new(0),
+            robust_list: AtomicU64::new(0),
+            stack,
+            exited: AtomicBool::new(false),
+            exit_code: Mutex::new(None),
+        })
+    }
+
+    pub fn mark_exit(&self, code: i32) {
+        if let Ok(mut slot) = self.exit_code.lock() {
+            *slot = Some(code);
+        }
+        self.exited.store(true, Ordering::Release);
+    }
+}
+
+/// Syscall-facing combination of process and current-thread state.
+#[derive(Clone)]
+pub struct GuestContext {
+    pub shared: Arc<ProcessShared>,
+    pub thread: Arc<GuestThread>,
+}
+
+impl GuestContext {
+    pub fn new(shared: Arc<ProcessShared>, thread: Arc<GuestThread>) -> Self {
+        Self { shared, thread }
+    }
+}
+
 // ---------------------------------------------------------------- 进程
 
 /// mprotect 运行时账本条目（PLAN-0.1.0 T3.2）：成功应用的保护变更，
@@ -156,6 +259,11 @@ pub struct ProtOverride {
 
 pub struct GuestProcess {
     pub pid: u32,
+    /// Linux thread id. The initial thread uses the process id.
+    pub tid: u32,
+    /// Address supplied by `set_tid_address`; a terminating thread stores 0
+    /// here and wakes waiters through the futex backend.
+    pub clear_tid: Option<u64>,
     /// 父进程 pid（0.0.6 M1：fork 时由元数据传递；普通启动 = 宿主派生值）。
     pub ppid: u32,
     pub uid: u32,
@@ -190,6 +298,8 @@ impl GuestProcess {
         }
         GuestProcess {
             pid,
+            tid: pid,
+            clear_tid: None,
             ppid: 0,
             uid: 1000,
             gid: 1000,
@@ -319,6 +429,7 @@ pub fn host_err_to_errno(e: &HostError) -> i32 {
         HostError::Invalid => abi::EINVAL,
         HostError::NoMemory => abi::ENOMEM,
         HostError::Exist => abi::EEXIST,
+        HostError::TimedOut => abi::ETIMEDOUT,
         HostError::Unimplemented => abi::ENOSYS,
         HostError::Other(c) => *c,
     }

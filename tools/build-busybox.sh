@@ -42,7 +42,8 @@ cd "$BB_SRC"
 make -s allnoconfig HOSTCC=gcc
 for f in ECHO LS CAT TRUE FALSE NPROC ENV PRINTF \
          ASH CP MV RM MKDIR RMDIR LN HEAD TAIL WC GREP SLEEP SEQ \
-         XARGS TEST EXPR SORT UNIQ DATE DF DU BASENAME DIRNAME WHOAMI; do
+         XARGS TEST EXPR SORT UNIQ DATE DF DU BASENAME DIRNAME WHOAMI \
+         FIND TAR GZIP; do
   sed -i "s/^# CONFIG_${f} is not set/CONFIG_${f}=y/" .config
 done
 sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
@@ -61,7 +62,7 @@ yes "" | make oldconfig HOSTCC=gcc >/dev/null 2>&1 || true
 # 显式强制生成 include/autoconf.h（CI 主 make 会跳过生成规则，本地不复现）
 rm -f include/autoconf.h
 rm -rf include/config
-make silentoldconfig HOSTCC=gcc
+yes "" | make silentoldconfig HOSTCC=gcc
 test -f include/autoconf.h || { echo "FATAL: include/autoconf.h not generated"; exit 1; }
 
 # zig 0.13 Windows 下 -Wp,-MD,<depfile> 会瞬间 FileNotFound（zig 的 dep-file
