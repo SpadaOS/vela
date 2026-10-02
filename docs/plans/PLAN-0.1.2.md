@@ -29,7 +29,7 @@
 
 支持以下线程 flags：
 
-`CLONE_VM`、`CLONE_FS`、`CLONE_FILES`、`CLONE_SIGHAND`、`CLONE_THREAD`、`CLONE_SYSVSEM`、`CLONE_SETTLS`、`CLONE_PARENT_SETTID`、`CLONE_CHILD_CLEARTID`。
+`CLONE_VM`、`CLONE_FS`、`CLONE_FILES`、`CLONE_SIGHAND`、`CLONE_THREAD`、`CLONE_SYSVSEM`、`CLONE_SETTLS`、`CLONE_PARENT_SETTID`、`CLONE_CHILD_CLEARTID`；`CLONE_DETACHED` 作为兼容性 no-op 掩码，不改变线程生命周期。
 
 - 父线程获得新 tid；子线程从 clone 返回点继续执行，返回值为 0，并使用 `newsp` 和 `tls`。
 - 未支持或组合错误的 flags 返回明确的 `EINVAL` 或 `ENOSYS`。
@@ -50,9 +50,9 @@
 在 Host 契约实现 `futex_wait(addr, expected, timeout)` 和 `futex_wake(addr, count)`。Windows 使用 `WaitOnAddress`、`WakeByAddressSingle`、`WakeByAddressAll`：
 
 - 当前值不等于 expected 返回 `EAGAIN`。
-- 无 timeout 表示无限等待，超时返回 0。
+- 无 timeout 表示无限等待；等待超时返回 `ETIMEDOUT`，不能与正常 wake 返回值混淆。
 - 非法地址、未对齐地址和非法 timespec 返回明确错误。
-- runtime 实现 `FUTEX_WAIT`、`FUTEX_WAKE` 和 private flag；PI、requeue、robust futex 等继续返回 `ENOSYS`。
+- runtime 实现 `FUTEX_WAIT`、`FUTEX_WAKE` 和 private flag；PI、requeue、robust futex 等继续返回 `ENOSYS`。Host API 必须保留 timeout/wake 的区别，让 runtime 映射为 `ETIMEDOUT` 或成功唤醒。
 - LinuxDev/SpadaOS 默认继续返回 `Unimplemented`，guest-side crate 不泄漏 Windows API。
 
 ### 5. guest 与 BusyBox

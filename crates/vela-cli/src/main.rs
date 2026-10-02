@@ -524,7 +524,7 @@ fn release_pending_exec(st: &mut GuestState) {
     }
     if failed != 0 {
         const MAX_EXECVE_DEBT: u64 = 1 << 30;
-        let _ = EXECVE_LEAK.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        let _ = EXECVE_LEAK.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             Some(v.saturating_add(failed).min(MAX_EXECVE_DEBT))
         });
         if logx::enabled() {
