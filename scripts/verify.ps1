@@ -40,8 +40,8 @@ if ($RequireBusybox) {
         if ($LASTEXITCODE -ne 0) { throw "BusyBox find root acceptance failed" }
         cargo run -q -p vela-cli --bin vela -- run --soft-tls --root $busyRoot guest/bin/busybox tar -cf /data/archive.tar /data/input.txt
         if ($LASTEXITCODE -ne 0) { throw "BusyBox tar root acceptance failed" }
-        # BusyBox refuses binary output to a terminal unless -f explicitly forces it.
-        cargo run -q -p vela-cli --bin vela -- run --soft-tls --root $busyRoot guest/bin/busybox gzip -f -c /data/input.txt
+        # Redirect the binary stream inside the guest so gzip does not write to a terminal.
+        cargo run -q -p vela-cli --bin vela -- run --soft-tls --root $busyRoot guest/bin/busybox sh -c 'gzip -c /data/input.txt > /data/input.gz'
         if ($LASTEXITCODE -ne 0) { throw "BusyBox gzip root acceptance failed" }
     } finally {
         Remove-Item -LiteralPath $busyRoot -Recurse -Force -ErrorAction SilentlyContinue
