@@ -1309,9 +1309,17 @@ impl HostProc for WindowsHost {
     }
 
     fn guest_thread_exited(&self) {
-        let _ = self
-            .active_threads
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+        loop {
+            let current = self.active_threads.load(Ordering::Acquire);
+            if current == 0
+                || self
+                    .active_threads
+                    .compare_exchange(current, current - 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                break;
+            }
+        }
     }
 
     fn current_tid(&self) -> u32 {
