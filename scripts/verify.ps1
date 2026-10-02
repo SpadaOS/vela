@@ -31,7 +31,8 @@ if ($RequireBusybox) {
     if ($LASTEXITCODE -ne 0) { exit 1 }
 
     $busyRoot = Join-Path ([System.IO.Path]::GetTempPath()) "vela-busybox-root-$PID"
-    New-Item -ItemType Directory -Force -Path (Join-Path $busyRoot "data") | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $busyRoot "data"), (Join-Path $busyRoot "bin") | Out-Null
+    Copy-Item -LiteralPath "guest/bin/busybox" -Destination (Join-Path $busyRoot "bin/busybox") -Force
     Set-Content -LiteralPath (Join-Path $busyRoot "data/input.txt") -Value "needle`nother`n" -NoNewline
     try {
         cargo run -q -p vela-cli --bin vela -- run --soft-tls --root $busyRoot guest/bin/busybox grep needle /data/input.txt
