@@ -46,6 +46,12 @@ for f in ECHO LS CAT TRUE FALSE NPROC ENV PRINTF \
          FIND TAR GZIP; do
   sed -i "s/^# CONFIG_${f} is not set/CONFIG_${f}=y/" .config
 done
+# TAR's implementation keeps the extraction callback in a feature-gated
+# libarchive object. Enable the small feature set needed by `tar -cf` and by
+# the long-option parser so the selected applet links consistently.
+for f in LONG_OPTS FEATURE_TAR_LONG_OPTIONS FEATURE_TAR_CREATE FEATURE_TAR_TO_COMMAND; do
+  sed -i "s/^# CONFIG_${f} is not set/CONFIG_${f}=y/" .config
+done
 sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
 # 0.1.0 M3：applet 内建解析。guest 无 /bin 文件树（busybox 多调用二进制
 # 无符号链接），宿主 PATH 是 Windows 形态——ash 必须经 applet 表直接
