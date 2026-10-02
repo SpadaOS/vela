@@ -42,7 +42,14 @@ cd "$BB_SRC"
 make -s allnoconfig HOSTCC=gcc
 for f in ECHO LS CAT TRUE FALSE NPROC ENV PRINTF \
          ASH CP MV RM MKDIR RMDIR LN HEAD TAIL WC GREP SLEEP SEQ \
-         XARGS TEST EXPR SORT UNIQ DATE DF DU BASENAME DIRNAME WHOAMI; do
+         XARGS TEST EXPR SORT UNIQ DATE DF DU BASENAME DIRNAME WHOAMI \
+         FIND TAR GZIP; do
+  sed -i "s/^# CONFIG_${f} is not set/CONFIG_${f}=y/" .config
+done
+# TAR's implementation keeps the extraction callback in a feature-gated
+# libarchive object. Enable the small feature set needed by `tar -cf` and by
+# the long-option parser so the selected applet links consistently.
+for f in LONG_OPTS FEATURE_TAR_LONG_OPTIONS FEATURE_TAR_CREATE FEATURE_TAR_TO_COMMAND; do
   sed -i "s/^# CONFIG_${f} is not set/CONFIG_${f}=y/" .config
 done
 sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config

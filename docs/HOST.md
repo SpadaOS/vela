@@ -1,3 +1,5 @@
+0.1.2 Windows 实现了 pthread 形态的 spawn_guest_thread、每线程 soft-TLS 和 futex_wait/futex_wake。Windows 使用原生线程与 WaitOnAddress；LinuxDev 和 SpadaOS 保持 Unimplemented，guest-side crate 不依赖 Windows API。阻塞等待不持有进程共享状态锁；多线程 fork/exec 的边界见 docs/NONGOALS.md。
+
 # HOST 契约（五组 + Trap/Proc，SpadaOS 就绪）
 
 `vela-sys` 是 runtime 与宿主之间的唯一边界（规格 2.4）。0.0.3 起 `Host`
@@ -7,7 +9,7 @@
 
 ```
 Host = HostMem + HostFileOps + HostTime + HostTls
-     + thread_exit / process_exit / thread_create(桩) / futex_wait/futex_wake(桩)
+- Windows 0.1.2 实现 pthread 形态 clone 和基础 futex；阻塞调用不持有进程共享状态锁。多线程 fork/exec、robust futex 和线程信号仍不在范围内。
      + HostTrap + HostProc（0.1.0；默认 Unimplemented）
 ```
 
@@ -22,8 +24,8 @@ runtime 及以上禁止 `#[cfg(target_os)]` 与任何宿主类型；路径在进
 | map | `HostMem` | `map` / `protect` / `unmap`；0.0.4 起 `map_file` / `unmap_view` / `decommit` | 地址空间：匿名映射、W^X 收敛、整块释放；文件映射（Windows 走 `CreateFileMappingW` COW，写不回宿主文件） |
 | file | `HostFileOps` | `open` `open_dir` `mkdir` `remove` `rename` `sync_file` `dup_file` `read` `write` `seek` `stat_path` `stat_file` `close` `stdio` | VFS：文件/目录 CRUD、元数据、句柄复制 |
 | time | `HostTime` | `monotonic_ns` / `realtime` / `random` | 时钟：单调钟/实时钟；熵源 |
-| thread | `HostTls` + `Host::thread_*` | `set_fs_base` / `thread_exit` / `thread_create`(桩) | TLS 寄存器切换、线程生命周期 |
-| futex | `Host::futex_*` | `futex_wait`(桩) / `futex_wake`(桩) | 等待队列 |
+| thread | `HostTls` + `HostProc` | `set_fs_base` / `spawn_guest_thread` / `thread_exit` | Windows 原生线程、每线程 soft-TLS、clear-tid |
+| futex | `Host::futex_*` | `futex_wait` / `futex_wake` | Windows WaitOnAddress/WakeByAddress；LinuxDev/SpadaOS 保持桩 |
 
 ## Trap / Proc 契约（0.1.0 T1.1/T1.2）
 
@@ -70,5 +72,7 @@ section）。其它宿主按表逐方法填实即为接入完成；不要为尚�
 
 - `Host` 增加 `unix_bind` / `anon_shm` 以接外部 X server（第一代 GUI =
   外部 Windows X server + Vela 只提供通路；不要把网络设计死成只能 TCP）
-- `thread_create` / `futex_wait` / `futex_wake`（clone 仅
+- Windows 0.1.2 实现 pthread 形态 clone 和基础 futex；阻塞调用不持有进程共享状态锁。多线程 fork/exec、robust futex 和线程信号仍不在范围内。
   `CLONE_VM|CLONE_FILES|CLONE_SETTLS` 当线程用）
+
+\r\n

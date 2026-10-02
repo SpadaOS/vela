@@ -19,7 +19,7 @@ jobs:
       - name: Format check (PLAN-0.0.3 T3.5)
         run: cargo fmt --check
       - name: Clippy (deny warnings)
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Host gate (PLAN-0.1.0 T1.4 — runtime/loader/fs must not touch host internals)
         shell: pwsh
         run: |
@@ -41,6 +41,9 @@ jobs:
         uses: mlugg/setup-zig@53fc45b17fe98b52f92ee5ea08ff48a85a3e7eb7 # v1
         with:
           version: 0.13.0
+      - name: Build pthread guest
+        shell: pwsh
+        run: zig cc -target x86_64-linux-musl -fPIE -pie -O2 -pthread -o guest/bin/pthread-test guest/src/pthread-test.c
       - name: Setup msys2 (make/gcc/bzip2/diffutils for busybox)
         uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:
@@ -87,5 +90,6 @@ jobs:
           cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/busybox echo hello
           cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/busybox nproc
           cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/busybox true
+          ./scripts/verify.ps1 -RequireBusybox -RequireThreads
       - name: Doctor report (informational)
         run: cargo run -p vela-cli --bin vela -- doctor

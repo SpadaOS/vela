@@ -15,9 +15,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use vela_loader as loader;
-use vela_runtime::{GuestProcess, InterpImage};
+use vela_runtime::{write_guest, GuestProcess, InterpImage};
 #[cfg(windows)]
-use vela_sys::{HostMem, HostProc, HostTrap, TrapFrame};
+use vela_sys::{GuestThreadContext, HostMem, HostProc, HostTid, HostTrap, TrapFrame};
 
 #[cfg(target_os = "linux")]
 use vela_sys::linux_dev::LinuxDevHost;
@@ -61,6 +61,10 @@ struct GuestState {
 }
 
 static GUEST: AtomicPtr<GuestState> = AtomicPtr::new(std::ptr::null_mut());
+static NEXT_GUEST_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+/// Serialize non-blocking trap work across native guest threads. Waiters do
+/// not hold this guard, so futex/poll/pipe operations can make progress.
+static TRAP_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Ctrl+C 清理回调（T5.3）：终止全部存活客户子进程（控制台进程组近似）。
 fn on_console_ctrl() {
@@ -74,6 +78,75 @@ fn on_console_ctrl() {
 /// execve 地址空间债（T4.5）：Reserve 块解除登记但不释放的累计字节。
 /// 本进程内可观测（-v 日志）；进程退出由 OS 回收。
 static EXECVE_LEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Start a Linux pthread-shaped clone.  The native host thread resumes at the
+/// instruction after the intercepted syscall with `rax == 0`, preserving the
+/// guest stack and TLS arguments supplied by musl.
+#[cfg(windows)]
+fn do_thread_clone(st: &mut GuestState, args: &[u64; 6], frame: &TrapFrame) -> Result<u32, i64> {
+    let flags = args[0];
+    let required = vela_abi::CLONE_VM
+        | vela_abi::CLONE_FS
+        | vela_abi::CLONE_FILES
+        | vela_abi::CLONE_SIGHAND
+        | vela_abi::CLONE_THREAD
+        | vela_abi::CLONE_SYSVSEM;
+    if flags & !vela_abi::CLONE_THREAD_FLAGS != 0 || flags & required != required {
+        return Err(-(vela_abi::EINVAL as i64));
+    }
+    let newsp = if args[1] == 0 {
+        frame.regs.rsp
+    } else {
+        args[1]
+    };
+    if newsp < 8 || !st.proc.mem.contains(newsp - 8, 8) {
+        return Err(-(vela_abi::EFAULT as i64));
+    }
+    for (ptr, enabled) in [
+        (args[2], flags & vela_abi::CLONE_PARENT_SETTID != 0),
+        (args[3], flags & vela_abi::CLONE_CHILD_CLEARTID != 0),
+    ] {
+        if enabled && (ptr == 0 || !st.proc.mem.contains(ptr, 4)) {
+            return Err(-(vela_abi::EFAULT as i64));
+        }
+    }
+    let tid = NEXT_GUEST_TID.fetch_add(1, Ordering::Relaxed);
+    let tid = if tid == 0 {
+        NEXT_GUEST_TID.fetch_add(1, Ordering::Relaxed)
+    } else {
+        tid
+    };
+    if flags & vela_abi::CLONE_PARENT_SETTID != 0 {
+        write_guest(&st.proc, args[2], &tid.to_le_bytes()).map_err(|e| -(e as i64))?;
+    }
+    let mut regs = *frame.regs;
+    regs.rip = frame.regs.rip + 2;
+    regs.rcx = regs.rip;
+    regs.rax = 0;
+    regs.rsp = newsp;
+    regs.r11 = frame.e_flags;
+    st.host
+        .spawn_guest_thread(GuestThreadContext {
+            tid: HostTid(tid as u64),
+            entry: regs.rip,
+            stack: newsp,
+            tls: args[4],
+            clear_tid: if flags & vela_abi::CLONE_CHILD_CLEARTID != 0 {
+                args[3]
+            } else {
+                0
+            },
+            regs,
+        })
+        .map_err(|e| -(vela_runtime::host_err_to_errno(&e) as i64))?;
+    if logx::enabled() {
+        eprintln!(
+            "[vela] clone -> tid {tid}, stack {newsp:#x}, tls {:#x}",
+            args[4]
+        );
+    }
+    Ok(tid)
+}
 
 fn main() {
     logx::init();
@@ -524,7 +597,7 @@ fn release_pending_exec(st: &mut GuestState) {
     }
     if failed != 0 {
         const MAX_EXECVE_DEBT: u64 = 1 << 30;
-        let _ = EXECVE_LEAK.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        let _ = EXECVE_LEAK.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             Some(v.saturating_add(failed).min(MAX_EXECVE_DEBT))
         });
         if logx::enabled() {
@@ -580,6 +653,10 @@ fn cmd_doctor() -> i32 {
     #[cfg(windows)]
     {
         let host = WindowsHost::new();
+        println!("  thread backend: Windows native threads (CLONE_THREAD baseline)");
+        println!("  futex backend : WaitOnAddress/WakeByAddress");
+        println!("  TLS mode      : hardware FS when available; per-thread soft-TLS fallback");
+        println!("  active tids   : {}", host.active_guest_threads());
         let (islands, veh) = host.island_veh_counts();
         println!(
             "  trap counts  : island sites={islands}, VEH sites={veh}, registered ranges={}",
@@ -599,7 +676,16 @@ fn cmd_doctor() -> i32 {
 
     // guest 产物
     let manifest = env!("CARGO_MANIFEST_DIR");
-    for g in ["hello", "hello-musl", "torture", "tls", "file-io", "bench"] {
+    for g in [
+        "hello",
+        "hello-musl",
+        "torture",
+        "tls",
+        "file-io",
+        "bench",
+        "pthread-test",
+        "busybox",
+    ] {
         let p = std::path::Path::new(manifest).join(format!("../../guest/bin/{g}"));
         let mark = if p.exists() {
             "ok"
@@ -795,6 +881,8 @@ fn run_elf(
     let island_ranges = build_islands_for(&host, &img, opts.trap);
 
     let mut proc = GuestProcess::new(host.current_pid(), img);
+    proc.tid = host.current_tid();
+    NEXT_GUEST_TID.store(proc.tid.saturating_add(1), Ordering::Relaxed);
     proc.attach_stdio(&host);
     proc.fs = fs;
     if opts.root.is_some() {
@@ -874,6 +962,7 @@ fn run_elf(
         let ptr = Box::into_raw(state);
         GUEST.store(ptr, Ordering::Relaxed);
         let st = unsafe { &*ptr };
+        vela_sys::windows::prepare_veh_scratch();
         // Ctrl+C（T5.3）：控制台事件先杀客户子进程树，再走默认终止。
         // 诚实边界：控制台进程组近似，非 SIGINT handler 语义。
         vela_sys::windows::set_console_ctrl_callback(on_console_ctrl);
@@ -920,14 +1009,25 @@ unsafe extern "system" fn trap(nr: u64, args: &[u64; 6], frame: &mut TrapFrame) 
     if p.is_null() {
         return -(vela_abi::ENOSYS as i64);
     }
+    let _trap_guard = (!matches!(
+        nr,
+        vela_abi::SYS_FUTEX
+            | vela_abi::SYS_POLL
+            | vela_abi::SYS_SELECT
+            | vela_abi::SYS_READ
+            | vela_abi::SYS_WRITE
+            | vela_abi::SYS_EXIT
+    ))
+    .then(|| {
+        TRAP_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    });
     // SAFETY: GUEST 在进入客户前设置一次；陷阱回调与客户代码同线程
     let st = unsafe { &mut *p };
     release_pending_exec(st);
     let rip = frame.regs.rip;
     // soft-tls：同步客户 TLS 基址到模拟器（arch_prctl 记录后即生效）
-    if st.proc.fs_base != 0 {
-        st.host.set_soft_tls_base(st.proc.fs_base);
-    }
     if logx::enabled() {
         if st.host.soft_tls_stub_hit() {
             eprintln!("[vela] stub HIT ✓");
@@ -948,30 +1048,43 @@ unsafe extern "system" fn trap(nr: u64, args: &[u64; 6], frame: &mut TrapFrame) 
         );
     }
     let r = if nr == vela_abi::SYS_EXECVE {
-        // execve（PLAN-0.0.4 T3.1）：进程内重载，属控制流操作，由 CLI 层
-        // 编排（loader/栈构建在此 crate）；成功路径直接改写上下文返回。
-        match do_execve(st, args) {
-            Ok((entry, rsp)) => {
-                frame.regs.rax = 0;
-                frame.regs.rip = entry;
-                frame.regs.rsp = rsp;
-                if logx::enabled() {
-                    eprintln!("[vela] execve → reloaded, entry {entry:#x} rsp {rsp:#x}");
+        if st.host.current_tid() != st.proc.tid {
+            -(vela_abi::ENOSYS as i64)
+        } else {
+            // execve（PLAN-0.0.4 T3.1）：进程内重载，属控制流操作，由 CLI 层
+            // 编排（loader/栈构建在此 crate）；成功路径直接改写上下文返回。
+            match do_execve(st, args) {
+                Ok((entry, rsp)) => {
+                    frame.regs.rax = 0;
+                    frame.regs.rip = entry;
+                    frame.regs.rsp = rsp;
+                    if logx::enabled() {
+                        eprintln!("[vela] execve → reloaded, entry {entry:#x} rsp {rsp:#x}");
+                    }
+                    return 0;
                 }
-                return 0;
-            }
-            Err(e) => {
-                // T3.1：fork 子进程内 execve 失败必须可诊断（ash 管道现场）
-                if logx::enabled() {
-                    eprintln!("[vela] execve failed: {e}");
+                Err(e) => {
+                    // T3.1：fork 子进程内 execve 失败必须可诊断（ash 管道现场）
+                    if logx::enabled() {
+                        eprintln!("[vela] execve failed: {e}");
+                    }
+                    e
                 }
-                e
             }
         }
     } else if nr == vela_abi::SYS_FORK
         || nr == vela_abi::SYS_VFORK
-        || (nr == vela_abi::SYS_CLONE && args[0] == fork::SIGCHLD_FLAGS)
+        || (nr == vela_abi::SYS_CLONE
+            && args[0] == fork::SIGCHLD_FLAGS
+            && st.host.active_guest_threads() == 1)
     {
+        if st.host.active_guest_threads() > 1 {
+            frame.regs.rax = -(vela_abi::EAGAIN as i64) as u64;
+            frame.regs.rcx = rip + 2;
+            frame.regs.r11 = frame.e_flags;
+            frame.regs.rip = rip + 2;
+            return 0;
+        }
         // fork（0.0.6 M1）：musl x86_64 fork() 走 SYS_FORK(57)；线程类
         // clone（CLONE_VM 等 flags）维持拒绝（单线程契约，NONGOALS）。
         match fork::do_fork(st, args, frame) {
@@ -989,14 +1102,16 @@ unsafe extern "system" fn trap(nr: u64, args: &[u64; 6], frame: &mut TrapFrame) 
             Err(e) => e,
         }
     } else if nr == vela_abi::SYS_CLONE {
-        // 线程类 clone（CLONE_VM 等 flags）：诚实拒绝（单线程契约，NONGOALS）
-        if logx::enabled() {
-            eprintln!(
-                "[vela] clone(flags={:#x}) → ENOSYS (threads unsupported, NONGOALS)",
-                args[0]
-            );
+        match do_thread_clone(st, args, frame) {
+            Ok(tid) => {
+                frame.regs.rax = tid as u64;
+                frame.regs.rcx = rip + 2;
+                frame.regs.r11 = frame.e_flags;
+                frame.regs.rip = rip + 2;
+                return 0;
+            }
+            Err(e) => e,
         }
-        -(vela_abi::ENOSYS as i64)
     } else if nr == vela_abi::SYS_WAIT4 {
         // wait4（0.0.6 M2）：真实等待子进程句柄（CLI 层持有 children 表）
         fork::do_wait4(st, args)
@@ -1008,9 +1123,6 @@ unsafe extern "system" fn trap(nr: u64, args: &[u64; 6], frame: &mut TrapFrame) 
     };
     // SET_FS updates proc.fs_base during this dispatch. Publish it before the
     // guest resumes so soft-tls can handle the next fs-prefixed instruction.
-    if st.proc.fs_base != 0 {
-        st.host.set_soft_tls_base(st.proc.fs_base);
-    }
     if logx::enabled() {
         eprintln!(
             "[vela] {} = {r} ({:#x})",

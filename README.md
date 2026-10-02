@@ -211,7 +211,7 @@ Vela 当沙箱用。杀毒软件可能对"进程内改可执行内存再执行"�
 
 ## 路线
 
-- **v0.1.1（当前）**：Windows 一等运行时——路径隔离、checked arithmetic、poll/select、岛页 syscall 热路径、陷阱走
+- **v0.1.2（开发中）**：Windows 运行时加入 pthread clone、每线程 soft-TLS、futex wait/wake 与 `pthread-test`；BusyBox 验收扩展到 grep/find/tar/gzip。多线程 fork/exec、socket、完整信号投递仍不在范围内。
   宿主栈、fork 不可变段共享 + mprotect 账本、busybox `sh -c` 闭环
   （CI 硬门禁）、utimensat、SIGCHLD 记账、Host Trap/Proc 契约收口、
   doctor 2.0、Ctrl+C 进程树、SECURITY.md。唯一可运行宿主：Windows
@@ -224,3 +224,5 @@ Vela 当沙箱用。杀毒软件可能对"进程内改可执行内存再执行"�
 ## 许可
 
 Apache-2.0（兼容层许可与 SpadaOS 内核许可分离，见 [LICENSE](LICENSE)）。
+
+\r\n

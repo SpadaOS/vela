@@ -1,4 +1,4 @@
-# Vela syscall 兼容矩阵（0.1.1）
+# Vela syscall 兼容矩阵（0.1.2 开发中）
 
 > 状态约定（效仿 Gramine 的诚实标注）：
 > - ✅ 完整翻译
@@ -65,7 +65,9 @@
 | 158 | arch_prctl | 🟨 | SET_FS 依赖 FSGSBASE；不支持时仅记录（`--soft-tls` 下 fs 访问由 VEH 软件模拟，见 DESIGN.md） |
 | 160/161 | getrlimit/setrlimit | ⭕ | RLIM_INFINITY（与 prlimit64 一致） |
 | 217 | getdents64 | ✅ | 快照式目录遍历（打开后不感知变化）；`..` 逃逸防护 |
-| 218 | set_tid_address | ✅ | 单线程假 pid |
+| 186 | gettid | ✅ | 当前 guest 线程 tid；`getpid` 仍返回进程 pid |
+| 202 | futex | ✅ | `FUTEX_WAIT`/`FUTEX_WAKE`、private flag；超时返回 `ETIMEDOUT` |
+| 218 | set_tid_address | ✅ | 每线程 clear-tid 地址；线程退出时清零并唤醒 joiner |
 | 228 | clock_gettime | ✅ | REALTIME / MONOTONIC |
 | 231 | exit_group | ✅ | |
 | 257 | openat | 🟨 | dirfd 支持目录 fd 相对路径（`..` 拒绝）；O_EXCL/O_TRUNC/O_APPEND/O_CLOEXEC |
@@ -78,7 +80,7 @@
 | 292 | dup3 | ✅ | 仅接受 O_CLOEXEC flag |
 | 293 | pipe2 | ✅ | **宿主匿名管道**（0.0.6 下沉）：真实阻塞读写、64 KiB 缓冲、fd 可跨 fork 继承；O_NONBLOCK 无效果（Linux 子集）；fstat = S_IFIFO\|0600 |
 | 22 | pipe | ✅ | ≡ pipe2(flags=0)（musl pipe() 降级路径） |
-| 56/57/58 | clone/fork/vfork | 🟨 | **用户态 fork**（0.0.6，0.1.0 减重）：仅接受 fork 语义（SIGCHLD / vfork / fork 号）——快照客户地址空间（区间级 inheritable section）+ CONTEXT 传递，子进程 MapViewOfFileEx 回原地址后从 fork 返回点继续；父返回子 pid、子返回 0。0.1.0 起：不可变区域（映像 X/R 段 + 解释器段 + 岛页）section 跨 fork 共享（kind-3），可变区域按 fork 拷贝；mprotect 运行时历史经账本（T3.2）在子进程重放，PROT_NONE 洞（mallocng donate）由拷贝侧跳过。⚠ 线程类 clone（CLONE_VM 等）诚实拒绝（单线程契约）；⚠ 性能非目标（-v 打印 copied/immutable KiB） |
+| 56/57/58 | clone/fork/vfork | 🟨 | fork 使用用户态快照协议；线程类 clone 支持 pthread 所需 flags，`CLONE_DETACHED` 为兼容性 no-op。多线程 fork 返回 `EAGAIN`，worker exec 返回 `ENOSYS`。 |
 | 280 | utimensat | 🟨 | **0.1.0 新增**：文件时间戳设置（AT_FDCWD 相对 / 绝对路径）；`SetFileTime` 落地。⚠ ctime 无 Windows 对应（不触碰）；`UTIME_NOW` 取当前时钟 |
 | 62 | kill | 🟨 | 最小集（0.0.6）：SIGKILL/SIGTERM → TerminateProcess(128+sig)、sig 0 → 探测；其余信号 → ENOSYS（信号**投递**仍 NONGOALS，客户 handler 永不触发） |
 | 109/121/111 | setpgid/getpgid/getpgrp | 🟨 | 诚实近似（0.0.6）：pgid=sid=pid（单进程无会话）；setpgid 校验后返回 0 |
@@ -99,7 +101,7 @@
 
 ## 已知不做（NONGOALS，见 docs/NONGOALS.md）
 
-socket/epoll、clone/futex/线程、信号投递（rt_sigaction 等仅记账，handler
+ socket/epoll、完整信号投递（rt_sigaction 等仅记账，handler
 永不触发）、MAP_SHARED 文件映射、glibc 动态链接（非 musl interp 诚实拒绝）、
 32 位 / 其他架构、Go 运行时。
 

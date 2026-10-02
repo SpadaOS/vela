@@ -18,6 +18,8 @@ pub const SYS_EXECVE: u64 = 59;
 pub const SYS_WAIT4: u64 = 61;
 pub const SYS_KILL: u64 = 62;
 pub const SYS_CLONE: u64 = 56;
+pub const SYS_GETTID: u64 = 186;
+pub const SYS_FUTEX: u64 = 202;
 pub const SYS_FORK: u64 = 57;
 pub const SYS_VFORK: u64 = 58;
 pub const SYS_GETPPID: u64 = 110;
@@ -109,6 +111,8 @@ pub fn syscall_name(nr: u64) -> &'static str {
         SYS_WAIT4 => "wait4",
         SYS_KILL => "kill",
         SYS_CLONE => "clone",
+        SYS_GETTID => "gettid",
+        SYS_FUTEX => "futex",
         SYS_FORK => "fork",
         SYS_VFORK => "vfork",
         SYS_GETPPID => "getppid",

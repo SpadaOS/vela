@@ -15,8 +15,9 @@ SIGCHLD 记账落地——从本清单移除或收窄；本清单是 "v0 承诺�
   与 sig 0 探测；SIGCHLD 仅记账（wait4 完成后置位，不投递 handler）
 - Ctrl+C 是控制台进程组近似（杀客户子进程树后默认终止），不是
   SIGINT handler 语义
-- **线程**：clone 仅接受 fork 语义（SIGCHLD），CLONE_VM 等线程 flags
-  诚实拒绝（单线程契约）
+- **线程进程边界**：0.1.2 支持 pthread 线程 flags、futex 和 per-thread TLS；
+  多线程进程调用 fork 返回 `EAGAIN`，worker 调用 execve 返回 `ENOSYS`。
+  robust futex、线程取消、线程信号和完整 pthread 进程语义仍未实现。
 - fork 的快照语义边界：不可变区 section 共享 + 可变区整块拷贝（无脏页
   跟踪）、mprotect 运行时历史按账本重放、HostDir 游标重置、孤儿无 init
   收养（wait4 诚实 -ECHILD）

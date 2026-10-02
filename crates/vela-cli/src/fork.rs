@@ -545,12 +545,16 @@ fn ser_fds(st: &GuestState) -> Result<Vec<FdEntrySer>, i64> {
                 HostFileKind::StdErr => FdSer::StdErr,
                 _ => continue, // 未知宿主形态：不继承（诚实缺失）
             },
-            GuestFd::PipeRead(f) => FdSer::PipeRead {
-                handle: f.raw_handle().ok_or(eio)?,
-            },
-            GuestFd::PipeWrite(f) => FdSer::PipeWrite {
-                handle: f.raw_handle().ok_or(eio)?,
-            },
+            GuestFd::PipeRead(f) => {
+                let handle = f.raw_handle().ok_or(eio)?;
+                st.host.set_inherit(handle).map_err(|_| eio)?;
+                FdSer::PipeRead { handle }
+            }
+            GuestFd::PipeWrite(f) => {
+                let handle = f.raw_handle().ok_or(eio)?;
+                st.host.set_inherit(handle).map_err(|_| eio)?;
+                FdSer::PipeWrite { handle }
+            }
             GuestFd::HostDir(d) => FdSer::HostDir {
                 path: d.host_path().to_string_lossy().into_owned(),
                 entries: d
@@ -993,6 +997,11 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
 
         // 4. 组装 GuestProcess（pid = 真实 Windows pid；ppid 来自父）
         let mut proc = GuestProcess::new(host.current_pid(), load);
+        proc.tid = host.current_tid();
+        crate::NEXT_GUEST_TID.store(
+            proc.tid.saturating_add(1),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         proc.ppid = meta.ppid;
         proc.uid = meta.uid;
         proc.gid = meta.gid;
@@ -1111,6 +1120,11 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
         let ptr = Box::into_raw(state);
         crate::GUEST.store(ptr, std::sync::atomic::Ordering::Relaxed);
         let st = unsafe { &*ptr };
+        // The fork child is a fresh native process, so the per-thread VEH
+        // scratch allocated by the parent is not present in its TLS slot.
+        // Allocate it before resuming guest code; otherwise the first UD2
+        // trap would dereference a null scratch pointer.
+        vela_sys::windows::prepare_veh_scratch();
         let mut exec_ranges = st.proc.load.exec_ranges.clone();
         if let Some(i) = &st.proc.load.interp {
             exec_ranges.extend(i.exec_ranges.iter().copied());
