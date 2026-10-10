@@ -741,7 +741,7 @@ fn host_stat_to_linux(hs: &HostStat, uid: u32, gid: u32) -> abi::Stat {
 
 pub(super) fn sys_close(proc: &mut GuestProcess, host: &dyn Host, fd_raw: u64) -> i64 {
     let fd = fd_raw as u32 as i32;
-    match proc.fds.remove(fd) {
+    match proc.fds.remove_with_watch_cleanup(fd) {
         None => -(abi::EBADF as i64),
         Some(GuestFd::Host(f)) | Some(GuestFd::PipeRead(f)) | Some(GuestFd::PipeWrite(f)) => {
             match host.close(f) {
@@ -1269,7 +1269,7 @@ pub(super) fn sys_dup2(
         return newfd as i64; // dup2：等价 no-op
     }
     // 先移除目标（触发 host close）
-    if let Some(entry) = proc.fds.remove(newfd) {
+    if let Some(entry) = proc.fds.remove_with_watch_cleanup(newfd) {
         close_fd_entry(host, entry);
     }
     dup_impl(
@@ -1302,6 +1302,7 @@ fn dup_impl(
     at: Option<i32>,
     cloexec: bool,
 ) -> i64 {
+    let inherited_flags = proc.fds.clone_flags_for_dup(oldfd);
     let new_entry = match proc.fds.get(oldfd) {
         Some(GuestFd::Host(f)) | Some(GuestFd::PipeRead(f)) | Some(GuestFd::PipeWrite(f)) => {
             match host.dup_file(f) {
@@ -1322,9 +1323,14 @@ fn dup_impl(
     let fd = match at {
         Some(n) => {
             proc.fds.insert_at(n, new_entry);
+            proc.fds.set_flags(n, inherited_flags);
             n
         }
-        None => proc.fds.alloc_fd(new_entry),
+        None => {
+            let n = proc.fds.alloc_fd(new_entry);
+            proc.fds.set_flags(n, inherited_flags);
+            n
+        }
     };
     if cloexec {
         proc.fds.update_flags(fd, |v| v | 1);

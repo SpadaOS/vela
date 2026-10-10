@@ -249,7 +249,7 @@ pub(super) fn sys_recvfrom(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]
         };
         let copy = cap.min(addr.len());
         let _ = write_guest(proc, a[4], &addr[..copy]);
-        let _ = write_guest(proc, a[5], &(copy as u32).to_le_bytes());
+        let _ = write_guest(proc, a[5], &(addr.len() as u32).to_le_bytes());
     }
     n as i64
 }
@@ -270,7 +270,7 @@ pub(super) fn sys_sendmsg(
     if count > 1024 {
         return -(abi::EINVAL as i64);
     }
-    let mut total = 0i64;
+    let mut payload = Vec::new();
     for i in 0..count {
         let ent_addr = match iov.checked_add(i.saturating_mul(16)) {
             Some(v) => v,
@@ -289,16 +289,16 @@ pub(super) fn sys_sendmsg(
             Ok(d) => d,
             Err(e) => return -(e as i64),
         };
-        let n = sys_sendto(proc, host, [fd, base, len, flags, 0, 0]);
-        if n < 0 {
-            return n;
-        }
-        total += n;
-        if n < data.len() as i64 {
-            break;
-        }
+        payload.extend_from_slice(data);
     }
-    total
+    let socket = match sock(proc, fd as i32) {
+        Ok(socket) => socket,
+        Err(e) => return e,
+    };
+    match host.socket_send(socket, &payload, flags as u32) {
+        Ok(n) => n as i64,
+        Err(e) => socket_err(proc, e),
+    }
 }
 pub(super) fn sys_recvmsg(
     proc: &mut GuestProcess,
@@ -316,7 +316,8 @@ pub(super) fn sys_recvmsg(
     if count > 1024 {
         return -(abi::EINVAL as i64);
     }
-    let mut total = 0i64;
+    let mut buffers = Vec::new();
+    let mut total_len = 0usize;
     for i in 0..count {
         let ent_addr = match iov.checked_add(i.saturating_mul(16)) {
             Some(v) => v,
@@ -331,16 +332,33 @@ pub(super) fn sys_recvmsg(
         if len > usize::MAX as u64 {
             return -(abi::E2BIG as i64);
         }
-        let n = sys_recvfrom(proc, host, [fd, base, len, flags, 0, 0]);
-        if n < 0 {
-            return if total == 0 { n } else { total };
-        }
-        total += n;
-        if n < len as i64 {
+        buffers.push((base, len as usize));
+        total_len = match total_len.checked_add(len as usize) {
+            Some(total) => total,
+            None => return -(abi::E2BIG as i64),
+        };
+    }
+    let socket = match sock(proc, fd as i32) {
+        Ok(socket) => socket,
+        Err(e) => return e,
+    };
+    let mut payload = vec![0u8; total_len];
+    let received = match host.socket_recv(socket, &mut payload, flags as u32) {
+        Ok(n) => n,
+        Err(e) => return host_err(e),
+    };
+    let mut copied = 0usize;
+    for (base, len) in buffers {
+        if copied >= received {
             break;
         }
+        let n = len.min(received - copied);
+        if let Err(e) = write_guest(proc, base, &payload[copied..copied + n]) {
+            return -(e as i64);
+        }
+        copied += n;
     }
-    total
+    received as i64
 }
 
 pub(super) fn sys_sockname(
@@ -367,7 +385,7 @@ pub(super) fn sys_sockname(
     if let Err(e) = write_guest(proc, out, &addr[..n]) {
         return -(e as i64);
     }
-    if let Err(e) = write_guest(proc, lenp, &(n as u32).to_le_bytes()) {
+    if let Err(e) = write_guest(proc, lenp, &(addr.len() as u32).to_le_bytes()) {
         return -(e as i64);
     }
     0
@@ -421,8 +439,13 @@ pub(super) fn sys_epoll_create1(proc: &mut GuestProcess, flags: u64) -> i64 {
     if flags & !abi::O_CLOEXEC != 0 {
         return -(abi::EINVAL as i64);
     }
-    proc.fds
-        .alloc_fd(GuestFd::Epoll(Arc::new(Mutex::new(EpollState::default())))) as i64
+    let fd = proc
+        .fds
+        .alloc_fd(GuestFd::Epoll(Arc::new(Mutex::new(EpollState::default()))));
+    if flags & abi::O_CLOEXEC != 0 {
+        proc.fds.set_flags(fd, 1);
+    }
+    fd as i64
 }
 pub(super) fn sys_epoll_ctl(
     proc: &mut GuestProcess,

@@ -28,6 +28,7 @@ pub(super) fn sys_rt_sigaction(
         let mut b = [0u8; 32];
         b[0..8].copy_from_slice(&d.handler.to_le_bytes());
         b[8..16].copy_from_slice(&d.flags.to_le_bytes());
+        b[16..24].copy_from_slice(&d.restorer.to_le_bytes());
         b[24..32].copy_from_slice(&d.mask.to_le_bytes());
         if let Err(e) = write_guest(proc, old, &b) {
             return -(e as i64);
@@ -41,6 +42,7 @@ pub(super) fn sys_rt_sigaction(
         proc.signals.dispositions[idx] = crate::SignalDisposition {
             handler: u64::from_le_bytes(b[0..8].try_into().unwrap()),
             flags: u64::from_le_bytes(b[8..16].try_into().unwrap()),
+            restorer: u64::from_le_bytes(b[16..24].try_into().unwrap()),
             mask: u64::from_le_bytes(b[24..32].try_into().unwrap()),
         };
     }
@@ -78,7 +80,46 @@ pub(super) fn sys_rt_sigprocmask(
     0
 }
 
-pub(super) fn sys_sigreturn(_proc: &mut GuestProcess) -> i64 {
+pub(super) fn sys_sigreturn(proc: &mut GuestProcess) -> i64 {
+    match proc.signal_frames.pop() {
+        Some(frame) => {
+            proc.signals.blocked = frame.blocked;
+            proc.signal_restore = Some(frame);
+            0
+        }
+        None => -(abi::EINVAL as i64),
+    }
+}
+
+pub(super) fn sys_sigaltstack(proc: &mut GuestProcess, new_ptr: u64, old_ptr: u64) -> i64 {
+    const SS_DISABLE: i32 = 2;
+    if old_ptr != 0 {
+        let (sp, size, flags) = proc.alt_stack.unwrap_or((0, 0, SS_DISABLE));
+        let mut raw = [0u8; 24];
+        raw[0..8].copy_from_slice(&sp.to_le_bytes());
+        raw[8..12].copy_from_slice(&flags.to_le_bytes());
+        raw[16..24].copy_from_slice(&size.to_le_bytes());
+        if let Err(e) = write_guest(proc, old_ptr, &raw) {
+            return -(e as i64);
+        }
+    }
+    if new_ptr != 0 {
+        let raw = match read_guest(proc, new_ptr, 24) {
+            Ok(raw) => raw,
+            Err(e) => return -(e as i64),
+        };
+        let sp = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+        let flags = i32::from_le_bytes(raw[8..12].try_into().unwrap());
+        let size = u64::from_le_bytes(raw[16..24].try_into().unwrap());
+        if flags & !SS_DISABLE != 0 || (flags & SS_DISABLE == 0 && (sp == 0 || size < 2048)) {
+            return -(abi::EINVAL as i64);
+        }
+        proc.alt_stack = if flags & SS_DISABLE != 0 {
+            None
+        } else {
+            Some((sp, size, 0))
+        };
+    }
     0
 }
 
@@ -89,7 +130,7 @@ pub(super) fn sys_kill(proc: &mut GuestProcess, pid: u64, sig: u64) -> i64 {
     if sig >= abi::NSIG as u64 {
         return -(abi::EINVAL as i64);
     }
-    if sig != 0 && sig != abi::SIGKILL as u64 {
+    if sig != 0 {
         proc.signals.pending |= 1u64 << (sig - 1);
     }
     0

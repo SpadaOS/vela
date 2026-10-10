@@ -39,7 +39,7 @@ cd "$BB_SRC"
 
 # 最小配置：allnoconfig（全部关闭）→ 白名单 applet + 静态。
 # 0.0.6 M4 扩容：ash（job control/历史全关，MMU fork 路径）+ coreutils。
-make -s allnoconfig HOSTCC=gcc
+make -s allnoconfig HOSTCC=gcc </dev/null >/dev/null 2>&1
 for f in ECHO LS CAT TRUE FALSE NPROC ENV PRINTF \
          ASH CP MV RM MKDIR RMDIR LN HEAD TAIL WC GREP SLEEP SEQ \
          XARGS TEST EXPR SORT UNIQ DATE DF DU BASENAME DIRNAME WHOAMI \
@@ -63,12 +63,12 @@ sed -i 's/^# CONFIG_FEATURE_SH_STANDALONE is not set/CONFIG_FEATURE_SH_STANDALON
 sed -i 's|^CONFIG_BUSYBOX_EXEC_PATH=.*|CONFIG_BUSYBOX_EXEC_PATH="/bin/busybox"|' .config
 grep -q 'CONFIG_BUSYBOX_EXEC_PATH="/bin/busybox"' .config || echo 'CONFIG_BUSYBOX_EXEC_PATH="/bin/busybox"' >> .config
 # 固化 config（非交互应答全部默认）
-yes "" | make oldconfig HOSTCC=gcc >/dev/null 2>&1 || true
+make oldconfig HOSTCC=gcc </dev/null >/dev/null 2>&1
 
 # 显式强制生成 include/autoconf.h（CI 主 make 会跳过生成规则，本地不复现）
 rm -f include/autoconf.h
 rm -rf include/config
-make silentoldconfig HOSTCC=gcc
+make silentoldconfig HOSTCC=gcc </dev/null >/dev/null 2>&1
 test -f include/autoconf.h || { echo "FATAL: include/autoconf.h not generated"; exit 1; }
 
 # zig 0.13 Windows 下 -Wp,-MD,<depfile> 会瞬间 FileNotFound（zig 的 dep-file

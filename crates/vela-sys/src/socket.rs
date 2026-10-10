@@ -9,6 +9,7 @@ use std::net::{
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::HostError;
+use socket2::{Domain, Protocol, Socket, Type};
 
 #[derive(Debug)]
 pub(crate) struct PairBus {
@@ -139,8 +140,29 @@ impl HostSocket {
         let socket_addr = parse_sockaddr(addr, domain)?;
         match kind {
             crate::SOCK_STREAM => {
+                if nonblock {
+                    let domain = if socket_addr.is_ipv4() {
+                        Domain::IPV4
+                    } else {
+                        Domain::IPV6
+                    };
+                    let socket =
+                        Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(map_io)?;
+                    socket.set_nonblocking(true).map_err(map_io)?;
+                    let result = socket.connect(&socket_addr.into());
+                    let stream: TcpStream = socket.into();
+                    stream.set_nonblocking(true).map_err(map_io)?;
+                    stream.set_nodelay(nodelay).ok();
+                    *state = SocketState::Stream { stream, nonblock };
+                    if let Err(e) = result {
+                        if e.kind() != std::io::ErrorKind::WouldBlock {
+                            return Err(map_io(e));
+                        }
+                        return Err(HostError::Other(crate::EINPROGRESS));
+                    }
+                    return Ok(());
+                }
                 let stream = TcpStream::connect(socket_addr).map_err(map_io)?;
-                stream.set_nonblocking(nonblock).map_err(map_io)?;
                 stream.set_nodelay(nodelay).ok();
                 *state = SocketState::Stream { stream, nonblock };
             }
@@ -210,10 +232,7 @@ impl HostSocket {
         let mut state = self.0.lock().map_err(|_| HostError::Invalid)?;
         match &mut *state {
             SocketState::Datagram { socket, .. } => socket
-                .send_to(
-                    data,
-                    parse_sockaddr(addr, crate::AF_INET).map_err(|_| HostError::Invalid)?,
-                )
+                .send_to(data, parse_sockaddr_from_bytes(addr)?)
                 .map_err(map_io),
             SocketState::Unbound {
                 domain,
@@ -649,6 +668,14 @@ fn parse_sockaddr(bytes: &[u8], domain: u16) -> Result<SocketAddr, HostError> {
         }
         _ => Err(HostError::Unimplemented),
     }
+}
+
+fn parse_sockaddr_from_bytes(bytes: &[u8]) -> Result<SocketAddr, HostError> {
+    if bytes.len() < 2 {
+        return Err(HostError::Invalid);
+    }
+    let family = u16::from_ne_bytes([bytes[0], bytes[1]]);
+    parse_sockaddr(bytes, family)
 }
 
 fn sockaddr_bytes(addr: SocketAddr) -> Vec<u8> {

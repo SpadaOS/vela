@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use vela_abi as abi;
-use vela_sys::{Host, HostDir, HostError, HostFile, HostProt};
+use vela_sys::{GuestRegs, Host, HostDir, HostError, HostFile, HostProt};
 
 use crate::mem::MemRegistry;
 
@@ -59,6 +59,7 @@ pub struct EpollState {
 pub struct SignalDisposition {
     pub handler: u64,
     pub flags: u64,
+    pub restorer: u64,
     pub mask: u64,
 }
 
@@ -69,6 +70,17 @@ pub struct SignalState {
     pub pending: u64,
 }
 
+/// A software signal frame saved at a trap safe point.  The host trap layer
+/// owns the live register reference; the runtime keeps the previous snapshot
+/// so `rt_sigreturn` can hand it back without depending on a Windows CONTEXT.
+#[derive(Clone, Copy, Debug)]
+pub struct SignalFrame {
+    pub regs: GuestRegs,
+    pub e_flags: u64,
+    pub blocked: u64,
+    pub rsp: u64,
+}
+
 impl Default for SignalState {
     fn default() -> Self {
         Self {
@@ -76,6 +88,17 @@ impl Default for SignalState {
             blocked: 0,
             pending: 0,
         }
+    }
+}
+
+impl SignalState {
+    pub fn reset_for_exec(&mut self) {
+        for disposition in &mut self.dispositions {
+            if disposition.handler != abi::SIG_IGN {
+                *disposition = SignalDisposition::default();
+            }
+        }
+        self.pending = 0;
     }
 }
 
@@ -135,7 +158,21 @@ impl FdTable {
 
     /// 强制占用指定 fd（dup2 语义）；已存在条目由调用方先 remove。
     pub fn insert_at(&mut self, fd: i32, entry: GuestFd) {
+        self.flags.remove(&fd);
         self.table.insert(fd, entry);
+    }
+
+    /// Close an fd and invalidate epoll watches that refer to its number.
+    pub fn remove_with_watch_cleanup(&mut self, fd: i32) -> Option<GuestFd> {
+        let removed = self.remove(fd);
+        for entry in self.table.values() {
+            if let GuestFd::Epoll(state) = entry {
+                if let Ok(mut state) = state.lock() {
+                    state.watches.remove(&fd);
+                }
+            }
+        }
+        removed
     }
 
     /// 记账 fd 标志（open 时记录客户传入 flags 的编码）。
@@ -145,6 +182,10 @@ impl FdTable {
 
     pub fn get_flags(&self, fd: i32) -> Option<u32> {
         self.flags.get(&fd).copied()
+    }
+
+    pub fn clone_flags_for_dup(&self, oldfd: i32) -> u32 {
+        self.flags.get(&oldfd).copied().unwrap_or(0) & !1
     }
 
     /// 更新 flags（F_SETFL/F_SETFD）；未记账的 fd 以 0 起始。
@@ -323,6 +364,9 @@ pub struct GuestProcess {
     /// mprotect 运行时账本（T3.2；按应用顺序追加，fork 元数据传递）。
     pub prot_ledger: Vec<ProtOverride>,
     pub signals: SignalState,
+    pub signal_frames: Vec<SignalFrame>,
+    pub signal_restore: Option<SignalFrame>,
+    pub alt_stack: Option<(u64, u64, i32)>,
 }
 
 impl GuestProcess {
@@ -353,6 +397,9 @@ impl GuestProcess {
             fs: vela_fs::FsMap::legacy(),
             prot_ledger: Vec::new(),
             signals: SignalState::default(),
+            signal_frames: Vec::new(),
+            signal_restore: None,
+            alt_stack: None,
         }
     }
 
@@ -470,5 +517,47 @@ pub fn host_err_to_errno(e: &HostError) -> i32 {
         HostError::TimedOut => abi::ETIMEDOUT,
         HostError::Unimplemented => abi::ENOSYS,
         HostError::Other(c) => *c,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fd_dup_flags_drop_cloexec_but_keep_status_flags() {
+        let mut fds = FdTable::empty();
+        let fd = fds.alloc_fd(GuestFd::Null);
+        fds.set_flags(fd, 1 | ((abi::O_NONBLOCK as u32) << 8));
+        assert_eq!(fds.clone_flags_for_dup(fd), (abi::O_NONBLOCK as u32) << 8);
+    }
+
+    #[test]
+    fn closing_fd_removes_epoll_watch() {
+        let mut fds = FdTable::empty();
+        let watched = fds.alloc_fd(GuestFd::Null);
+        let state = std::sync::Arc::new(std::sync::Mutex::new(EpollState::default()));
+        state.lock().unwrap().watches.insert(
+            watched,
+            EpollWatch {
+                events: abi::EPOLLIN,
+                data: 7,
+            },
+        );
+        let _epfd = fds.alloc_fd(GuestFd::Epoll(state.clone()));
+        assert!(fds.remove_with_watch_cleanup(watched).is_some());
+        assert!(state.lock().unwrap().watches.is_empty());
+    }
+
+    #[test]
+    fn exec_signal_reset_preserves_ignored_handlers() {
+        let mut state = SignalState::default();
+        state.dispositions[0].handler = abi::SIG_IGN;
+        state.dispositions[1].handler = 0x1234;
+        state.pending = 1 << 1;
+        state.reset_for_exec();
+        assert_eq!(state.dispositions[0].handler, abi::SIG_IGN);
+        assert_eq!(state.dispositions[1].handler, abi::SIG_DFL);
+        assert_eq!(state.pending, 0);
     }
 }

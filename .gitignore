@@ -17,4 +17,7 @@ musl-1.2.5/
 # busybox 构建树与本地诊断产物（CI 生成，不入库）
 .busybox-src/
 guest/bin/busybox
+guest/bin/signal-test
+guest/bin/socket-test
+/release/
 sh-trace*.log
