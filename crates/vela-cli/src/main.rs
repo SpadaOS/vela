@@ -662,6 +662,9 @@ fn cmd_doctor() -> i32 {
             "  trap counts  : island sites={islands}, VEH sites={veh}, registered ranges={}",
             vela_sys::windows::guest_exec_range_count()
         );
+        println!("  socket backend: Winsock/std net (TCP, UDP, AF_UNIX socketpair)");
+        println!("  signal backend: trap safe-point delivery (basic dispositions/pending)");
+        println!("  epoll         : level-triggered, max 1024 watches");
     }
 
     // fork / 地址空间债（0.1.0 T5.2；doctor 是独立进程，只报机制与观测方法）
@@ -684,6 +687,8 @@ fn cmd_doctor() -> i32 {
         "file-io",
         "bench",
         "pthread-test",
+        "signal-test",
+        "socket-test",
         "busybox",
     ] {
         let p = std::path::Path::new(manifest).join(format!("../../guest/bin/{g}"));
@@ -1117,7 +1122,14 @@ unsafe extern "system" fn trap(nr: u64, args: &[u64; 6], frame: &mut TrapFrame) 
         fork::do_wait4(st, args)
     } else if nr == vela_abi::SYS_KILL {
         // kill（0.0.6 M3）：SIGKILL/SIGTERM 终止 + sig 0 探测
-        fork::do_kill(st, args[0], args[1])
+        if args[0] as u32 == st.proc.pid
+            && args[1] != vela_abi::SIGKILL as u64
+            && args[1] != vela_abi::SIGTERM as u64
+        {
+            vela_runtime::dispatch(&mut st.proc, &st.host, nr, *args)
+        } else {
+            fork::do_kill(st, args[0], args[1])
+        }
     } else {
         vela_runtime::dispatch(&mut st.proc, &st.host, nr, *args)
     };
@@ -1131,6 +1143,30 @@ unsafe extern "system" fn trap(nr: u64, args: &[u64; 6], frame: &mut TrapFrame) 
         );
     }
     // 模拟硬件 syscall 固定副作用：Rax=返回值、Rcx=返回地址、R11=RFLAGS、Rip+=2
+    if r == 0 {
+        let pending = st.proc.signals.pending & !st.proc.signals.blocked;
+        if pending != 0 {
+            let sig = pending.trailing_zeros() as u64 + 1;
+            let disposition = st.proc.signals.dispositions[sig as usize - 1];
+            st.proc.signals.pending &= !(1u64 << (sig - 1));
+            if disposition.handler > vela_abi::SIG_IGN {
+                if let Some(new_rsp) = frame.regs.rsp.checked_sub(8) {
+                    if st.proc.mem.contains(new_rsp, 8)
+                        && vela_runtime::write_guest(&st.proc, new_rsp, &(rip + 2).to_le_bytes())
+                            .is_ok()
+                    {
+                        frame.regs.rsp = new_rsp;
+                        frame.regs.rip = disposition.handler;
+                        frame.regs.rdi = sig;
+                        frame.regs.rax = 0;
+                        frame.regs.rcx = rip + 2;
+                        frame.regs.r11 = frame.e_flags;
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
     frame.regs.rax = r as u64;
     frame.regs.rcx = rip + 2;
     frame.regs.r11 = frame.e_flags;

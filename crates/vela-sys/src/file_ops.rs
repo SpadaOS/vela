@@ -132,6 +132,7 @@ pub(crate) fn dup_file(f: &HostFile) -> Result<HostFile, HostError> {
         }
         // 管道端：真实句柄必须 DuplicateHandle（裸 clone 会 double-close）
         HostFileKind::Pipe(e) => Ok(HostFile(HostFileKind::Pipe(e.dup()?))),
+        HostFileKind::Socket(s) => Ok(HostFile(HostFileKind::Socket(s.clone()))),
         _ => Ok(HostFile(f.0.clone_kind())),
     }
 }
@@ -142,6 +143,7 @@ pub(crate) fn read(f: &HostFile, buf: &mut [u8]) -> Result<usize, HostError> {
         HostFileKind::StdIn => std::io::stdin().read(buf).map_err(|e| io_err(&e)),
         HostFileKind::Disk { file, .. } => (&file.0).read(buf).map_err(|e| io_err(&e)),
         HostFileKind::Pipe(e) => e.read(buf),
+        HostFileKind::Socket(_) => Err(HostError::Invalid),
         _ => Err(HostError::Access),
     }
 }
@@ -162,6 +164,7 @@ pub(crate) fn write(f: &HostFile, buf: &[u8]) -> Result<usize, HostError> {
             .map(|_| buf.len())
             .map_err(|e| io_err(&e)),
         HostFileKind::Pipe(e) => e.write(buf),
+        HostFileKind::Socket(_) => Err(HostError::Invalid),
         HostFileKind::StdIn => Err(HostError::Access),
     }
 }
@@ -240,6 +243,9 @@ pub(crate) fn poll(fds: &mut [HostPollFd<'_>], timeout_ms: i32) -> Result<usize,
                         }
                     }
                 }
+                HostFileKind::Socket(socket) => {
+                    revents |= socket.poll_ready(fd.events);
+                }
             }
             fd.revents = revents;
             if revents != 0 {
@@ -283,6 +289,18 @@ pub(crate) fn stat_file(f: &HostFile) -> Result<HostStat, HostError> {
             Ok(HostStat::char_device())
         }
         HostFileKind::Pipe(_) => Ok(fifo_stat()),
+        HostFileKind::Socket(_) => Ok(HostStat {
+            size: 0,
+            is_dir: false,
+            is_readonly: false,
+            mtime_ns: 0,
+            mode: 0o140777,
+            nlink: 1,
+            ino: 1,
+            dev: 1,
+            atime_ns: 0,
+            ctime_ns: 0,
+        }),
         HostFileKind::Disk { file, path } => {
             let md = file.0.metadata().map_err(|e| io_err(&e))?;
             Ok(host_stat_from(&md, Some(path)))
@@ -444,6 +462,10 @@ pub(crate) fn close(f: HostFile) -> Result<(), HostError> {
         HostFileKind::Disk { .. } => Ok(()), // Drop 关闭
         // 管道端：真实句柄 CloseHandle；内存端标记半关（对端看到 EOF/EPIPE）
         HostFileKind::Pipe(e) => e.close_half(),
+        HostFileKind::Socket(s) => {
+            s.close();
+            Ok(())
+        }
     }
 }
 

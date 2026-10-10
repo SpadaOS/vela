@@ -1,4 +1,4 @@
-# Vela syscall 兼容矩阵（0.1.2 开发中）
+# Vela syscall compatibility matrix (0.1.3 development)
 
 > 状态约定（效仿 Gramine 的诚实标注）：
 > - ✅ 完整翻译
@@ -25,7 +25,7 @@
 | 10 | mprotect | ✅ | 文件视图区间剥离 WRITE（VirtualProtect RW 会关闭 COW 穿透宿主文件） |
 | 11 | munmap | 🟨 | 仅释放完全覆盖的整块（Windows 限制）；FileView 走 UnmapViewOfFile |
 | 12 | brk | ✅ | 预映射堆块内移动 |
-| 13 | rt_sigaction | ⭕ | 记录后返回 0；信号**投递**未实现（NONGOALS） |
+| 13/14/15 | rt_sigaction/rt_sigprocmask/rt_sigreturn | 🟨 | 常用 disposition、block mask 和 pending 状态；异步 frame/realtime signal 受限 |
 | 14 | rt_sigprocmask | ⭕ | 同上 |
 | 17 | pread64 | ✅ | seek→io→seek-back（单线程契约） |
 | 18 | pwrite64 | ✅ | 同上 |
@@ -122,3 +122,4 @@
 - `vela doctor`：FSGSBASE、映射约定、trap 后端、fork 快照/地址空间债说明、guest 产物状态
 - `VELA_LOG=1` / `-v`：strace 风格逐 syscall 日志（含 rip，stderr）；
   fork 打印 `copied/immutable KiB`；execve 打印 reserve debt（T4.5/T4.6）
+> 0.1.3: `select`, `pselect6`, and `ppoll` share the socket-aware poll backend and validate temporary signal masks; the 1024-descriptor limit remains.

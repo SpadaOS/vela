@@ -264,7 +264,13 @@
 - TLS trampoline（wrfsbase，需 FSGSBASE）
 - guest：hello（汇编）/ torture / tls / hello-musl
 - Windows 主宿主完整实现；linux_dev 逻辑测试壳；SpadaOS 空壳
-\r\n## [0.1.2] - unreleased
+## [0.1.2] - released
 
 - Thread and concurrency runtime development: pthread-shaped `clone`, per-thread TLS, futex wait/wake, and Windows native guest-thread launch.
 - Added the `pthread-test` guest acceptance asset.
+
+## [0.1.3] - development
+
+- Added Windows Winsock-backed TCP/UDP sockets, local socketpair, socket-aware poll/select, and level-triggered epoll with a 1024 descriptor cap.
+- Added signal disposition, mask, pending-signal, kill/tgkill, sigreturn, and alternate-stack ABI/runtime state.
+- Added socket/signal ABI layouts and documented the remaining realtime-signal, SCM_RIGHTS, MAP_SHARED, glibc, and non-Windows limits.

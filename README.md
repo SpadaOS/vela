@@ -101,8 +101,8 @@ v0.1.1 实测（CI 在 Windows runner 上自动验收全部 ✅ 项）：
 | mmap | ✅ | 匿名 + 文件映射（COW，写不回宿主文件）；SHARED 诚实 ENOSYS |
 | TLS | ✅ | FSGSBASE 硬件路径，缺失时 `--soft-tls` 软件模拟 |
 | 时间 / 熵 / 进程身份 | ✅ | clock/getrandom/uname/auxv/utimensat |
-| 信号投递 | ❌ | rt_sigaction/procmask 记账；kill SIGKILL/SIGTERM；SIGCHLD 仅记账；Ctrl+C 杀子进程树（控制台近似） |
-| socket / epoll / GUI | ❌ | 返回 `-ENOSYS`，libc 有降级路径 |
+| 信号投递 | 🟨 | 常用 rt_sigaction/procmask、kill/tgkill、pending 和 trap 安全点 handler；realtime/完整异步 frame 仍受限 |
+| **socket / epoll** | ✅ | Windows Winsock TCP/UDP、AF_UNIX socketpair、poll/select readiness 与 level-triggered epoll |
 | Go 程序 / 32 位 / ARM / 非 Windows 宿主 | ❌ | 见 [docs/NONGOALS.md](docs/NONGOALS.md) |
 
 未实现的 syscall 一律返回 Linux 风格 `-ENOSYS`——行为可预期，而不是崩溃。
@@ -211,7 +211,7 @@ Vela 当沙箱用。杀毒软件可能对"进程内改可执行内存再执行"�
 
 ## 路线
 
-- **v0.1.2（开发中）**：Windows 运行时加入 pthread clone、每线程 soft-TLS、futex wait/wake 与 `pthread-test`；BusyBox 验收扩展到 grep/find/tar/gzip。多线程 fork/exec、socket、完整信号投递仍不在范围内。
+- **v0.1.3（开发中）**：Windows 运行时加入 socket/UDP/TCP/socketpair/epoll 与常用 signal ABI/pending 状态，保留 pthread、futex、fork/exec、poll/select 和 BusyBox grep/find/tar/gzip 验收；完整异步信号、MAP_SHARED、glibc、SCM_RIGHTS 和非 Windows host 仍不在范围内。
   宿主栈、fork 不可变段共享 + mprotect 账本、busybox `sh -c` 闭环
   （CI 硬门禁）、utimensat、SIGCHLD 记账、Host Trap/Proc 契约收口、
   doctor 2.0、Ctrl+C 进程树、SECURITY.md。唯一可运行宿主：Windows

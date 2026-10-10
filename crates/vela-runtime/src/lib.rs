@@ -33,6 +33,7 @@ pub enum GuestFd {
     PipeWrite(HostFile),
     Null,
     Zero,
+    Epoll(std::sync::Arc<std::sync::Mutex<EpollState>>),
     Reserved,
 }
 
@@ -40,6 +41,41 @@ impl GuestFd {
     /// 是否持有宿主资源（close 时需要动作）。
     pub fn is_pipe(&self) -> bool {
         matches!(self, GuestFd::PipeRead(_) | GuestFd::PipeWrite(_))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EpollWatch {
+    pub events: u32,
+    pub data: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct EpollState {
+    pub watches: BTreeMap<i32, EpollWatch>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SignalDisposition {
+    pub handler: u64,
+    pub flags: u64,
+    pub mask: u64,
+}
+
+#[derive(Debug)]
+pub struct SignalState {
+    pub dispositions: [SignalDisposition; 64],
+    pub blocked: u64,
+    pub pending: u64,
+}
+
+impl Default for SignalState {
+    fn default() -> Self {
+        Self {
+            dispositions: [SignalDisposition::default(); 64],
+            blocked: 0,
+            pending: 0,
+        }
     }
 }
 
@@ -286,6 +322,7 @@ pub struct GuestProcess {
     pub fs: vela_fs::FsMap,
     /// mprotect 运行时账本（T3.2；按应用顺序追加，fork 元数据传递）。
     pub prot_ledger: Vec<ProtOverride>,
+    pub signals: SignalState,
 }
 
 impl GuestProcess {
@@ -315,6 +352,7 @@ impl GuestProcess {
             cwd: "/mnt/c".to_string(),
             fs: vela_fs::FsMap::legacy(),
             prot_ledger: Vec::new(),
+            signals: SignalState::default(),
         }
     }
 

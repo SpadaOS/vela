@@ -8,6 +8,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: windows-latest
@@ -44,6 +47,11 @@ jobs:
       - name: Build pthread guest
         shell: pwsh
         run: zig cc -target x86_64-linux-musl -fPIE -pie -O2 -pthread -o guest/bin/pthread-test guest/src/pthread-test.c
+      - name: Build signal and socket guests
+        shell: pwsh
+        run: |
+          zig cc -target x86_64-linux-musl -fPIE -pie -O2 -o guest/bin/signal-test guest/src/signal-test.c
+          zig cc -target x86_64-linux-musl -fPIE -pie -O2 -o guest/bin/socket-test guest/src/socket-test.c
       - name: Setup msys2 (make/gcc/bzip2/diffutils for busybox)
         uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:
@@ -90,6 +98,6 @@ jobs:
           cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/busybox echo hello
           cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/busybox nproc
           cargo run -p vela-cli --bin vela -- run --soft-tls guest/bin/busybox true
-          ./scripts/verify.ps1 -RequireBusybox -RequireThreads
+          ./scripts/verify.ps1 -RequireBusybox -RequireThreads -RequireSignals -RequireNetwork
       - name: Doctor report (informational)
         run: cargo run -p vela-cli --bin vela -- doctor

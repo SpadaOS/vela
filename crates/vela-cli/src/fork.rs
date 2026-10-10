@@ -565,6 +565,7 @@ fn ser_fds(st: &GuestState) -> Result<Vec<FdEntrySer>, i64> {
             },
             GuestFd::Null => FdSer::Null,
             GuestFd::Zero => FdSer::Zero,
+            GuestFd::Epoll(_) => continue,
             GuestFd::Reserved => continue,
         };
         let flags = st.proc.fds.get_flags(fd).unwrap_or(0);

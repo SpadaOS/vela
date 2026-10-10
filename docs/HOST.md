@@ -1,4 +1,4 @@
-0.1.2 Windows 实现了 pthread 形态的 spawn_guest_thread、每线程 soft-TLS 和 futex_wait/futex_wake。Windows 使用原生线程与 WaitOnAddress；LinuxDev 和 SpadaOS 保持 Unimplemented，guest-side crate 不依赖 Windows API。阻塞等待不持有进程共享状态锁；多线程 fork/exec 的边界见 docs/NONGOALS.md。
+0.1.3 Windows 使用标准库 Winsock-backed socket contract 提供 TCP/UDP、AF_UNIX socketpair 和 socket-aware poll/epoll；同时保留 0.1.2 的 pthread、soft-TLS 与 WaitOnAddress futex。LinuxDev 和 SpadaOS 对 socket/epoll 继续返回 Unimplemented，guest-side crate 不依赖 Windows API。阻塞等待不持有进程共享状态锁；多线程 fork/exec 的边界见 docs/NONGOALS.md。
 
 # HOST 契约（五组 + Trap/Proc，SpadaOS 就绪）
 
@@ -9,7 +9,7 @@
 
 ```
 Host = HostMem + HostFileOps + HostTime + HostTls
-- Windows 0.1.2 实现 pthread 形态 clone 和基础 futex；阻塞调用不持有进程共享状态锁。多线程 fork/exec、robust futex 和线程信号仍不在范围内。
+- Windows 0.1.3 保留 pthread 形态 clone、基础 futex，并增加 socket/epoll Host contract；阻塞调用不持有进程共享状态锁。多线程 fork/exec、robust futex 和完整异步信号仍不在范围内。
      + HostTrap + HostProc（0.1.0；默认 Unimplemented）
 ```
 

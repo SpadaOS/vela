@@ -43,7 +43,7 @@ make -s allnoconfig HOSTCC=gcc
 for f in ECHO LS CAT TRUE FALSE NPROC ENV PRINTF \
          ASH CP MV RM MKDIR RMDIR LN HEAD TAIL WC GREP SLEEP SEQ \
          XARGS TEST EXPR SORT UNIQ DATE DF DU BASENAME DIRNAME WHOAMI \
-         FIND TAR GZIP; do
+         FIND TAR GZIP WGET NC; do
   sed -i "s/^# CONFIG_${f} is not set/CONFIG_${f}=y/" .config
 done
 # TAR's implementation keeps the extraction callback in a feature-gated

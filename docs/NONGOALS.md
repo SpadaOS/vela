@@ -10,9 +10,7 @@ SIGCHLD 记账落地——从本清单移除或收窄；本清单是 "v0 承诺�
   不为它设计 map 语义、不写假时钟/假文件）
 - GUI / X11 / Wayland / PulseAudio
 - glibc 动态链接（仅 `ld-musl*` 解释器在白名单内；glibc 诚实拒绝）
-- **信号投递**：rt_sigaction/rt_sigprocmask 记账后放行，但信号不会真的
-  送达，客户注册的 handler 永不触发；kill 仅 SIGKILL/SIGTERM（进程终止）
-  与 sig 0 探测；SIGCHLD 仅记账（wait4 完成后置位，不投递 handler）
+- **信号投递**：0.1.3 支持常用 disposition、per-thread mask、pending、kill/tgkill 和 sigreturn ABI；handler 在 syscall trap 安全点投递。完整异步 frame、realtime queue、signalfd、job-control 和 SIGCHLD handler 仍未实现。
 - Ctrl+C 是控制台进程组近似（杀客户子进程树后默认终止），不是
   SIGINT handler 语义
 - **线程进程边界**：0.1.2 支持 pthread 线程 flags、futex 和 per-thread TLS；
@@ -24,7 +22,7 @@ SIGCHLD 记账落地——从本清单移除或收窄；本清单是 "v0 承诺�
 - MAP_SHARED 文件映射（共享匿名仅服务 fork 快照；`mmap` SHARED 诚实
   ENOSYS）
 - Go 程序（运行时自己发 `syscall`，且可能 JIT）
-- socket / epoll / inotify / ptrace / mount / cgroup / namespace
+- socket/epoll 仅覆盖 Windows TCP/UDP、AF_UNIX socketpair、poll/select 和 level-triggered epoll；SCM_RIGHTS、io_uring、inotify、ptrace、mount、cgroup、namespace 仍未实现。
 - 32 位、x32、i386、ARM、RISC-V
 - 完整 `/proc` 或假 Linux 发行版（readlink 恒 -ENOENT 是诚实行为而非缺陷）
 - 指令模拟器 / 完整用户态 CPU emulator（可作未来后门，v0 禁止当主路径）
