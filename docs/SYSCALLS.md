@@ -1,4 +1,4 @@
-# Vela syscall compatibility matrix (0.1.3 development)
+# Vela syscall compatibility matrix (0.1.3 released)
 
 > 状态约定（效仿 Gramine 的诚实标注）：
 > - ✅ 完整翻译
@@ -19,22 +19,30 @@
 | 4 | stat | ✅ | ino 为路径哈希（同进程稳定，stat/getdents 一致） |
 | 5 | fstat | ✅ | 目录 fd / FIFO（S_IFIFO）支持 |
 | 6 | lstat | 🟨 | ≡ stat（无 symlink 语义） |
-| 7 | poll | ✅ | 普通文件立即就绪；标准流与 Vela pipe 支持 IN/OUT/ERR/HUP/NVAL；nfds ≤ 1024，超时遵循 -1/0/正数 |
+| 7 | poll | ✅ | 普通文件立即就绪；标准流、Vela pipe 与 socket 共用 readiness backend；支持 IN/OUT/ERR/HUP/NVAL；nfds ≤ 1024，超时遵循 -1/0/正数 |
 | 8 | lseek | ✅ | 目录 fd 返回 ESPIPE |
 | 9 | mmap | 🟨 | MAP_PRIVATE 匿名 + **文件映射**（fd 背书，COW 语义）；MAP_FIXED 落在已登记 Reserve 内就地覆盖（musl donate 模式）；MAP_SHARED = ENOSYS。文件视图条件：offset/hint 64K 对齐，否则退化为匿名映射 + 读入（EOF 后零填充）。⚠ 旧 Reserve 块内的"就地覆盖"保留原页内容（Linux 为匿名零页）——musl 仅对未写入的 brk 尾页这样做 |
 | 10 | mprotect | ✅ | 文件视图区间剥离 WRITE（VirtualProtect RW 会关闭 COW 穿透宿主文件） |
 | 11 | munmap | 🟨 | 仅释放完全覆盖的整块（Windows 限制）；FileView 走 UnmapViewOfFile |
 | 12 | brk | ✅ | 预映射堆块内移动 |
-| 13/14/15 | rt_sigaction/rt_sigprocmask/rt_sigreturn | 🟨 | 常用 disposition、block mask 和 pending 状态；异步 frame/realtime signal 受限 |
-| 14 | rt_sigprocmask | ⭕ | 同上 |
+| 13/14/15 | rt_sigaction/rt_sigprocmask/rt_sigreturn | 🟨 | 常用 disposition、block mask、pending、trap 安全点 handler 与保存现场恢复；完整异步 frame/realtime signal 受限 |
 | 17 | pread64 | ✅ | seek→io→seek-back（单线程契约） |
 | 18 | pwrite64 | ✅ | 同上 |
 | 21 | access | 🟨 | W_OK 按宿主只读位；X_OK 语义简化 |
-| 23 | select | ✅ | fd_set 转换到 poll；nfds ≤ 1024；ppoll/pselect6 返回 ENOSYS |
+| 23 | select | ✅ | fd_set 转换到 socket-aware poll；nfds ≤ 1024 |
+| 270/271 | pselect6/ppoll | 🟨 | 共用 poll backend，校验超时与 8-byte 临时 signal mask，并恢复原 mask；不提供完整异步信号中断语义 |
 | 26 | msync | ⭕ | 参数校验后恒成功（MAP_PRIVATE 无回写语义） |
 | 28 | madvise | ⭕ | no-op |
 | 32 | dup | ✅ | 管道端复制共享缓冲 |
 | 33 | dup2 | ✅ | |
+| 41 | socket | 🟨 | Windows IPv4/IPv6 TCP/UDP；支持 NONBLOCK/CLOEXEC 标志；非 Windows Host 未实现 |
+| 42/49/50 | connect/bind/listen | 🟨 | Winsock-backed TCP/UDP 子集；不提供完整 AF_UNIX 路径 socket |
+| 43/288 | accept/accept4 | 🟨 | TCP 接入及 NONBLOCK/CLOEXEC 标志；当前入口不写回 peer sockaddr |
+| 44/45 | sendto/recvfrom | 🟨 | TCP/UDP 数据收发；按 Linux sockaddr 转换地址 |
+| 46/47 | sendmsg/recvmsg | 🟨 | 普通 iovec 数据；不支持 SCM_RIGHTS 等 ancillary data |
+| 48/51/52 | shutdown/getsockname/getpeername | 🟨 | Windows socket contract 子集 |
+| 53 | socketpair | 🟨 | AF_UNIX/SOCK_STREAM 的本地双向后端；不是完整 Unix-domain socket 实现 |
+| 54/55 | setsockopt/getsockopt | 🟨 | 常用 socket option 子集；不支持的选项返回错误 |
 | 59 | execve | 🟨 | **进程内重载**（CLI 层编排）：新映像装载成功后释放旧 Reserve/FileView/Island，重建堆/栈/auxv；CLOEXEC fd 关闭，其余 fd 跨重载保留。释放失败才计入有上限的诊断债务。失败路径返回 -errno，原映像继续 |
 | 61 | wait4 | ✅ | **真实等待**（0.0.6）：WaitForSingleObject 阻塞 / WNOHANG 轮询；status 按 Linux 编码（退出码 <128 = WIFEXITED，≥128 = WIFSIGNALED）；孤儿无 init 收养 → -ECHILD；rusage 填零 |
 | 74 | fsync | ✅ | stdio/伪设备 no-op |
@@ -82,7 +90,12 @@
 | 22 | pipe | ✅ | ≡ pipe2(flags=0)（musl pipe() 降级路径） |
 | 56/57/58 | clone/fork/vfork | 🟨 | fork 使用用户态快照协议；线程类 clone 支持 pthread 所需 flags，`CLONE_DETACHED` 为兼容性 no-op。多线程 fork 返回 `EAGAIN`，worker exec 返回 `ENOSYS`。 |
 | 280 | utimensat | 🟨 | **0.1.0 新增**：文件时间戳设置（AT_FDCWD 相对 / 绝对路径）；`SetFileTime` 落地。⚠ ctime 无 Windows 对应（不触碰）；`UTIME_NOW` 取当前时钟 |
-| 62 | kill | 🟨 | 最小集（0.0.6）：SIGKILL/SIGTERM → TerminateProcess(128+sig)、sig 0 → 探测；其余信号 → ENOSYS（信号**投递**仍 NONGOALS，客户 handler 永不触发） |
+| 62 | kill | 🟨 | 本进程 signal 进入 pending，handler 在 trap 安全点投递；外部 Windows 进程保留 SIGKILL/SIGTERM/signal 0 近似路径 |
+| 200/234 | tkill/tgkill | 🟨 | 当前 guest 的 pending signal 路径；跨线程定向语义受限，tgkill 校验当前 pid/tid |
+| 131 | sigaltstack | 🟨 | 校验并记录 alternate-stack 配置；handler 尚不切换到该栈 |
+| 219 | restart_syscall | ⭕ | 返回 EINTR；不实现完整 syscall restart 协议 |
+| 232/233/291 | epoll_wait/epoll_ctl/epoll_create1 | 🟨 | level-triggered readiness，每实例最多 1024 个关注 fd；EPOLLET/EPOLLONESHOT 返回 EINVAL |
+| 281 | epoll_pwait | 🟨 | epoll_wait 加临时 signal mask 状态；完整异步等待中断仍受限 |
 | 109/121/111 | setpgid/getpgid/getpgrp | 🟨 | 诚实近似（0.0.6）：pgid=sid=pid（单进程无会话）；setpgid 校验后返回 0 |
 | 112/124 | setsid/getsid | 🟨 | 同上：返回 pid |
 | 302 | prlimit64 | ⭕ | 上报 RLIM_INFINITY（无资源限制语义） |
@@ -101,9 +114,9 @@
 
 ## 已知不做（NONGOALS，见 docs/NONGOALS.md）
 
- socket/epoll、完整信号投递（rt_sigaction 等仅记账，handler
-永不触发）、MAP_SHARED 文件映射、glibc 动态链接（非 musl interp 诚实拒绝）、
-32 位 / 其他架构、Go 运行时。
+完整异步信号、realtime queue、signalfd、job control、SIGCHLD handler、
+完整 Unix-domain socket、SCM_RIGHTS、EPOLLET/EPOLLONESHOT、MAP_SHARED、
+glibc 动态链接（非 musl interp 诚实拒绝）、32 位 / 其他架构、Go 运行时与非 Windows Host。
 
 ## 陷阱与热路径（0.1.0）
 
@@ -122,4 +135,3 @@
 - `vela doctor`：FSGSBASE、映射约定、trap 后端、fork 快照/地址空间债说明、guest 产物状态
 - `VELA_LOG=1` / `-v`：strace 风格逐 syscall 日志（含 rip，stderr）；
   fork 打印 `copied/immutable KiB`；execve 打印 reserve debt（T4.5/T4.6）
-> 0.1.3: `select`, `pselect6`, and `ppoll` share the socket-aware poll backend and validate temporary signal masks; the 1024-descriptor limit remains.
