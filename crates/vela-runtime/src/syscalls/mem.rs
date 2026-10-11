@@ -117,7 +117,8 @@ pub(super) fn sys_mmap_file(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6
         | Some(GuestFd::Null)
         | Some(GuestFd::Zero)
         | Some(GuestFd::PipeRead(_))
-        | Some(GuestFd::PipeWrite(_)) => return -(abi::ENODEV as i64),
+        | Some(GuestFd::PipeWrite(_))
+        | Some(GuestFd::Epoll(_)) => return -(abi::ENODEV as i64),
         None | Some(GuestFd::Reserved) => return -(abi::EBADF as i64),
     };
     let Some(len_up) = page_align(len) else {

@@ -128,6 +128,7 @@ impl HostFileOps for MockHost {
             HostFileKind::StdOut => HostFile(HostFileKind::StdOut),
             HostFileKind::StdErr => HostFile(HostFileKind::StdErr),
             HostFileKind::Pipe(e) => HostFile(HostFileKind::Pipe(e.dup()?)),
+            HostFileKind::Socket(s) => HostFile(HostFileKind::Socket(s.clone())),
             HostFileKind::Disk { .. } => return Err(HostError::Unimplemented),
         })
     }
@@ -1325,7 +1326,12 @@ fn honest_stubs_and_errors() {
     let lim = unsafe { std::ptr::read_unaligned((addr + 0x180) as *const u64) };
     assert_eq!(lim, abi::RLIM_INFINITY);
     // socket 体系明确 ENOSYS
-    let r = dispatch(&mut proc, &host, abi::SYS_SOCKET, [0, 0, 0, 0, 0, 0]);
+    let r = dispatch(
+        &mut proc,
+        &host,
+        abi::SYS_SOCKET,
+        [abi::AF_INET as u64, abi::SOCK_STREAM as u64, 0, 0, 0, 0],
+    );
     assert_eq!(r, -(abi::ENOSYS as i64));
 }
 

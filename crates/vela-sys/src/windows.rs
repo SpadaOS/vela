@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use crate::file_ops;
 use crate::{
     GuestRegs, GuestThreadContext, Host, HostDir, HostError, HostFile, HostFileKind, HostFileOps,
-    HostMem, HostOpen, HostPath, HostPollFd, HostProc, HostProt, HostStat, HostTid, HostTime,
-    HostTls, HostTrap, PipeEnd, StdioHandles, TrapFn, TrapFrame,
+    HostMem, HostOpen, HostPath, HostPollFd, HostProc, HostProt, HostSocket, HostStat, HostTid,
+    HostTime, HostTls, HostTrap, PipeEnd, StdioHandles, TrapFn, TrapFrame,
 };
 
 // ---------------------------------------------------------------- Win32 FFI
@@ -1124,6 +1124,90 @@ impl HostFileOps for WindowsHost {
     }
     fn create_pipe(&self) -> Result<(HostFile, HostFile), HostError> {
         file_ops::create_pipe()
+    }
+    fn socket(&self, domain: u16, kind: u32, _protocol: u32) -> Result<HostSocket, HostError> {
+        Ok(HostSocket::new(
+            domain,
+            kind & crate::SOCK_TYPE_MASK,
+            kind & crate::SOCK_NONBLOCK != 0,
+        ))
+    }
+    fn socketpair(
+        &self,
+        domain: u16,
+        kind: u32,
+        _protocol: u32,
+    ) -> Result<(HostSocket, HostSocket), HostError> {
+        if domain != crate::AF_UNIX || kind & crate::SOCK_TYPE_MASK != crate::SOCK_STREAM {
+            return Err(HostError::Unimplemented);
+        }
+        Ok(HostSocket::pair())
+    }
+    fn socket_bind(&self, socket: &HostSocket, addr: &[u8]) -> Result<(), HostError> {
+        socket.bind(addr)
+    }
+    fn socket_listen(&self, socket: &HostSocket, backlog: i32) -> Result<(), HostError> {
+        socket.listen(backlog)
+    }
+    fn socket_accept(&self, socket: &HostSocket) -> Result<HostSocket, HostError> {
+        socket.accept()
+    }
+    fn socket_connect(&self, socket: &HostSocket, addr: &[u8]) -> Result<(), HostError> {
+        socket.connect(addr)
+    }
+    fn socket_send(&self, socket: &HostSocket, buf: &[u8], flags: u32) -> Result<usize, HostError> {
+        socket.send(buf, flags)
+    }
+    fn socket_sendto(
+        &self,
+        socket: &HostSocket,
+        buf: &[u8],
+        addr: &[u8],
+        flags: u32,
+    ) -> Result<usize, HostError> {
+        socket.send_to(buf, addr, flags)
+    }
+    fn socket_recv(
+        &self,
+        socket: &HostSocket,
+        buf: &mut [u8],
+        flags: u32,
+    ) -> Result<usize, HostError> {
+        socket.recv(buf, flags)
+    }
+    fn socket_recvfrom(
+        &self,
+        socket: &HostSocket,
+        buf: &mut [u8],
+        flags: u32,
+    ) -> Result<(usize, Vec<u8>), HostError> {
+        socket.recv_from(buf, flags)
+    }
+    fn socket_shutdown(&self, socket: &HostSocket, how: u32) -> Result<(), HostError> {
+        socket.shutdown(how)
+    }
+    fn socket_set_nonblocking(&self, socket: &HostSocket, enabled: bool) -> Result<(), HostError> {
+        socket.set_nonblocking(enabled)
+    }
+    fn socket_name(&self, socket: &HostSocket, peer: bool) -> Result<Vec<u8>, HostError> {
+        socket.name(peer)
+    }
+    fn socket_set_option(
+        &self,
+        socket: &HostSocket,
+        level: u32,
+        opt: u32,
+        value: i32,
+    ) -> Result<(), HostError> {
+        socket.set_option(level, opt, value)
+    }
+    fn socket_get_option(
+        &self,
+        socket: &HostSocket,
+        level: u32,
+        opt: u32,
+    ) -> Result<i32, HostError> {
+        socket.get_option(level, opt)
     }
 }
 

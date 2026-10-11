@@ -1,5 +1,5 @@
 ﻿# verify.ps1 — Windows 本地完整验证（CI 同款命令）
-param([switch]$RequireBusybox, [switch]$RequireThreads)
+param([switch]$RequireBusybox, [switch]$RequireThreads, [switch]$RequireNetwork, [switch]$RequireSignals)
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
 
@@ -54,6 +54,22 @@ if ($RequireThreads) {
     1..3 | ForEach-Object {
         cargo run -q -p vela-cli --bin vela -- run --soft-tls guest/bin/pthread-test
         if ($LASTEXITCODE -ne 0) { throw "pthread guest failed on iteration $_" }
+    }
+}
+if ($RequireSignals) {
+    Write-Host "==> signal acceptance"
+    if (-not (Test-Path guest/bin/signal-test)) { throw "guest/bin/signal-test is required" }
+    1..3 | ForEach-Object {
+        cargo run -q -p vela-cli --bin vela -- run --soft-tls guest/bin/signal-test
+        if ($LASTEXITCODE -ne 0) { throw "signal guest failed on iteration $_" }
+    }
+}
+if ($RequireNetwork) {
+    Write-Host "==> socket/epoll acceptance"
+    if (-not (Test-Path guest/bin/socket-test)) { throw "guest/bin/socket-test is required" }
+    1..3 | ForEach-Object {
+        cargo run -q -p vela-cli --bin vela -- run --soft-tls guest/bin/socket-test
+        if ($LASTEXITCODE -ne 0) { throw "socket guest failed on iteration $_" }
     }
 }
 

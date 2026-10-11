@@ -102,6 +102,37 @@ pub(super) fn sys_poll(
     ready
 }
 
+pub(super) fn sys_ppoll(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 {
+    let timeout = if a[2] == 0 {
+        u64::MAX
+    } else {
+        let raw = match read_guest(proc, a[2], 16) {
+            Ok(v) => v,
+            Err(e) => return -(e as i64),
+        };
+        let sec = i64::from_le_bytes(raw[0..8].try_into().unwrap());
+        let nsec = i64::from_le_bytes(raw[8..16].try_into().unwrap());
+        if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+            return -(abi::EINVAL as i64);
+        }
+        (sec as u128 * 1000 + (nsec as u128).div_ceil(1_000_000)).min(i32::MAX as u128) as u64
+    };
+    let old_mask = proc.signals.blocked;
+    if a[3] != 0 {
+        if a[4] != 8 {
+            return -(abi::EINVAL as i64);
+        }
+        let raw = match read_guest(proc, a[3], 8) {
+            Ok(v) => v,
+            Err(e) => return -(e as i64),
+        };
+        proc.signals.blocked = u64::from_le_bytes(raw.try_into().unwrap());
+    }
+    let result = sys_poll(proc, host, a[0], a[1], timeout);
+    proc.signals.blocked = old_mask;
+    result
+}
+
 fn fdset_has(proc: &GuestProcess, ptr: u64, fd: usize) -> Result<bool, i32> {
     if ptr == 0 {
         return Ok(false);
@@ -135,13 +166,24 @@ fn fdset_set(proc: &mut GuestProcess, ptr: u64, fd: usize) -> Result<(), i32> {
 /// select(2) conversion through the same host poll backend. `exceptfds` is
 /// accepted for ABI compatibility and remains empty because no OOB sources exist.
 pub(super) fn sys_select(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 {
+    sys_select_inner(proc, host, a, None)
+}
+
+fn sys_select_inner(
+    proc: &mut GuestProcess,
+    host: &dyn Host,
+    a: [u64; 6],
+    timeout_override: Option<i32>,
+) -> i64 {
     let nfds = a[0];
     if nfds > MAX_POLL_FDS {
         return -(abi::EINVAL as i64);
     }
     let n = nfds as usize;
     let (read_ptr, write_ptr, except_ptr, tv_ptr) = (a[1], a[2], a[3], a[4]);
-    let timeout = if tv_ptr == 0 {
+    let timeout = if let Some(value) = timeout_override {
+        value
+    } else if tv_ptr == 0 {
         -1
     } else {
         let raw = match read_guest(proc, tv_ptr, 16) {
@@ -237,10 +279,56 @@ pub(super) fn sys_select(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) 
     ready
 }
 
+pub(super) fn sys_pselect6(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -> i64 {
+    let mask_ptr = a[5];
+    let (set_ptr, mask_len) = if mask_ptr == 0 {
+        (0, 0)
+    } else {
+        let raw = match read_guest(proc, mask_ptr, 16) {
+            Ok(v) => v,
+            Err(e) => return -(e as i64),
+        };
+        (
+            u64::from_le_bytes(raw[0..8].try_into().unwrap()),
+            u64::from_le_bytes(raw[8..16].try_into().unwrap()),
+        )
+    };
+    let timeout_override = if a[4] != 0 {
+        let raw = match read_guest(proc, a[4], 16) {
+            Ok(v) => v,
+            Err(e) => return -(e as i64),
+        };
+        let sec = i64::from_le_bytes(raw[0..8].try_into().unwrap());
+        let nsec = i64::from_le_bytes(raw[8..16].try_into().unwrap());
+        if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+            return -(abi::EINVAL as i64);
+        }
+        let ms =
+            (sec as u128 * 1000 + (nsec as u128).div_ceil(1_000_000)).min(i32::MAX as u128) as i64;
+        Some(ms as i32)
+    } else {
+        None
+    };
+    let old = proc.signals.blocked;
+    if set_ptr != 0 {
+        if mask_len != 8 {
+            return -(abi::EINVAL as i64);
+        }
+        let raw = match read_guest(proc, set_ptr, 8) {
+            Ok(v) => v,
+            Err(e) => return -(e as i64),
+        };
+        proc.signals.blocked = u64::from_le_bytes(raw.try_into().unwrap());
+    }
+    let result = sys_select_inner(proc, host, a, timeout_override);
+    proc.signals.blocked = old;
+    result
+}
+
 // ---------------------------------------------------------------- 读写
 
 pub(super) fn sys_write(
-    proc: &GuestProcess,
+    proc: &mut GuestProcess,
     host: &dyn Host,
     fd_raw: u64,
     buf: u64,
@@ -260,13 +348,26 @@ pub(super) fn sys_write(
                 return 0;
             }
             match read_guest(proc, buf, len as usize) {
-                Ok(data) => host
-                    .write(f, data)
-                    .map(|n| n as i64)
-                    .unwrap_or_else(|e| -(host_err_to_errno(&e) as i64)),
+                Ok(data) => {
+                    let result = match &f.0 {
+                        HostFileKind::Socket(s) => host.socket_send(s, data, 0),
+                        _ => host.write(f, data),
+                    };
+                    match result {
+                        Ok(n) => n as i64,
+                        Err(e) => {
+                            let errno = host_err_to_errno(&e);
+                            if errno == abi::EPIPE {
+                                proc.signals.pending |= 1u64 << (abi::SIGPIPE - 1);
+                            }
+                            -(errno as i64)
+                        }
+                    }
+                }
                 Err(e) => -(e as i64),
             }
         }
+        Some(GuestFd::Epoll(_)) => -(abi::EBADF as i64),
     }
 }
 
@@ -293,13 +394,16 @@ pub(super) fn sys_read(
         Some(GuestFd::PipeWrite(_)) => -(abi::EBADF as i64), // 写端不可读
         Some(GuestFd::PipeRead(f)) | Some(GuestFd::Host(f)) => {
             match read_guest_mut(proc, buf, len as usize) {
-                Ok(dst) => host
-                    .read(f, dst)
-                    .map(|n| n as i64)
-                    .unwrap_or_else(|e| -(host_err_to_errno(&e) as i64)),
+                Ok(dst) => match &f.0 {
+                    HostFileKind::Socket(s) => host.socket_recv(s, dst, 0),
+                    _ => host.read(f, dst),
+                }
+                .map(|n| n as i64)
+                .unwrap_or_else(|e| -(host_err_to_errno(&e) as i64)),
                 Err(e) => -(e as i64),
             }
         }
+        Some(GuestFd::Epoll(_)) => -(abi::EBADF as i64),
     }
 }
 
@@ -308,7 +412,7 @@ fn write_zeros(proc: &GuestProcess, addr: u64, len: usize) -> Result<(), i32> {
 }
 
 pub(super) fn sys_writev(
-    proc: &GuestProcess,
+    proc: &mut GuestProcess,
     host: &dyn Host,
     fd_raw: u64,
     iov: u64,
@@ -353,13 +457,24 @@ pub(super) fn sys_writev(
                     Ok(d) => d,
                     Err(e) => return -(e as i64),
                 };
-                match host.write(f, data) {
+                let result = match &f.0 {
+                    HostFileKind::Socket(s) => host.socket_send(s, data, 0),
+                    _ => host.write(f, data),
+                };
+                match result {
                     Ok(n) => total += n as i64,
-                    Err(e) => return -(host_err_to_errno(&e) as i64),
+                    Err(e) => {
+                        let errno = host_err_to_errno(&e);
+                        if errno == abi::EPIPE {
+                            proc.signals.pending |= 1u64 << (abi::SIGPIPE - 1);
+                        }
+                        return -(errno as i64);
+                    }
                 }
             }
             total
         }
+        Some(GuestFd::Epoll(_)) => -(abi::EBADF as i64),
     }
 }
 
@@ -552,6 +667,7 @@ pub(super) fn sys_fstat(proc: &GuestProcess, host: &dyn Host, fd_raw: u64, statb
             host.stat_file(f) // 管道端 → S_IFIFO（file_ops::fifo_stat）
         }
         Some(GuestFd::HostDir(d)) => host.stat_path(&HostPath(d.host_path().to_path_buf())),
+        Some(GuestFd::Epoll(_)) => Err(HostError::Invalid),
     };
     fill_stat(proc, r, statbuf)
 }
@@ -625,7 +741,7 @@ fn host_stat_to_linux(hs: &HostStat, uid: u32, gid: u32) -> abi::Stat {
 
 pub(super) fn sys_close(proc: &mut GuestProcess, host: &dyn Host, fd_raw: u64) -> i64 {
     let fd = fd_raw as u32 as i32;
-    match proc.fds.remove(fd) {
+    match proc.fds.remove_with_watch_cleanup(fd) {
         None => -(abi::EBADF as i64),
         Some(GuestFd::Host(f)) | Some(GuestFd::PipeRead(f)) | Some(GuestFd::PipeWrite(f)) => {
             match host.close(f) {
@@ -825,7 +941,17 @@ pub(super) fn sys_fcntl(
             let new_status = (arg as u32) & mask;
             proc.fds
                 .update_flags(fd, |v| (v & !(0x1_FFFF << 8)) | (new_status << 8));
-            0
+            let socket = match proc.fds.get(fd) {
+                Some(GuestFd::Host(HostFile(HostFileKind::Socket(s)))) => Some(s.clone()),
+                _ => None,
+            };
+            if let Some(s) = socket {
+                host.socket_set_nonblocking(&s, new_status & abi::O_NONBLOCK as u32 != 0)
+                    .map(|_| 0)
+                    .unwrap_or_else(|e| -(host_err_to_errno(&e) as i64))
+            } else {
+                0
+            }
         }
         abi::F_DUPFD | abi::F_DUPFD_CLOEXEC => {
             // 复制 fd；v0.3 从最小可用号分配（≥arg 语义极少依赖，注释见 SYSCALLS.md）
@@ -1143,7 +1269,9 @@ pub(super) fn sys_dup2(
         return newfd as i64; // dup2：等价 no-op
     }
     // 先移除目标（触发 host close）
-    let _ = proc.fds.remove(newfd);
+    if let Some(entry) = proc.fds.remove_with_watch_cleanup(newfd) {
+        close_fd_entry(host, entry);
+    }
     dup_impl(
         proc,
         host,
@@ -1154,6 +1282,19 @@ pub(super) fn sys_dup2(
 }
 
 /// dup 核心：复制 Host 句柄或伪设备标记，分配（或落到指定）fd。
+fn close_fd_entry(host: &dyn Host, entry: GuestFd) {
+    match entry {
+        GuestFd::Host(f) | GuestFd::PipeRead(f) | GuestFd::PipeWrite(f) => {
+            let _ = host.close(f);
+        }
+        GuestFd::HostDir(_)
+        | GuestFd::Null
+        | GuestFd::Zero
+        | GuestFd::Epoll(_)
+        | GuestFd::Reserved => {}
+    }
+}
+
 fn dup_impl(
     proc: &mut GuestProcess,
     host: &dyn Host,
@@ -1161,6 +1302,7 @@ fn dup_impl(
     at: Option<i32>,
     cloexec: bool,
 ) -> i64 {
+    let inherited_flags = proc.fds.clone_flags_for_dup(oldfd);
     let new_entry = match proc.fds.get(oldfd) {
         Some(GuestFd::Host(f)) | Some(GuestFd::PipeRead(f)) | Some(GuestFd::PipeWrite(f)) => {
             match host.dup_file(f) {
@@ -1175,14 +1317,20 @@ fn dup_impl(
         }
         Some(GuestFd::Null) => GuestFd::Null,
         Some(GuestFd::Zero) => GuestFd::Zero,
+        Some(GuestFd::Epoll(state)) => GuestFd::Epoll(state.clone()),
         _ => return -(abi::EBADF as i64),
     };
     let fd = match at {
         Some(n) => {
             proc.fds.insert_at(n, new_entry);
+            proc.fds.set_flags(n, inherited_flags);
             n
         }
-        None => proc.fds.alloc_fd(new_entry),
+        None => {
+            let n = proc.fds.alloc_fd(new_entry);
+            proc.fds.set_flags(n, inherited_flags);
+            n
+        }
     };
     if cloexec {
         proc.fds.update_flags(fd, |v| v | 1);

@@ -124,7 +124,7 @@ vela run --soft-tls guest\bin\busybox nproc
 vela run --soft-tls guest\bin\busybox true
 ```
 
-0.1.2 ���Ȿ������ `grep`��`find`��`tar` �� `gzip`��ֻ�� root �����������ʹ�ã�
+0.1.3 root 验收保留 `grep`、`find`、`tar`、`gzip`，并增加 `wget`/`nc` 的 loopback 网络 applet；所有网络默认使用宿主网络，Vela 不是安全沙箱。
 �������ڷ���̨������һ�£�
 
 ```powershell
@@ -132,7 +132,7 @@ vela run --soft-tls --root C:\vela-root guest\bin\busybox grep needle /data/inpu
 vela run --soft-tls --root C:\vela-root guest\bin\busybox find /data -name input.txt
 ```
 
-## `pthread-test`��0.1.2 ���̻߳�׼
+## `pthread-test`（0.1.2 线程基准）
 
 `pthread-test` �� musl static PIE���ڻ��в��Թ��� 8 ������̡߳�ÿ�̵߳�
 `_Thread_local`����ԭ�Ӽ�����futex wait/wake��`gettid`/`getpid` �� join��
@@ -157,3 +157,15 @@ vela run --soft-tls guest/bin/pthread-test
 
 - 用 MinGW 编出来的 PE 当测试（规格 8.3）
 - glibc 动态链接的 hello（非 musl 解释器，v0.0.4 诚实拒绝）
+## `signal-test` 与 `socket-test`（0.1.3）
+
+Windows x86_64 上可用 zig + musl 构建两个网络/信号验收 guest：
+
+```powershell
+zig cc -target x86_64-linux-musl -fPIE -pie -O2 -o guest/bin/signal-test guest/src/signal-test.c
+zig cc -target x86_64-linux-musl -fPIE -pie -O2 -o guest/bin/socket-test guest/src/socket-test.c
+vela run --soft-tls guest/bin/signal-test
+vela run --soft-tls guest/bin/socket-test
+```
+
+`socket-test` 覆盖 AF_UNIX socketpair、TCP/UDP loopback 和 epoll readiness，只使用本机回环地址。Vela 的网络默认走宿主网络，不提供沙箱隔离。

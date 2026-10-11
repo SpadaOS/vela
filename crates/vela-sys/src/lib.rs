@@ -5,6 +5,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub use vela_abi::*;
+
 // ---------------------------------------------------------------- 保护位
 
 /// 宿主内存保护位（值与 Linux PROT_* 一致，便于直传）。
@@ -55,6 +57,8 @@ pub struct HostPath(pub PathBuf);
 /// 不透明文件句柄。Std* 变体归宿主生命周期管理，Disk 由 Drop 关闭。
 #[derive(Debug)]
 pub struct HostFile(pub HostFileKind);
+
+pub use socket_impl::HostSocket;
 
 /// Host-side poll descriptor. `revents` is filled by `HostFileOps::poll`.
 pub struct HostPollFd<'a> {
@@ -148,6 +152,8 @@ pub enum HostFileKind {
     },
     /// 匿名管道一端（pipe2 产物；fstat = S_IFIFO）。
     Pipe(PipeEnd),
+    /// Winsock or local socket endpoint.
+    Socket(HostSocket),
 }
 
 impl HostFileKind {
@@ -158,6 +164,7 @@ impl HostFileKind {
             HostFileKind::StdOut => HostFileKind::StdOut,
             HostFileKind::StdErr => HostFileKind::StdErr,
             HostFileKind::Pipe(e) => HostFileKind::Pipe(e.clone()),
+            HostFileKind::Socket(s) => HostFileKind::Socket(s.clone()),
             HostFileKind::Disk { .. } => unreachable!("dup_file handles Disk via try_clone"),
         }
     }
@@ -767,6 +774,93 @@ pub trait HostFileOps: Send + Sync + 'static {
     fn create_pipe(&self) -> Result<(HostFile, HostFile), HostError> {
         Err(HostError::Unimplemented)
     }
+
+    fn socket(&self, _domain: u16, _kind: u32, _protocol: u32) -> Result<HostSocket, HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn socketpair(
+        &self,
+        _domain: u16,
+        _kind: u32,
+        _protocol: u32,
+    ) -> Result<(HostSocket, HostSocket), HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn socket_bind(&self, _socket: &HostSocket, _addr: &[u8]) -> Result<(), HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn socket_listen(&self, _socket: &HostSocket, _backlog: i32) -> Result<(), HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn socket_accept(&self, _socket: &HostSocket) -> Result<HostSocket, HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn socket_connect(&self, _socket: &HostSocket, _addr: &[u8]) -> Result<(), HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn socket_send(
+        &self,
+        _socket: &HostSocket,
+        _buf: &[u8],
+        _flags: u32,
+    ) -> Result<usize, HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn socket_sendto(
+        &self,
+        _socket: &HostSocket,
+        _buf: &[u8],
+        _addr: &[u8],
+        _flags: u32,
+    ) -> Result<usize, HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn socket_recv(
+        &self,
+        _socket: &HostSocket,
+        _buf: &mut [u8],
+        _flags: u32,
+    ) -> Result<usize, HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn socket_recvfrom(
+        &self,
+        _socket: &HostSocket,
+        _buf: &mut [u8],
+        _flags: u32,
+    ) -> Result<(usize, Vec<u8>), HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn socket_shutdown(&self, _socket: &HostSocket, _how: u32) -> Result<(), HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn socket_set_nonblocking(
+        &self,
+        _socket: &HostSocket,
+        _enabled: bool,
+    ) -> Result<(), HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn socket_name(&self, _socket: &HostSocket, _peer: bool) -> Result<Vec<u8>, HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn socket_set_option(
+        &self,
+        _socket: &HostSocket,
+        _level: u32,
+        _opt: u32,
+        _value: i32,
+    ) -> Result<(), HostError> {
+        Err(HostError::Unimplemented)
+    }
+    fn socket_get_option(
+        &self,
+        _socket: &HostSocket,
+        _level: u32,
+        _opt: u32,
+    ) -> Result<i32, HostError> {
+        Err(HostError::Unimplemented)
+    }
 }
 
 /// 组 3 time：时间与熵（宿主环境信息；RNG 并入本组，见 PLAN-0.0.3 决策点 3）。
@@ -826,6 +920,8 @@ pub trait Host: HostMem + HostFileOps + HostTime + HostTls + HostTrap + HostProc
 
 /// 通用文件/时间操作（基于 std，跨 Windows 与 linux_dev 复用）。
 pub(crate) mod file_ops;
+#[path = "socket.rs"]
+mod socket_impl;
 
 #[cfg(target_os = "linux")]
 pub mod linux_dev;

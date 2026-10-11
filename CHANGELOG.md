@@ -2,6 +2,19 @@
 
 本项目的所有显著变更记录于此（Keep a Changelog 格式）。
 
+## [0.1.3] - 2026-10-11
+
+- Added Windows Winsock-backed TCP/UDP sockets, local socketpair, socket-aware poll/select, and level-triggered epoll with a 1024 descriptor cap.
+- Added trap-safe-point signal handlers, disposition and mask/pending state, kill/tgkill, sigreturn, and alternate-stack ABI/runtime state.
+- Added repeated `signal-test` and `socket-test` guest acceptance alongside the existing pthread and BusyBox root checks; enabled BusyBox `wget` and `nc` applets.
+- Added mandatory signal/network guest checks to CI and release workflows, version and package-content checks, extracted-ZIP guest smoke, and ZIP/SHA-256 release assets.
+- Published `v0.1.3` for Windows x86_64 after the release workflow passed. Full asynchronous/realtime signals, signalfd, SCM_RIGHTS, MAP_SHARED, glibc, and non-Windows hosts remain unsupported.
+
+## [0.1.2] - 2026-10-03
+
+- Added pthread-shaped `clone`, per-thread TLS, futex wait/wake, and Windows native guest-thread launch.
+- Added the `pthread-test` guest acceptance asset.
+
 ## [0.1.1] - 2026-10-01
 
 - Stability and release closeout for path isolation, checked arithmetic, fork/exec, ELF validation, and verification packaging.
@@ -264,7 +277,3 @@
 - TLS trampoline（wrfsbase，需 FSGSBASE）
 - guest：hello（汇编）/ torture / tls / hello-musl
 - Windows 主宿主完整实现；linux_dev 逻辑测试壳；SpadaOS 空壳
-\r\n## [0.1.2] - unreleased
-
-- Thread and concurrency runtime development: pthread-shaped `clone`, per-thread TLS, futex wait/wake, and Windows native guest-thread launch.
-- Added the `pthread-test` guest acceptance asset.

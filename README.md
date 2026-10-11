@@ -43,6 +43,8 @@ ABI 自主演进、不在内核里做 Linux 兼容，Linux 软件通过 Vela 这
 
 ## 快速开始
 
+当前发布版本为 [v0.1.3](https://github.com/SpadaOS/vela/releases/tag/v0.1.3)（2026-10-11，Windows x86_64），提供 Windows x64 ZIP 和 SHA-256 校验文件。
+
 零第三方依赖，任何能装 Rust 的机器都能完整构建：
 
 ```powershell
@@ -85,7 +87,7 @@ cargo build -p vela-cli --release
 
 ## 能力矩阵
 
-v0.1.1 实测（CI 在 Windows runner 上自动验收全部 ✅ 项）：
+v0.1.3 已发布；Windows CI 验收覆盖下列能力的 guest 用例，具体 syscall 限制见 [docs/SYSCALLS.md](docs/SYSCALLS.md)：
 
 | 能力 | 状态 | 说明 |
 |---|:---:|---|
@@ -96,17 +98,18 @@ v0.1.1 实测（CI 在 Windows runner 上自动验收全部 ✅ 项）：
 | **用户态 fork** | ✅ | fork+waitpid 全语义；不可变段 section 跨 fork 共享，快照体积可观测（0.1.0 起） |
 | **busybox shell** | ✅ | `sh -c` 管道/命令替换/变量展开/重定向 CI 硬门禁（0.1.0 起） |
 | **execve** | ✅ | 进程内重载，fd 跨重载保留；pipe2 管道 |
-| **poll / select** | ✅ | 同步文件、标准流和 Vela pipe；fd 上限 1024 |
+| **pthread / futex** | ✅ | musl pthread-shaped clone、每线程 TLS、futex wait/wake；多线程 fork 返回 EAGAIN，worker exec 返回 ENOSYS |
+| **poll / select** | ✅ | 同步文件、标准流、Vela pipe 和 socket；fd 上限 1024；ppoll/pselect6 支持临时 mask 状态 |
 | **syscall 热路径** | ✅ | 岛页跳板（`--trap=auto`），UD2+VEH 兜底；陷阱全程宿主栈 |
 | mmap | ✅ | 匿名 + 文件映射（COW，写不回宿主文件）；SHARED 诚实 ENOSYS |
 | TLS | ✅ | FSGSBASE 硬件路径，缺失时 `--soft-tls` 软件模拟 |
 | 时间 / 熵 / 进程身份 | ✅ | clock/getrandom/uname/auxv/utimensat |
-| 信号投递 | ❌ | rt_sigaction/procmask 记账；kill SIGKILL/SIGTERM；SIGCHLD 仅记账；Ctrl+C 杀子进程树（控制台近似） |
-| socket / epoll / GUI | ❌ | 返回 `-ENOSYS`，libc 有降级路径 |
+| 信号投递 | 🟨 | 常用 rt_sigaction/procmask、kill/tgkill、pending 和 trap 安全点 handler；realtime/完整异步 frame 仍受限 |
+| **socket / epoll** | ✅ | Windows Winsock TCP/UDP、AF_UNIX socketpair、poll/select readiness 与 level-triggered epoll |
 | Go 程序 / 32 位 / ARM / 非 Windows 宿主 | ❌ | 见 [docs/NONGOALS.md](docs/NONGOALS.md) |
 
 未实现的 syscall 一律返回 Linux 风格 `-ENOSYS`——行为可预期，而不是崩溃。
-逐条兼容矩阵（约 60 条）见 [docs/SYSCALLS.md](docs/SYSCALLS.md)。
+逐条兼容矩阵见 [docs/SYSCALLS.md](docs/SYSCALLS.md)。
 
 ## 和 WSL 的区别
 
@@ -162,13 +165,16 @@ vela --version | --help
 
 ```powershell
 .\scripts\verify.ps1        # 一键：构建 + 测试 + guest 验收（Windows）
+.\scripts\verify.ps1 -RequireBusybox -RequireThreads -RequireSignals -RequireNetwork
 cargo test --workspace      # 或仅测试
 ```
 
 覆盖：ELF 解析与拒绝路径、syscall patch、dispatch 语义翻译、路径翻译、
 soft-tls 解码表驱动回归，以及端到端验收（hello / torture / hello-dyn /
 fs-exec / pipe 对 / busybox echo·nproc·true）。CI 在 Windows runner 上执行
-同一流程并现场构建 busybox（msys2 make + zig cc musl）。
+同一流程并现场构建 busybox（msys2 make + zig cc musl），额外验收 root 下的
+grep/find/tar/gzip，以及重复运行的 pthread、signal 和 TCP/UDP/socketpair/epoll guest。
+tag 发布流程还检查版本一致性、ZIP 资产清单、解压后的 guest smoke，并上传 ZIP 和 SHA-256 文件。
 
 ## 项目结构
 
@@ -211,11 +217,8 @@ Vela 当沙箱用。杀毒软件可能对"进程内改可执行内存再执行"�
 
 ## 路线
 
-- **v0.1.2（开发中）**：Windows 运行时加入 pthread clone、每线程 soft-TLS、futex wait/wake 与 `pthread-test`；BusyBox 验收扩展到 grep/find/tar/gzip。多线程 fork/exec、socket、完整信号投递仍不在范围内。
-  宿主栈、fork 不可变段共享 + mprotect 账本、busybox `sh -c` 闭环
-  （CI 硬门禁）、utimensat、SIGCHLD 记账、Host Trap/Proc 契约收口、
-  doctor 2.0、Ctrl+C 进程树、SECURITY.md。唯一可运行宿主：Windows
-- 下一步候选：fork 脏页跟踪、MAP_SHARED 匿名共享、信号投递地基
+- **[v0.1.3（已发布，2026-10-11）](https://github.com/SpadaOS/vela/releases/tag/v0.1.3)**：Windows 运行时加入 TCP/UDP/socketpair/epoll 与 trap 安全点 signal handler、mask/pending 和 sigreturn，保留 pthread、futex、fork/exec、poll/select 和 BusyBox grep/find/tar/gzip 验收；完整异步信号、MAP_SHARED、glibc、SCM_RIGHTS 和非 Windows host 仍不在范围内。版本还保留宿主栈切换、fork 不可变段共享与 mprotect 账本、BusyBox `sh -c` 闭环、utimensat、SIGCHLD 记账、Host Trap/Proc 契约、doctor 2.0、Ctrl+C 进程树和 SECURITY.md。唯一可运行宿主：Windows。
+- 下一步候选：fork 脏页跟踪、MAP_SHARED 匿名共享、完整异步信号语义
 - v1：SpadaOS `Host` 填满（等 SpadaOS 内核具备用户态 map/file 能力后）、
   外部 X server 通路
 

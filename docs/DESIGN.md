@@ -187,6 +187,8 @@ vela-cli → vela-loader → vela-runtime → vela-fs
 
 ## 0.1.2 线程与并发边界
 
+0.1.3 在同一进程共享模型上增加 HostSocket 和 epoll readiness backend。Windows 使用 Winsock-backed 标准库网络对象；socket fd、pipe 和 stdio 经过同一个 poll backend，epoll 采用 level-triggered 语义并限制 1024 个关注 fd。信号 disposition、线程 mask 和 pending mask 在 trap 安全点更新，完整异步 frame、realtime queue、signalfd 和 SCM_RIGHTS 延后。
+
 Windows 运行时把 pthread 形态的 `clone` 映射到原生线程。进程映像、内存登记、文件表和路径映射属于进程共享资源；tid、FS/GS、soft-TLS、clear-tid 和退出状态属于线程资源。VEH/island scratch 和 soft-TLS 基址按宿主线程保存，futex/poll/pipe 等等待期间不持有进程共享锁。
 
 当前 flags 覆盖 musl pthread 创建路径；`CLONE_DETACHED` 作为兼容性 no-op。线程退出先清零 `clear_tid` 并执行一次 futex wake，再结束当前原生线程；`exit_group` 才终止整个 Vela 进程。多线程进程调用 fork 返回 `EAGAIN`，非主线程 execve 返回 `ENOSYS`，避免伪造不安全的 POSIX 快照语义。

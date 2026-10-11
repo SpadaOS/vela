@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 use vela_loader as loader;
 use vela_runtime::{write_guest, GuestProcess, InterpImage};
 #[cfg(windows)]
-use vela_sys::{GuestThreadContext, HostMem, HostProc, HostTid, HostTrap, TrapFrame};
+use vela_sys::{GuestThreadContext, Host, HostMem, HostProc, HostTid, HostTrap, TrapFrame};
 
 #[cfg(target_os = "linux")]
 use vela_sys::linux_dev::LinuxDevHost;
@@ -558,6 +558,10 @@ fn do_execve(st: &mut GuestState, args: &[u64; 6]) -> Result<(u64, u64), i64> {
     st.proc.fs_base = 0;
     st.proc.gs_base = 0;
     st.proc.fs_apply_pending = None;
+    st.proc.signals.reset_for_exec();
+    st.proc.signal_frames.clear();
+    st.proc.signal_restore = None;
+    st.proc.alt_stack = None;
     st.host.set_soft_tls_base(0);
     st.exec_guest_path = argv.first().cloned().unwrap_or_else(|| path.clone());
     st.exec_host_path = host_path;
@@ -662,6 +666,9 @@ fn cmd_doctor() -> i32 {
             "  trap counts  : island sites={islands}, VEH sites={veh}, registered ranges={}",
             vela_sys::windows::guest_exec_range_count()
         );
+        println!("  socket backend: Winsock/std net (TCP, UDP, AF_UNIX socketpair)");
+        println!("  signal backend: trap safe-point delivery (basic dispositions/pending)");
+        println!("  epoll         : level-triggered, max 1024 watches");
     }
 
     // fork / 地址空间债（0.1.0 T5.2；doctor 是独立进程，只报机制与观测方法）
@@ -684,6 +691,8 @@ fn cmd_doctor() -> i32 {
         "file-io",
         "bench",
         "pthread-test",
+        "signal-test",
+        "socket-test",
         "busybox",
     ] {
         let p = std::path::Path::new(manifest).join(format!("../../guest/bin/{g}"));
@@ -1117,7 +1126,14 @@ unsafe extern "system" fn trap(nr: u64, args: &[u64; 6], frame: &mut TrapFrame) 
         fork::do_wait4(st, args)
     } else if nr == vela_abi::SYS_KILL {
         // kill（0.0.6 M3）：SIGKILL/SIGTERM 终止 + sig 0 探测
-        fork::do_kill(st, args[0], args[1])
+        if args[0] as u32 == st.proc.pid
+            && args[1] != vela_abi::SIGKILL as u64
+            && args[1] != vela_abi::SIGTERM as u64
+        {
+            vela_runtime::dispatch(&mut st.proc, &st.host, nr, *args)
+        } else {
+            fork::do_kill(st, args[0], args[1])
+        }
     } else {
         vela_runtime::dispatch(&mut st.proc, &st.host, nr, *args)
     };
@@ -1131,6 +1147,60 @@ unsafe extern "system" fn trap(nr: u64, args: &[u64; 6], frame: &mut TrapFrame) 
         );
     }
     // 模拟硬件 syscall 固定副作用：Rax=返回值、Rcx=返回地址、R11=RFLAGS、Rip+=2
+    if nr == vela_abi::SYS_RT_SIGRETURN {
+        if let Some(saved) = st.proc.signal_restore.take() {
+            *frame.regs = saved.regs;
+            frame.e_flags = saved.e_flags;
+            return 0;
+        }
+    }
+    if r == 0 {
+        let pending = st.proc.signals.pending & !st.proc.signals.blocked;
+        if pending != 0 {
+            let sig = pending.trailing_zeros() as u64 + 1;
+            let disposition = st.proc.signals.dispositions[sig as usize - 1];
+            st.proc.signals.pending &= !(1u64 << (sig - 1));
+            if disposition.handler == vela_abi::SIG_DFL {
+                if sig != vela_abi::SIGCHLD as u64 && sig != vela_abi::SIGCONT as u64 {
+                    st.host.process_exit(128 + sig as i32);
+                }
+            } else if disposition.handler > vela_abi::SIG_IGN {
+                let mut saved = *frame.regs;
+                saved.rax = r as u64;
+                saved.rcx = rip + 2;
+                saved.r11 = frame.e_flags;
+                saved.rip = rip + 2;
+                st.proc.signal_frames.push(vela_runtime::SignalFrame {
+                    regs: saved,
+                    e_flags: frame.e_flags,
+                    blocked: st.proc.signals.blocked,
+                    rsp: frame.regs.rsp,
+                });
+                st.proc.signals.blocked |= disposition.mask | (1u64 << (sig - 1));
+                if let Some(new_rsp) = frame.regs.rsp.checked_sub(8) {
+                    let return_pc = if disposition.restorer != 0 {
+                        disposition.restorer
+                    } else {
+                        rip + 2
+                    };
+                    if st.proc.mem.contains(new_rsp, 8)
+                        && vela_runtime::write_guest(&st.proc, new_rsp, &return_pc.to_le_bytes())
+                            .is_ok()
+                    {
+                        frame.regs.rsp = new_rsp;
+                        frame.regs.rip = disposition.handler;
+                        frame.regs.rdi = sig;
+                        frame.regs.rax = 0;
+                        frame.regs.rcx = rip + 2;
+                        frame.regs.r11 = frame.e_flags;
+                        return 0;
+                    }
+                }
+                let _ = st.proc.signal_frames.pop();
+                st.proc.signals.blocked &= !(1u64 << (sig - 1));
+            }
+        }
+    }
     frame.regs.rax = r as u64;
     frame.regs.rcx = rip + 2;
     frame.regs.r11 = frame.e_flags;

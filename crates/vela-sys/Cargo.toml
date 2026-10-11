@@ -4,5 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[dependencies]
+socket2 = "0.5.8"
+vela-abi = { path = "../vela-abi" }
+
 [lints]
 workspace = true
