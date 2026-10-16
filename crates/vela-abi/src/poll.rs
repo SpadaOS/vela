@@ -6,3 +6,4 @@ pub const POLLOUT: u16 = 0x0004;
 pub const POLLERR: u16 = 0x0008;
 pub const POLLHUP: u16 = 0x0010;
 pub const POLLNVAL: u16 = 0x0020;
+pub const POLLRDHUP: u16 = 0x2000;

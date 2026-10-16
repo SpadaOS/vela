@@ -6,7 +6,7 @@ use vela_abi as abi;
 
 use vela_sys::{Host, HostError};
 
-use crate::{host_err_to_errno, read_guest_mut, write_guest, GuestProcess};
+use crate::{host_err_to_errno, validate_guest_write, write_guest, GuestProcess};
 
 pub(super) fn sys_exit(proc: &mut GuestProcess, host: &dyn Host, code: u64, group: bool) -> i64 {
     // 退出前冲刷 stdio，避免宿主侧缓冲丢失（规格 4：exit 直接结束进程）
@@ -28,7 +28,7 @@ pub(super) fn sys_exit(proc: &mut GuestProcess, host: &dyn Host, code: u64, grou
 /// is owned by the thread launcher; this baseline records the address in the
 /// future `GuestThread` state and validates it when a process mapping exists.
 pub(super) fn sys_set_tid_address(proc: &mut GuestProcess, host: &dyn Host, addr: u64) -> i64 {
-    if addr != 0 && !proc.mem.contains(addr, 4) {
+    if addr != 0 && !proc.can_access(addr, 4, 1) {
         return -(abi::EFAULT as i64);
     }
     proc.clear_tid = if addr == 0 { None } else { Some(addr) };
@@ -46,7 +46,7 @@ pub(super) fn sys_futex(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -
     if addr == 0 || !addr.is_multiple_of(std::mem::align_of::<u32>() as u64) {
         return -(abi::EINVAL as i64);
     }
-    if !proc.mem.contains(addr, 4) {
+    if !proc.can_access(addr, 4, 1) {
         return -(abi::EFAULT as i64);
     }
     let ptr = addr as *const u32;
@@ -54,6 +54,9 @@ pub(super) fn sys_futex(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) -
         abi::FUTEX_WAIT => {
             let current = unsafe { std::ptr::read_volatile(ptr) };
             if current != a[2] as u32 {
+                return -(abi::EAGAIN as i64);
+            }
+            if proc.nonblocking_step {
                 return -(abi::EAGAIN as i64);
             }
             let timeout = match parse_futex_timeout(proc, a[3]) {
@@ -158,12 +161,15 @@ pub(super) fn sys_getrandom(proc: &mut GuestProcess, host: &dyn Host, buf: u64, 
     if len > (1 << 26) {
         return -(abi::EINVAL as i64); // v0 上限 64MiB 防呆
     }
-    match read_guest_mut(proc, buf, len as usize) {
-        Ok(dst) => host
-            .random(dst)
+    if validate_guest_write(proc, buf, len as usize).is_err() {
+        return -(abi::EFAULT as i64);
+    }
+    let mut data = vec![0; len as usize];
+    match host.random(&mut data) {
+        Ok(()) => write_guest(proc, buf, &data)
             .map(|_| len as i64)
-            .unwrap_or_else(|e| -(host_err_to_errno(&e) as i64)),
-        Err(e) => -(e as i64),
+            .unwrap_or_else(|e| -(e as i64)),
+        Err(error) => -(host_err_to_errno(&error) as i64),
     }
 }
 

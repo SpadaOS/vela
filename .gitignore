@@ -19,5 +19,12 @@ musl-1.2.5/
 guest/bin/busybox
 guest/bin/signal-test
 guest/bin/socket-test
+guest/bin/network-concurrency-test
+guest/bin/epoll-test
+guest/bin/signal-wait-test
+guest/bin/socket-edge-test
+guest/bin/signal-lifecycle-test
+guest/bin/island-test
+__pycache__/
 /release/
 sh-trace*.log

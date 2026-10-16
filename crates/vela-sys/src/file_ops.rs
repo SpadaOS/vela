@@ -496,6 +496,31 @@ pub(crate) fn create_pipe() -> Result<(HostFile, HostFile), HostError> {
     #[cfg(windows)]
     {
         let (r, w) = pipe_handles()?;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetNamedPipeHandleState(
+                handle: isize,
+                mode: *const u32,
+                max: *const u32,
+                timeout: *const u32,
+            ) -> i32;
+        }
+        // Anonymous pipes are byte-mode named pipes internally. Keep native
+        // attempts nonblocking; the CLI implements the interruptible wait.
+        let nowait = 1u32;
+        for handle in [r, w] {
+            if unsafe {
+                SetNamedPipeHandleState(handle, &nowait, std::ptr::null(), std::ptr::null())
+            } == 0
+            {
+                let error = unsafe { GetLastError() };
+                unsafe {
+                    CloseHandle(r);
+                    CloseHandle(w);
+                }
+                return Err(HostError::Other(os_to_errno(error as i32)));
+            }
+        }
         Ok((
             HostFile(HostFileKind::Pipe(PipeEnd(PipeEndInner::Handle(r, true)))),
             HostFile(HostFileKind::Pipe(PipeEnd(PipeEndInner::Handle(w, false)))),
@@ -535,6 +560,9 @@ impl PipeEnd {
                     // ERROR_BROKEN_PIPE 表示写端已全关——对读端是 EOF 而非错误
                     if e == 109 {
                         return Ok(0);
+                    }
+                    if e == 232 {
+                        return Err(HostError::Other(crate::EAGAIN));
                     }
                     return Err(HostError::Other(os_to_errno(e as i32)));
                 }
@@ -576,7 +604,13 @@ impl PipeEnd {
                 };
                 if ok == 0 {
                     let e = unsafe { GetLastError() };
+                    if e == 232 || e == 233 {
+                        return Err(HostError::Other(crate::EPIPE));
+                    }
                     return Err(HostError::Other(os_to_errno(e as i32)));
+                }
+                if put == 0 && !buf.is_empty() {
+                    return Err(HostError::Other(crate::EAGAIN));
                 }
                 Ok(put as usize)
             }

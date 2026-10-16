@@ -174,7 +174,7 @@ vela-cli → vela-loader → vela-runtime → vela-fs
 
 - `LoadedImage`/`Segment` 定义在 runtime（GuestProcess 持有），loader 构造填充。
 - `vela-runtime` 无 `cfg(target_os)`、无宿主类型；差异全部在 `vela-sys`。
-- v0 零第三方依赖（不用 windows/goblin/bitflags crate），FFI 手写声明，降低
+- Vela 手写宿主 FFI，socket 使用 Cargo 锁定的 socket2，降低
   构建内存与磁盘占用，并满足「无 SpadaOS 机器完整构建」。
 
 ## 已知 v0 简化
@@ -192,3 +192,15 @@ vela-cli → vela-loader → vela-runtime → vela-fs
 Windows 运行时把 pthread 形态的 `clone` 映射到原生线程。进程映像、内存登记、文件表和路径映射属于进程共享资源；tid、FS/GS、soft-TLS、clear-tid 和退出状态属于线程资源。VEH/island scratch 和 soft-TLS 基址按宿主线程保存，futex/poll/pipe 等等待期间不持有进程共享锁。
 
 当前 flags 覆盖 musl pthread 创建路径；`CLONE_DETACHED` 作为兼容性 no-op。线程退出先清零 `clear_tid` 并执行一次 futex wake，再结束当前原生线程；`exit_group` 才终止整个 Vela 进程。多线程进程调用 fork 返回 `EAGAIN`，非主线程 execve 返回 `ENOSYS`，避免伪造不安全的 POSIX 快照语义。
+
+## 0.1.4：实际运行的状态与等待协议
+
+`ProcessShared<GuestState>` 作为 trap 的唯一共享所有者，guard 内通过 `GuestContext::enter` 绑定 `GuestThread` 的 TLS、mask、signal frame 和 altstack。console callback 只置原子事件；trap 和等待重试消费事件。
+
+可等待 syscall 使用零超时/非阻塞有界尝试，复制输入或接收 owned buffer；释放 guard 后再重试。临时 signal mask 与 pending 检查在同一 guard 内完成；创建 handler 时把原调用 mask 写入 signal frame。信号返回恢复 flags、FP 和 syscall 结果；有限 restart 重放原 syscall 寄存器。地址空间和 fd 更改在 guard 内串行化，不保留跨等待 guest 切片。
+
+Windows socket2 socket 始终原生非阻塞，逻辑 blocking/timeout 单独记账；WSAPoll、SO_ERROR、deadline 与 Linux errno 显式转换。epoll watch 使用稳定 open-file-description identity 和注册 fd；dup 共享 flags，CLOEXEC 独立，最后别名关闭时删除 watch。
+
+island 的 flags/FP、宿主栈和保存区均为每线程 TLS storage。专用汇编 guest 强制成功建岛，验证 fork 和并发 clone；clone 从迁移 cell 继续，避免落在 E9 的中间。安全点回收已终止线程的 native handle 和 scratch。doctor 仅报告自身进程的观察值。
+
+0.1.3 的网络实现已在本版本改为上述模型；不再使用标准库 stream clone/peek 推测全部 readiness。未实现语义参见 NONGOALS，不将异步抢占或网络 fd 的 fork 继承计为已支持。

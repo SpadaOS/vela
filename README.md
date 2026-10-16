@@ -1,231 +1,68 @@
-<div align="center">
-
 # Vela
 
-**在 Windows 用户态运行未经修改的 Linux x86_64 程序**
+在 Windows x86_64 用户态运行 Linux x86_64 PIE ELF。Vela 装载 ELF、改写 syscall 站点，并通过宿主接口翻译受支持的 Linux ABI。
 
-一个 `vela.exe` 进程 = 一个 Linux 进程<br>
-不改内核 · 不用虚拟机 · 零第三方依赖 · 单文件交付
+当前已发布版本为 **0.1.3**；本分支开发 **0.1.4**，尚未创建发布标签。实施和验收范围见 [0.1.4 计划](docs/plans/PLAN-0.1.4.md)。
 
-[![CI](https://github.com/SpadaOS/vela/actions/workflows/ci.yml/badge.svg)](https://github.com/SpadaOS/vela/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/SpadaOS/vela)](https://github.com/SpadaOS/vela/releases)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+Vela 直接在宿主进程和网络中运行 guest，**不是安全沙箱**。仅运行可信程序，安全边界见 [SECURITY.md](SECURITY.md)。
 
-[快速开始](#快速开始) · [能力矩阵](#能力矩阵) · [工作原理](#工作原理) · [文档](#文档)
+## 运行
 
-</div>
-
----
-
-Vela 是一个纯用户态的 **Linux ELF 翻译运行时**：加载未经修改的 Linux x86_64
-程序，在加载期把 `syscall` 指令改写为陷阱，由 VEH 拦截后把 Linux 语义逐条
-翻译到宿主 API。Vela 隶属 [SpadaOS](https://github.com/SpadaOS)——SpadaOS 的
-ABI 自主演进、不在内核里做 Linux 兼容，Linux 软件通过 Vela 这个独立运行时
-进入系统；Windows 是当前主宿主，接入 SpadaOS 只需实现 `Host` trait
-（[docs/HOST.md](docs/HOST.md)）。
-
-```text
-     unmodified Linux ELF (asm / static musl / dynamic musl / busybox)
-                           |
-                           v
-   .------------------------------------------------------.
-   |  vela.exe   one host process = one Linux process     |
-   |                                                      |
-   |  loader    ELF parse, map, patch 0F 05 -> 0F 0B      |
-   |  runtime   VEH trap -> dispatch -> Linux semantics   |
-   |  vela-fs   path map: /lib/... -> C:\...              |
-   |  vela-sys  Host trait = Windows API                  |
-   '------------------------------------------------------'
-                           |
-                           v
-          Windows user mode (no kernel change, no VM)
-```
-
-## 快速开始
-
-当前发布版本为 [v0.1.3](https://github.com/SpadaOS/vela/releases/tag/v0.1.3)（2026-10-11，Windows x86_64），提供 Windows x64 ZIP 和 SHA-256 校验文件。
-
-零第三方依赖，任何能装 Rust 的机器都能完整构建：
+Windows x64 发布包包含单个 `vela.exe`、guest 示例和验收脚本。运行 Vela 无需安装 Rust、Zig 或额外网络运行时。
 
 ```powershell
-git clone https://github.com/SpadaOS/vela
-cd vela
-cargo build -p vela-cli --release
+.\vela.exe --version
+.\vela.exe doctor
+.\vela.exe run guest/bin/hello
+.\vela.exe run --soft-tls guest/bin/hello-musl
+.\vela.exe run --soft-tls guest/bin/busybox echo hello
 ```
 
-三条最有代表性的命令——汇编 hello、动态链接 musl、宿主管道组合：
+硬件 FSGSBASE 可用时可以运行使用 FS 的 guest；云 VM、VBS 等环境可用 `--soft-tls` 诊断和验收，该模式没有性能承诺。
 
 ```powershell
-# 1. 无 libc 汇编 hello（183 字节静态 PIE）
-.\target\release\vela.exe run guest\bin\hello
-# hello from linux elf
-
-# 2. 动态链接：ld-musl 解释器做重定位，musl 运行时 + TLS
-.\target\release\vela.exe run --soft-tls guest\bin\hello-dyn
-# hello from musl
-
-# 3. 两个 vela 进程用 PowerShell 宿主管道组合
-.\target\release\vela.exe run guest\bin\pipe-a | .\target\release\vela.exe run guest\bin\pipe-b
-# pipe-b ok: 29 bytes, 3 lines
+.\vela.exe run --soft-tls --root C:/vela-root guest/bin/busybox sh -c 'echo hello > /data/hello && cat /data/hello'
+.\vela.exe run --soft-tls --root C:/vela-root guest/bin/busybox wget -O /data/file http://127.0.0.1:8080/file
+.\vela.exe run --soft-tls guest/bin/busybox nc 127.0.0.1 9000
 ```
 
-> [!TIP]
-> `--soft-tls` 在 **FSGSBASE 缺失**的环境（Hyper-V / 多数云虚拟机）必须开启：
-> Vela 会用 VEH 软件模拟客户 fs 段访问。裸机/支持 FSGSBASE 的机器不需要。
-> 用 `vela doctor` 检查你的环境。
+先创建 root 中的 `/data`。无 `--root` 时保留 `/mnt/c` 到 `C:\` 的兼容映射；提供 root 时只访问 root，除非通过 `--map` 增加映射。root 是路径映射约定，不提供安全隔离。参数详见 `vela --help`。
 
-更多命令——文件 IO 全链路、execve 自重载、**用户态 fork**、busybox
-（CI 现场构建，本地复现见 [tools/build-busybox.sh](tools/build-busybox.sh)）：
+## 0.1.4 范围
+
+| 能力 | 支持范围 |
+| --- | --- |
+| 装载 | 静态 PIE、musl 动态 PIE；包含解释器示例；拒绝 glibc 解释器 |
+| 文件和进程 | 文件、目录、pipe、poll/select、单线程快照 fork、exec、wait4、root 路径映射 |
+| 线程 | pthread 形态 clone、guest tid、每线程 TLS、futex WAIT/WAKE；等待时释放共享状态锁 |
+| 网络 | Windows socket2/Winsock IPv4/IPv6 TCP/UDP；有界本地 socketpair；非阻塞 connect、SO_ERROR、超时、半关闭 |
+| 消息 | accept4 地址/flags、sendmsg/recvmsg 的有界 iovec 和 UDP 地址；PEEK/DONTWAIT/NOSIGNAL/TRUNC 子集 |
+| epoll | level-triggered、每实例 1024 watches、dup/close/fd 复用身份、maxevents 轮转；拒绝 ET/ONESHOT/嵌套 |
+| 信号 | trap 安全点、每线程 mask/frame/altstack、tkill/tgkill、SIMD/flags 恢复、等待中 EINTR、有限 SA_RESTART、SIGCHLD |
+| CLI 验收 | BusyBox gzip 解压逐字节校验、tar 提取、wget 实际 HTTP/hash/错误响应、nc 双向 TCP/EOF |
+
+任何 socket/socketpair/epoll fd 存在时，fork 返回 ENOSYS；多线程 fork 返回 EAGAIN。worker exec 或其他 guest 线程仍存活时 exec 返回 ENOSYS。信号不在任意 guest 指令位置抢占，SIGINFO/realtime/job control 等限制见 [NONGOALS](docs/NONGOALS.md) 和 [SYSCALLS](docs/SYSCALLS.md)。
+
+## 构建与质量门禁
+
+构建 Vela 需要 Rust stable 和 Windows MSVC 工具链；Cargo 获取锁定依赖，其中 socket2 提供原生 socket 接口。构建 guest/BusyBox 另需固定 **Zig 0.13.0** 和 MSYS2 的 make/gcc/bzip2/diffutils/curl。
 
 ```powershell
-.\target\release\vela.exe run --soft-tls guest\bin\file-io     # 文件 syscall 全链路
-.\target\release\vela.exe run --soft-tls guest\bin\fs-exec     # pipe -> dup2 -> execve 自重载
-.\target\release\vela.exe run --soft-tls guest\bin\fork-test   # fork -> 管道 -> waitpid
-
-.\target\release\vela.exe doctor    # 环境自检：FSGSBASE / 映射 / guest 清单
+cargo build --workspace
+.\scripts\quality.ps1 -BuildBusybox -Package
 ```
 
-## 能力矩阵
-
-v0.1.3 已发布；Windows CI 验收覆盖下列能力的 guest 用例，具体 syscall 限制见 [docs/SYSCALLS.md](docs/SYSCALLS.md)：
-
-| 能力 | 状态 | 说明 |
-|---|:---:|---|
-| 无 libc 汇编程序 | ✅ | 任何 Linux x86_64 静态 PIE |
-| 静态 musl C 程序 | ✅ | 文件 IO 全链路（stat/getdents64/fcntl） |
-| **动态链接** | ✅ | `ld-musl` 解释器全权重定位（0.0.4 起）；glibc 诚实拒绝 |
-| **busybox 子集** | ✅ | echo/ls/cat/true/false/nproc/env/printf 等 30+ applet |
-| **用户态 fork** | ✅ | fork+waitpid 全语义；不可变段 section 跨 fork 共享，快照体积可观测（0.1.0 起） |
-| **busybox shell** | ✅ | `sh -c` 管道/命令替换/变量展开/重定向 CI 硬门禁（0.1.0 起） |
-| **execve** | ✅ | 进程内重载，fd 跨重载保留；pipe2 管道 |
-| **pthread / futex** | ✅ | musl pthread-shaped clone、每线程 TLS、futex wait/wake；多线程 fork 返回 EAGAIN，worker exec 返回 ENOSYS |
-| **poll / select** | ✅ | 同步文件、标准流、Vela pipe 和 socket；fd 上限 1024；ppoll/pselect6 支持临时 mask 状态 |
-| **syscall 热路径** | ✅ | 岛页跳板（`--trap=auto`），UD2+VEH 兜底；陷阱全程宿主栈 |
-| mmap | ✅ | 匿名 + 文件映射（COW，写不回宿主文件）；SHARED 诚实 ENOSYS |
-| TLS | ✅ | FSGSBASE 硬件路径，缺失时 `--soft-tls` 软件模拟 |
-| 时间 / 熵 / 进程身份 | ✅ | clock/getrandom/uname/auxv/utimensat |
-| 信号投递 | 🟨 | 常用 rt_sigaction/procmask、kill/tgkill、pending 和 trap 安全点 handler；realtime/完整异步 frame 仍受限 |
-| **socket / epoll** | ✅ | Windows Winsock TCP/UDP、AF_UNIX socketpair、poll/select readiness 与 level-triggered epoll |
-| Go 程序 / 32 位 / ARM / 非 Windows 宿主 | ❌ | 见 [docs/NONGOALS.md](docs/NONGOALS.md) |
-
-未实现的 syscall 一律返回 Linux 风格 `-ENOSYS`——行为可预期，而不是崩溃。
-逐条兼容矩阵见 [docs/SYSCALLS.md](docs/SYSCALLS.md)。
-
-## 和 WSL 的区别
-
-| | WSL1 | WSL2 | Vela |
-|---|---|---|---|
-| 机制 | NT 内核 pico driver | 轻量 VM + 真 Linux 内核 | 纯用户态翻译 |
-| 改宿主内核 | 要 | 要 Hyper-V | **不要** |
-| 兼容上限 | 中 | 高 | 低（诚实承认） |
-| 单文件分发 | 否 | 否 | **是**（一个 exe） |
-| 可移植到自主 OS | 否 | 否 | **是**（实现 `Host` trait 即可） |
-
-Vela 的定位不是替代 WSL，而是给 **SpadaOS** 这类自主内核 OS 提供一条
-不动内核的 Linux 生态接入路径，顺带让 Windows 获得一个零安装的 Linux
-二进制启动器。
-
-## 工作原理
-
-1. **patch**：loader 解析 ELF 后，线性走查代码段指令流，把指令边界上的
-   `syscall`（`0F 05`）改写为 `UD2`（`0F 0B`）——不做裸字节匹配，避免
-   误伤指令内部的相同字节。
-2. **陷阱**：`--trap=auto` 时为每个通过校验的 syscall 站点建 RX 岛页
-   跳板（2 字节短跳，保存现场后切宿主栈直调分发器）；校验不过的站点
-   与真实故障走 UD2 + VEH 异常兜底。
-3. **翻译**：`vela-runtime::dispatch` 按 Linux 语义执行——路径交给
-   `vela-fs` 翻译，文件/内存/时钟操作落到 `vela-sys` 的 `Host` trait。
-4. **返回**：结果按 Linux ABI 写回寄存器，异常返回 / 岛内续接回到客户。
-
-安全边界、COW 文件映射、软 TLS、execve 重载、fork 快照的实现细节与决策
-记录：[docs/DESIGN.md](docs/DESIGN.md)。
-
-## CLI 速查
-
-```text
-vela run [options] <linux-elf> [guest-args...]
-vela doctor                          环境自检
-vela --version | --help
-```
-
-| 选项 | 说明 |
-|---|---|
-| `--root <dir>` | 把宿主目录挂为客户根 `/` |
-| `--map <g>=<host>` | 追加前缀映射；未指定 `--root` 时默认兼容 `/mnt/c` → `C:\`，指定 `--root` 后仅保留根映射和显式追加项 |
-| `--env K=V` | 传递/覆盖环境变量；`K=` 表示删除 |
-| `--uid <n>` / `--gid <n>` | 客户身份（默认 1000） |
-| `--interp <path>` | 显式指定动态链接解释器 |
-| `--stack-mb` / `--heap-mb` | 客户栈/堆大小（默认各 8 MiB） |
-| `--soft-tls` | 软件模拟客户 fs 段（FSGSBASE 缺失环境） |
-| `-v` / `VELA_LOG=1` | syscall 日志到 stderr（默认安静，只放行客户 stdout） |
-
-退出码：客户 `exit` 的码；文件缺失 127；ELF 格式错误 1；用法错误 2。
-
-## 测试与 CI
+`quality.ps1` 统一执行 fmt、Clippy、workspace 测试（含宿主源码隔离门禁）、release 构建、guest 重建、完整验收和可选 ZIP。PR、main、分支手动 CI 与 release 使用相同入口。
 
 ```powershell
-.\scripts\verify.ps1        # 一键：构建 + 测试 + guest 验收（Windows）
-.\scripts\verify.ps1 -RequireBusybox -RequireThreads -RequireSignals -RequireNetwork
-cargo test --workspace      # 或仅测试
+# 指定现有二进制和 guest 目录；不通过 cargo 替换待测程序。
+python scripts/acceptance.py --exe target/release/vela.exe --guests guest/bin --busybox --threads --signals --network
 ```
 
-覆盖：ELF 解析与拒绝路径、syscall patch、dispatch 语义翻译、路径翻译、
-soft-tls 解码表驱动回归，以及端到端验收（hello / torture / hello-dyn /
-fs-exec / pipe 对 / busybox echo·nproc·true）。CI 在 Windows runner 上执行
-同一流程并现场构建 busybox（msys2 make + zig cc musl），额外验收 root 下的
-grep/find/tar/gzip，以及重复运行的 pthread、signal 和 TCP/UDP/socketpair/epoll guest。
-tag 发布流程还检查版本一致性、ZIP 资产清单、解压后的 guest smoke，并上传 ZIP 和 SHA-256 文件。
+每个 guest 有进程级 deadline，原始 stdout/stderr、命令、退出码和二进制 hash 保存到 `release/validation`。`scripts/package.py` 打包 ZIP 与 SHA-256，解压到源码目录之外，用包内程序执行同一完整验收；证据在 `release/package-validation` 和 `release/package.json`。
 
-## 项目结构
+## 文档
 
-```text
-crates/
-  vela-abi       Linux x86_64 ABI：syscall 号、errno、结构体（10 个子模块）
-  vela-sys       Host trait + Windows / linux_dev 实现 + VEH 陷阱 + soft-tls
-  vela-loader    ELF64 解析校验、加载、syscall patch
-  vela-runtime   GuestProcess 与 dispatch：Linux 语义 -> Host 调用
-  vela-fs        Linux 路径 -> 宿主原生路径翻译
-  vela-cli       CLI + execve 重载编排 + guest 生成器
-guest/           验收用 Linux ELF（源码 + 产物；busybox 由 CI 构建）
-tools/           busybox 构建脚本
-docs/            DESIGN / SYSCALLS / NONGOALS / HOST / bench / plans
-scripts/         verify.ps1 / verify.sh
-.github/         CI（Windows runner）
-```
-
-依赖方向单向：`cli -> loader -> runtime -> fs`，宿主差异全部收敛在
-`vela-sys`；runtime 以上禁止 `cfg(target_os)`。
-
-## 安全
-
-> [!WARNING]
-> Vela is not a security sandbox. Guest code shares the host process.
-
-Linux 程序与 `vela.exe` 同进程、同权限，可访问用户能访问的一切，不要把
-Vela 当沙箱用。杀毒软件可能对"进程内改可执行内存再执行"敏感：开发时若
-被拦，给 `vela.exe` 加排除（Vela 不做任何加壳混淆）。漏洞报告流程见
-[SECURITY.md](SECURITY.md)。
-
-## 参与
-
-提交信息遵循 [Conventional Commits](CONTRIBUTING.md)。核心规则：
-
-- 主路径在 Windows 上验收（syscall patch + VEH 是 Windows 专属机制）。
-- 没有 Windows 也能贡献：ELF 解析器、vela-abi、单元测试可 linux dev 构建。
-- 提交前跑 `.\scripts\verify.ps1`；代码标识符全英文；宿主差异只进 vela-sys。
-- 零第三方依赖是 v0 硬约束，新增依赖先开 issue。
-
-## 路线
-
-- **[v0.1.3（已发布，2026-10-11）](https://github.com/SpadaOS/vela/releases/tag/v0.1.3)**：Windows 运行时加入 TCP/UDP/socketpair/epoll 与 trap 安全点 signal handler、mask/pending 和 sigreturn，保留 pthread、futex、fork/exec、poll/select 和 BusyBox grep/find/tar/gzip 验收；完整异步信号、MAP_SHARED、glibc、SCM_RIGHTS 和非 Windows host 仍不在范围内。版本还保留宿主栈切换、fork 不可变段共享与 mprotect 账本、BusyBox `sh -c` 闭环、utimensat、SIGCHLD 记账、Host Trap/Proc 契约、doctor 2.0、Ctrl+C 进程树和 SECURITY.md。唯一可运行宿主：Windows。
-- 下一步候选：fork 脏页跟踪、MAP_SHARED 匿名共享、完整异步信号语义
-- v1：SpadaOS `Host` 填满（等 SpadaOS 内核具备用户态 map/file 能力后）、
-  外部 X server 通路
-
-版本计划与历史决策：[docs/plans/](docs/plans/)、[docs/DESIGN.md](docs/DESIGN.md)。
-
-## 许可
-
-Apache-2.0（兼容层许可与 SpadaOS 内核许可分离，见 [LICENSE](LICENSE)）。
-
-\r\n
+- [宿主接口](docs/HOST.md)、[设计](docs/DESIGN.md)、[syscall 矩阵](docs/SYSCALLS.md)
+- [guest 构建与验收](guest/README.md)、[版本记录](CHANGELOG.md)、[贡献](CONTRIBUTING.md)
+- [支持边界](docs/NONGOALS.md)、[性能观测](docs/bench.md)、[许可证](LICENSE)

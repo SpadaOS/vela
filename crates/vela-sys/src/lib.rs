@@ -433,6 +433,10 @@ pub type IslandPlan = (usize, usize, Vec<(u64, u64)>);
 /// 组 6 trap：客户执行与 syscall 陷阱机制（VEH / 岛页 / 未来宿主机制）。
 /// 默认全部未实现——仅真正能执行客户的宿主填实。
 pub trait HostTrap: Send + Sync + 'static {
+    fn save_signal_fp(&self, _frame: &TrapFrame) -> Vec<u8> {
+        Vec::new()
+    }
+    fn restore_signal_fp(&self, _frame: &mut TrapFrame, _state: &[u8]) {}
     /// 安装陷阱机制并注册 dispatch 回调。幂等。
     fn install_trap(&self, f: TrapFn) -> Result<(), HostError> {
         let _ = f;
@@ -514,6 +518,7 @@ pub trait HostTrap: Send + Sync + 'static {
 /// 组 7 proc：进程生命周期原语（用户态 fork 协议的宿主侧，T1.2）。
 /// 句柄 token 为 isize（宿主原始值，仅可传回同宿主方法；跨进程继承后同值）。
 pub trait HostProc: Send + Sync + 'static {
+    fn set_guest_tid(&self, _tid: u32) {}
     fn current_pid(&self) -> u32 {
         std::process::id()
     }
@@ -549,6 +554,8 @@ pub trait HostProc: Send + Sync + 'static {
 
     /// Wait for a guest thread to leave.  A zero timeout polls; `None` waits
     /// indefinitely.
+    fn reap_guest_threads(&self) {}
+
     fn join_guest_thread(
         &self,
         _tid: HostTid,
@@ -718,6 +725,9 @@ pub trait HostMem: Send + Sync + 'static {
 
 /// 组 2 file：文件系统与 stdio。
 pub trait HostFileOps: Send + Sync + 'static {
+    fn is_terminal(&self, _file: &HostFile) -> bool {
+        false
+    }
     fn open(&self, path: &HostPath, opt: HostOpen) -> Result<HostFile, HostError>;
     /// 打开目录做快照遍历（O_DIRECTORY 语义）。
     fn open_dir(&self, path: &HostPath) -> Result<HostDir, HostError>;

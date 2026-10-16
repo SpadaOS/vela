@@ -6,7 +6,8 @@ use vela_abi as abi;
 use vela_sys::{Host, HostError, HostFile, HostFileKind, HostOpen, HostPath, HostStat};
 
 use crate::{
-    host_err_to_errno, read_cstr, read_guest, read_guest_mut, write_guest, GuestFd, GuestProcess,
+    host_err_to_errno, read_cstr, read_guest, validate_guest_write, write_guest, GuestFd,
+    GuestProcess,
 };
 
 const MAX_POLL_FDS: u64 = 1024;
@@ -26,7 +27,9 @@ pub(super) fn sys_poll(
     if nfds > MAX_POLL_FDS || timeout_ms > i32::MAX as u64 && timeout_ms != u64::MAX {
         return -(abi::EINVAL as i64);
     }
-    let timeout = if timeout_ms == u64::MAX {
+    let timeout = if proc.nonblocking_step {
+        0
+    } else if timeout_ms == u64::MAX {
         -1
     } else {
         timeout_ms as i32
@@ -181,7 +184,9 @@ fn sys_select_inner(
     }
     let n = nfds as usize;
     let (read_ptr, write_ptr, except_ptr, tv_ptr) = (a[1], a[2], a[3], a[4]);
-    let timeout = if let Some(value) = timeout_override {
+    let timeout = if proc.nonblocking_step {
+        0
+    } else if let Some(value) = timeout_override {
         value
     } else if tv_ptr == 0 {
         -1
@@ -350,8 +355,8 @@ pub(super) fn sys_write(
             match read_guest(proc, buf, len as usize) {
                 Ok(data) => {
                     let result = match &f.0 {
-                        HostFileKind::Socket(s) => host.socket_send(s, data, 0),
-                        _ => host.write(f, data),
+                        HostFileKind::Socket(s) => host.socket_send(s, &data, 0),
+                        _ => host.write(f, &data),
                     };
                     match result {
                         Ok(n) => n as i64,
@@ -393,14 +398,32 @@ pub(super) fn sys_read(
         // 管道读端：空管道真实阻塞（宿主管道语义），写端全关 → EOF（0）
         Some(GuestFd::PipeWrite(_)) => -(abi::EBADF as i64), // 写端不可读
         Some(GuestFd::PipeRead(f)) | Some(GuestFd::Host(f)) => {
-            match read_guest_mut(proc, buf, len as usize) {
-                Ok(dst) => match &f.0 {
-                    HostFileKind::Socket(s) => host.socket_recv(s, dst, 0),
-                    _ => host.read(f, dst),
+            if proc.nonblocking_step && matches!(&f.0, HostFileKind::Pipe(_)) {
+                let mut ready = [vela_sys::HostPollFd {
+                    file: f,
+                    events: abi::POLLIN,
+                    revents: 0,
+                }];
+                if host.poll(&mut ready, 0).unwrap_or(0) == 0 {
+                    return -(abi::EAGAIN as i64);
                 }
-                .map(|n| n as i64)
-                .unwrap_or_else(|e| -(host_err_to_errno(&e) as i64)),
-                Err(e) => -(e as i64),
+            }
+            if len > 16 * 1024 * 1024 {
+                return -(abi::EINVAL as i64);
+            }
+            if validate_guest_write(proc, buf, len as usize).is_err() {
+                return -(abi::EFAULT as i64);
+            }
+            let mut data = vec![0; len as usize];
+            let result = match &f.0 {
+                HostFileKind::Socket(socket) => host.socket_recv(socket, &mut data, 0),
+                _ => host.read(f, &mut data),
+            };
+            match result {
+                Ok(n) => write_guest(proc, buf, &data[..n])
+                    .map(|_| n as i64)
+                    .unwrap_or_else(|e| -(e as i64)),
+                Err(error) => -(host_err_to_errno(&error) as i64),
             }
         }
         Some(GuestFd::Epoll(_)) => -(abi::EBADF as i64),
@@ -411,70 +434,134 @@ fn write_zeros(proc: &GuestProcess, addr: u64, len: usize) -> Result<(), i32> {
     write_guest(proc, addr, &vec![0u8; len])
 }
 
+pub(super) fn sys_readv(
+    proc: &mut GuestProcess,
+    host: &dyn Host,
+    fd: u64,
+    iov: u64,
+    count: u64,
+) -> i64 {
+    if count > 1024 {
+        return -(abi::EINVAL as i64);
+    }
+    let mut buffers = Vec::new();
+    let mut total = 0usize;
+    for index in 0..count {
+        let Some(ptr) = iov.checked_add(index * 16) else {
+            return -(abi::EFAULT as i64);
+        };
+        let raw = match read_guest(proc, ptr, 16) {
+            Ok(raw) => raw,
+            Err(error) => return -(error as i64),
+        };
+        let base = rd_u64(&raw, 0);
+        let size = rd_u64(&raw, 8);
+        if size > 16 * 1024 * 1024 || total as u64 + size > 16 * 1024 * 1024 {
+            return -(abi::EINVAL as i64);
+        }
+        if validate_guest_write(proc, base, size as usize).is_err() {
+            return -(abi::EFAULT as i64);
+        }
+        buffers.push((base, size as usize));
+        total += size as usize;
+    }
+    let mut data = vec![0; total];
+    let received = match proc.fds.get(fd as i32) {
+        Some(GuestFd::Null) => Ok(0),
+        Some(GuestFd::Zero) => Ok(total),
+        Some(GuestFd::Host(file)) | Some(GuestFd::PipeRead(file)) => {
+            if proc.nonblocking_step && matches!(&file.0, HostFileKind::Pipe(_)) {
+                let mut ready = [vela_sys::HostPollFd {
+                    file,
+                    events: abi::POLLIN,
+                    revents: 0,
+                }];
+                if host.poll(&mut ready, 0).unwrap_or(0) == 0 {
+                    return -(abi::EAGAIN as i64);
+                }
+            }
+            match &file.0 {
+                HostFileKind::Socket(socket) => host.socket_recv(socket, &mut data, 0),
+                _ => host.read(file, &mut data),
+            }
+        }
+        _ => return -(abi::EBADF as i64),
+    };
+    let received = match received {
+        Ok(n) => n,
+        Err(error) => return -(host_err_to_errno(&error) as i64),
+    };
+    let mut copied = 0;
+    for (base, size) in buffers {
+        let count = size.min(received - copied);
+        if let Err(error) = write_guest(proc, base, &data[copied..copied + count]) {
+            return -(error as i64);
+        }
+        copied += count;
+        if copied == received {
+            break;
+        }
+    }
+    received as i64
+}
+
 pub(super) fn sys_writev(
     proc: &mut GuestProcess,
     host: &dyn Host,
     fd_raw: u64,
     iov: u64,
-    iovcnt_raw: u64,
+    count: u64,
 ) -> i64 {
-    let fd = fd_raw as u32 as i32;
-    let iovcnt = iovcnt_raw as u32 as i32;
-    if !(0..=1024).contains(&iovcnt) {
+    if count > 1024 {
         return -(abi::EINVAL as i64);
     }
-    if iovcnt == 0 {
+    let fd = fd_raw as i32;
+    match proc.fds.get(fd) {
+        None
+        | Some(GuestFd::Reserved)
+        | Some(GuestFd::PipeRead(_))
+        | Some(GuestFd::HostDir(_))
+        | Some(GuestFd::Epoll(_)) => return -(abi::EBADF as i64),
+        _ => {}
+    }
+    let mut payload = Vec::new();
+    for index in 0..count {
+        let Some(ptr) = iov.checked_add(index * 16) else {
+            return -(abi::EFAULT as i64);
+        };
+        let ent = match read_guest(proc, ptr, 16) {
+            Ok(ent) => ent,
+            Err(error) => return -(error as i64),
+        };
+        let (base, len) = (rd_u64(&ent, 0), rd_u64(&ent, 8));
+        if len > 16 * 1024 * 1024 || payload.len() as u64 + len > 16 * 1024 * 1024 {
+            return -(abi::EINVAL as i64);
+        }
+        match read_guest(proc, base, len as usize) {
+            Ok(data) => payload.extend_from_slice(&data),
+            Err(error) => return -(error as i64),
+        }
+    }
+    if payload.is_empty() {
         return 0;
     }
-    match proc.fds.get(fd) {
-        None | Some(GuestFd::Reserved) => -(abi::EBADF as i64),
-        Some(GuestFd::HostDir(_)) => -(abi::EBADF as i64),
-        Some(GuestFd::Null) | Some(GuestFd::Zero) => {
-            // /dev/null 语义：校验可读后返回总长
-            let mut total = 0i64;
-            for i in 0..iovcnt as u64 {
-                match read_guest(proc, iov + i * 16, 16) {
-                    Ok(ent) => total += rd_u64(ent, 8) as i64,
-                    Err(e) => return -(e as i64),
-                }
+    let result = match proc.fds.get(fd) {
+        Some(GuestFd::Null) | Some(GuestFd::Zero) => return payload.len() as i64,
+        Some(GuestFd::Host(file)) | Some(GuestFd::PipeWrite(file)) => match &file.0 {
+            HostFileKind::Socket(socket) => host.socket_send(socket, &payload, 0),
+            _ => host.write(file, &payload),
+        },
+        _ => unreachable!(),
+    };
+    match result {
+        Ok(n) => n as i64,
+        Err(error) => {
+            let errno = host_err_to_errno(&error);
+            if errno == abi::EPIPE {
+                proc.signals.pending |= 1 << (abi::SIGPIPE - 1);
             }
-            total
+            -(errno as i64)
         }
-        Some(GuestFd::PipeRead(_)) => -(abi::EBADF as i64),
-        // 管道写端走宿主管道（阻塞写 + OS 容量管理），与文件同路径
-        Some(GuestFd::PipeWrite(f)) | Some(GuestFd::Host(f)) => {
-            let mut total = 0i64;
-            for i in 0..iovcnt as u64 {
-                let ent = match read_guest(proc, iov + i * 16, 16) {
-                    Ok(e) => e,
-                    Err(e) => return -(e as i64),
-                };
-                let (base, len) = (rd_u64(ent, 0), rd_u64(ent, 8));
-                if len == 0 {
-                    continue;
-                }
-                let data = match read_guest(proc, base, len as usize) {
-                    Ok(d) => d,
-                    Err(e) => return -(e as i64),
-                };
-                let result = match &f.0 {
-                    HostFileKind::Socket(s) => host.socket_send(s, data, 0),
-                    _ => host.write(f, data),
-                };
-                match result {
-                    Ok(n) => total += n as i64,
-                    Err(e) => {
-                        let errno = host_err_to_errno(&e);
-                        if errno == abi::EPIPE {
-                            proc.signals.pending |= 1u64 << (abi::SIGPIPE - 1);
-                        }
-                        return -(errno as i64);
-                    }
-                }
-            }
-            total
-        }
-        Some(GuestFd::Epoll(_)) => -(abi::EBADF as i64),
     }
 }
 
@@ -937,8 +1024,9 @@ pub(super) fn sys_fcntl(
         }
         abi::F_GETFL => decode_status(proc.fds.get_flags(fd).unwrap_or(0)) as i64,
         abi::F_SETFL => {
-            let mask = (abi::O_APPEND | abi::O_NONBLOCK | abi::O_RDWR | abi::O_WRONLY) as u32;
-            let new_status = (arg as u32) & mask;
+            let mask = (abi::O_APPEND | abi::O_NONBLOCK) as u32;
+            let current = decode_status(proc.fds.get_flags(fd).unwrap_or(0));
+            let new_status = (current & !mask) | ((arg as u32) & mask);
             proc.fds
                 .update_flags(fd, |v| (v & !(0x1_FFFF << 8)) | (new_status << 8));
             let socket = match proc.fds.get(fd) {
@@ -965,7 +1053,7 @@ pub(super) fn sys_fcntl(
 /// 其余（含 TCGETS/TCSETS）返回 ENOTTY——诚实声明「不是终端」，musl isatty 据此走非 tty 路径。
 pub(super) fn sys_ioctl(
     proc: &GuestProcess,
-    _host: &dyn Host,
+    host: &dyn Host,
     fd_raw: u64,
     cmd: u64,
     arg: u64,
@@ -975,6 +1063,10 @@ pub(super) fn sys_ioctl(
         return -(abi::EBADF as i64);
     }
     if cmd == abi::TIOCGWINSZ {
+        match proc.fds.get(fd) {
+            Some(GuestFd::Host(file)) if host.is_terminal(file) => {}
+            _ => return -(abi::ENOTTY as i64),
+        }
         // struct winsize { ws_row, ws_col, ws_xpixel, ws_ypixel } = 4 × u16
         let ws: [u8; 8] = [25, 0, 80, 0, 0, 0, 0, 0]; // row=25, col=80, 像素位 0
         return match write_guest(proc, arg, &ws) {
@@ -1002,6 +1094,12 @@ fn positioned(
     if !matches!(proc.fds.get(fd), Some(GuestFd::Host(_))) {
         return -(abi::ESPIPE as i64); // 非 Host fd（含目录/伪设备）不支持定位
     }
+    if len > 16 * 1024 * 1024 {
+        return -(abi::EINVAL as i64);
+    }
+    if !is_write && validate_guest_write(proc, buf, len as usize).is_err() {
+        return -(abi::EFAULT as i64);
+    }
     // 段 1：保存当前游标
     let cur = match proc.fds.get(fd) {
         Some(GuestFd::Host(f)) => host.seek(f, 0, 1),
@@ -1023,7 +1121,7 @@ fn positioned(
         match read_guest(proc, buf, len as usize) {
             Ok(data) => match proc.fds.get(fd) {
                 Some(GuestFd::Host(f)) => host
-                    .write(f, data)
+                    .write(f, &data)
                     .map(|n| n as i64)
                     .unwrap_or_else(|e| -(host_err_to_errno(&e) as i64)),
                 _ => unreachable!(),
@@ -1031,15 +1129,15 @@ fn positioned(
             Err(e) => -(e as i64),
         }
     } else {
-        match read_guest_mut(proc, buf, len as usize) {
-            Ok(dst) => match proc.fds.get(fd) {
-                Some(GuestFd::Host(f)) => host
-                    .read(f, dst)
-                    .map(|n| n as i64)
-                    .unwrap_or_else(|e| -(host_err_to_errno(&e) as i64)),
-                _ => unreachable!(),
+        let mut data = vec![0; len as usize];
+        match proc.fds.get(fd) {
+            Some(GuestFd::Host(file)) => match host.read(file, &mut data) {
+                Ok(n) => write_guest(proc, buf, &data[..n])
+                    .map(|_| n as i64)
+                    .unwrap_or_else(|e| -(e as i64)),
+                Err(error) => -(host_err_to_errno(&error) as i64),
             },
-            Err(e) => -(e as i64),
+            _ => unreachable!(),
         }
     };
     // 段 4：恢复游标（尽力而为）
@@ -1335,6 +1433,7 @@ fn dup_impl(
     if cloexec {
         proc.fds.update_flags(fd, |v| v | 1);
     }
+    proc.fds.link_dup(oldfd, fd);
     fd as i64
 }
 

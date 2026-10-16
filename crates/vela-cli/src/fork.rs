@@ -25,7 +25,7 @@ use vela_sys::{
 use crate::GuestState;
 
 const META_MAGIC: u32 = 0x5645_4C46; // "VELF"
-const META_VERSION: u32 = 3; // 0.1.0 T3.2：+mprotect 账本
+const META_VERSION: u32 = 4; // 0.1.0 T3.2：+mprotect 账本
 /// Linux SIGCHLD；musl fork() = clone(SIGCHLD, 0)。
 pub const SIGCHLD_FLAGS: u64 = 17;
 
@@ -40,36 +40,24 @@ pub const SIGCHLD_FLAGS: u64 = 17;
 /// dst 为本进程刚映射的可写视图且长度 ≥ len。
 unsafe fn copy_readable(src: u64, dst: *mut u8, len: u64, ledger: &[vela_runtime::ProtOverride]) {
     let end = src + len;
-    let mut holes: Vec<(u64, u64)> = ledger
-        .iter()
-        .filter(|p| p.prot == 0 && p.start < end && p.start + p.len > src)
-        .map(|p| (p.start.max(src), (p.start + p.len).min(end)))
-        .collect();
-    holes.sort_unstable();
-    // 合并重叠洞，顺序输出可读子区间
-    let mut cur = src;
-    for (hs, he) in holes {
-        if hs >= he || he <= cur {
-            continue;
-        }
-        let hs = hs.max(cur);
-        if hs > cur {
-            // SAFETY: [cur, hs) 已确认可读；dst 偏移区间在视图内
+    let mut cursor = src;
+    while cursor < end {
+        let next = ((cursor & !4095) + 4096).min(end);
+        // Only the latest protection applies. An old PROT_NONE entry must
+        // not punch a zero-filled hole in a subsequently writable page.
+        let readable = ledger
+            .iter()
+            .rev()
+            .find(|p| cursor >= p.start && cursor < p.start.saturating_add(p.len))
+            .is_none_or(|p| p.prot & 1 != 0);
+        if readable {
             std::ptr::copy_nonoverlapping(
-                cur as *const u8,
-                dst.add((cur - src) as usize),
-                (hs - cur) as usize,
+                cursor as *const u8,
+                dst.add((cursor - src) as usize),
+                (next - cursor) as usize,
             );
         }
-        cur = he;
-    }
-    if cur < end {
-        // SAFETY: [cur, end) 已确认可读；dst 偏移区间在视图内
-        std::ptr::copy_nonoverlapping(
-            cur as *const u8,
-            dst.add((cur - src) as usize),
-            (end - cur) as usize,
-        );
+        cursor = next;
     }
 }
 
@@ -190,6 +178,8 @@ struct FdEntrySer {
 }
 
 struct Meta {
+    dispositions: [vela_runtime::SignalDisposition; 64],
+    blocked: u64,
     ppid: u32,
     uid: u32,
     gid: u32,
@@ -288,6 +278,13 @@ fn encode(meta: &Meta) -> Vec<u8> {
     let mut w = W::new();
     w.u32(META_MAGIC);
     w.u32(META_VERSION);
+    w.u64(meta.blocked);
+    for d in meta.dispositions {
+        w.u64(d.handler);
+        w.u64(d.flags);
+        w.u64(d.restorer);
+        w.u64(d.mask);
+    }
     w.u32(meta.ppid);
     w.u32(meta.uid);
     w.u32(meta.gid);
@@ -361,6 +358,14 @@ fn decode(b: &[u8]) -> Result<Meta, ()> {
     if r.u32()? != META_MAGIC || r.u32()? != META_VERSION {
         return Err(());
     }
+    let blocked = r.u64()?;
+    let mut dispositions = [vela_runtime::SignalDisposition::default(); 64];
+    for d in &mut dispositions {
+        d.handler = r.u64()?;
+        d.flags = r.u64()?;
+        d.restorer = r.u64()?;
+        d.mask = r.u64()?;
+    }
     let ppid = r.u32()?;
     let uid = r.u32()?;
     let gid = r.u32()?;
@@ -431,6 +436,8 @@ fn decode(b: &[u8]) -> Result<Meta, ()> {
         prots.push((r.u64()?, r.u64()?, r.u32()? as u8));
     }
     Ok(Meta {
+        dispositions,
+        blocked,
         ppid,
         uid,
         gid,
@@ -643,6 +650,17 @@ fn quote_windows_arg(arg: &str) -> String {
 }
 
 pub fn do_fork(st: &mut GuestState, args: &[u64; 6], frame: &mut TrapFrame) -> Result<u32, i64> {
+    if st.proc.fds.iter().any(|(_, entry)| {
+        matches!(
+            entry,
+            GuestFd::Epoll(_) | GuestFd::Host(HostFile(HostFileKind::Socket(_)))
+        )
+    }) {
+        if crate::logx::enabled() {
+            eprintln!("[vela] fork: network and epoll descriptors cannot be inherited yet");
+        }
+        return Err(-(abi::ENOSYS as i64));
+    }
     let _ = args;
     let eio = -(vela_abi::EIO as i64);
     // 诊断：fork 每步失败点（临时；发版前降为 -v 日志）
@@ -803,6 +821,8 @@ pub fn do_fork(st: &mut GuestState, args: &[u64; 6], frame: &mut TrapFrame) -> R
     let ctx_bytes = st.host.fork_child_context(frame);
 
     let meta = Meta {
+        dispositions: st.proc.signals.dispositions,
+        blocked: st.proc.signals.blocked,
         ppid: st.host.current_pid(),
         uid: st.proc.uid,
         gid: st.proc.gid,
@@ -989,6 +1009,7 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
             let irebuild = rebuild(i);
             load.interp = Some(InterpImage {
                 bias: irebuild.bias,
+                segments: irebuild.segments,
                 entry: irebuild.entry,
                 span: irebuild.span,
                 exec_ranges: irebuild.exec_ranges,
@@ -998,7 +1019,8 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
 
         // 4. 组装 GuestProcess（pid = 真实 Windows pid；ppid 来自父）
         let mut proc = GuestProcess::new(host.current_pid(), load);
-        proc.tid = host.current_tid();
+        host.set_guest_tid(proc.pid);
+        proc.tid = proc.pid;
         crate::NEXT_GUEST_TID.store(
             proc.tid.saturating_add(1),
             std::sync::atomic::Ordering::Relaxed,
@@ -1009,6 +1031,8 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
         proc.fs_base = meta.fs_base;
         proc.brk_start = meta.brk_start;
         proc.brk = meta.brk;
+        proc.signals.dispositions = meta.dispositions;
+        proc.signals.blocked = meta.blocked;
         proc.cwd = meta.cwd.clone();
         proc.mem = mem;
         if meta.heap_len > 0 {
@@ -1118,9 +1142,10 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
             copied_bytes: std::cell::Cell::new(0),
             trap: crate::TrapBackend::Auto, // 父进程已建岛（快照含岛页），子进程沿用
         });
-        let ptr = Box::into_raw(state);
+        let ptr = Box::into_raw(Box::new(vela_runtime::ProcessShared::new(*state)));
         crate::GUEST.store(ptr, std::sync::atomic::Ordering::Relaxed);
-        let st = unsafe { &*ptr };
+        let guard = unsafe { &*ptr }.lock().unwrap_or_else(|p| p.into_inner());
+        let st = &*guard;
         // The fork child is a fresh native process, so the per-thread VEH
         // scratch allocated by the parent is not present in its TLS slot.
         // Allocate it before resuming guest code; otherwise the first UD2
@@ -1158,7 +1183,9 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
             );
         }
         // SAFETY: 客户栈/代码/堆均已恢复到原地址且登记
-        unsafe { st.host.resume_child(&meta.ctx) }
+        let resume_host = st.host.clone();
+        drop(guard);
+        unsafe { resume_host.resume_child(&meta.ctx) }
     }
     #[cfg(not(windows))]
     {
@@ -1171,6 +1198,17 @@ pub fn internal_fork_main(opts: &crate::RunOpts, meta_handle: isize) -> i32 {
 
 /// wait4(61) 真实化（CLI trap 层）：等子进程句柄，编码 Linux status。
 /// status/rusage 由本函数写入客户内存，返回等待到的子 pid（WNOHANG 无子退出 → 0）。
+pub fn poll_children(st: &mut GuestState) {
+    for (&pid, &handle) in st.children.borrow().iter() {
+        if !st.proc.notified_children.contains(&pid)
+            && matches!(st.host.wait(handle, 0), Ok(Some(_)))
+        {
+            st.proc.notified_children.insert(pid);
+            st.proc.signals.pending |= 1 << (abi::SIGCHLD - 1);
+        }
+    }
+}
+
 pub fn do_wait4(st: &mut GuestState, args: &[u64; 6]) -> i64 {
     let (pid, stat_ptr, opts, _r0, rusage, _r5) =
         (args[0] as i64, args[1], args[2], args[3], args[4], args[5]);
@@ -1182,7 +1220,11 @@ pub fn do_wait4(st: &mut GuestState, args: &[u64; 6]) -> i64 {
             let p = pid as u32;
             children.contains_key(&p).then_some(p)
         } else if pid == -1 {
-            children.keys().next().copied()
+            children
+                .iter()
+                .find(|(_, h)| matches!(st.host.wait(**h, 0), Ok(Some(_))))
+                .map(|(p, _)| *p)
+                .or_else(|| children.keys().next().copied())
         } else {
             None
         }
@@ -1218,6 +1260,7 @@ pub fn do_wait4(st: &mut GuestState, args: &[u64; 6]) -> i64 {
         let _ = vela_runtime::write_guest(&st.proc, rusage, &[0u8; 144]);
     }
     st.children.borrow_mut().remove(&child);
+    st.proc.notified_children.remove(&child);
     st.host.close_handle(handle);
     // T3.6 SIGCHLD 记账：wait 回收即置位（不投递 handler，NONGOALS）
     st.sigchld_reaped.set(st.sigchld_reaped.get() + 1);

@@ -283,11 +283,11 @@ fn setup(len: usize) -> (MockHost, GuestProcess, usize) {
         phnum: 1,
         phentsize: 56,
         segments: vec![Segment {
-            vaddr: 0x4000_0000,
+            vaddr: addr as u64,
             host_addr: addr,
             file_size: len as u64,
             mem_size: len as u64,
-            prot: 5,
+            prot: 3,
         }],
         exec_ranges: vec![],
         syscall_sites: vec![],
@@ -1154,7 +1154,7 @@ fn fcntl_flags_roundtrip() {
 }
 
 #[test]
-fn ioctl_tiocgwinsz_returns_winsize() {
+fn ioctl_tiocgwinsz_rejects_redirected_stdio() {
     let (host, mut proc, addr) = setup(4096);
     let buf = (addr + 0x100) as u64;
     let r = dispatch(
@@ -1163,11 +1163,7 @@ fn ioctl_tiocgwinsz_returns_winsize() {
         abi::SYS_IOCTL,
         [1, abi::TIOCGWINSZ, buf, 0, 0, 0],
     );
-    assert_eq!(r, 0);
-    // SAFETY: buf 为 mock 分配的可写内存
-    let row = unsafe { std::ptr::read_unaligned(buf as *const u16) };
-    let col = unsafe { std::ptr::read_unaligned((buf + 2) as *const u16) };
-    assert_eq!((row, col), (25, 80));
+    assert_eq!(r, -(abi::ENOTTY as i64));
     // TCGETS 诚实返回 ENOTTY；坏 fd 返回 EBADF
     let r = dispatch(
         &mut proc,
@@ -1183,6 +1179,47 @@ fn ioctl_tiocgwinsz_returns_winsize() {
         [99, abi::TIOCGWINSZ, buf, 0, 0, 0],
     );
     assert_eq!(r, -(abi::EBADF as i64));
+}
+
+#[test]
+fn guest_buffers_obey_latest_protection_and_page_boundaries() {
+    let (host, mut proc, addr) = setup(8192);
+    proc.prot_ledger.push(vela_runtime::ProtOverride {
+        start: addr as u64,
+        len: 8192,
+        prot: 0,
+    });
+    assert_eq!(
+        vela_runtime::read_guest(&proc, addr as u64, 1),
+        Err(abi::EFAULT)
+    );
+    assert_eq!(
+        dispatch(
+            &mut proc,
+            &host,
+            abi::SYS_GETRANDOM,
+            [addr as u64, 16, 0, 0, 0, 0]
+        ),
+        -(abi::EFAULT as i64)
+    );
+    proc.prot_ledger.push(vela_runtime::ProtOverride {
+        start: addr as u64,
+        len: 4096,
+        prot: 3,
+    });
+    assert!(vela_runtime::write_guest(&proc, addr as u64, b"restored").is_ok());
+    assert_eq!(
+        vela_runtime::read_guest(&proc, addr as u64, 8).unwrap(),
+        b"restored"
+    );
+    assert_eq!(
+        vela_runtime::read_guest(&proc, addr as u64 + 4090, 16),
+        Err(abi::EFAULT)
+    );
+    assert_eq!(
+        vela_runtime::write_guest(&proc, addr as u64 + 4090, &[0; 16]),
+        Err(abi::EFAULT)
+    );
 }
 
 // ---------------------------------------------------------------- openat dirfd

@@ -8,8 +8,8 @@ pub use mem::{InterpImage, LoadedImage, MemRange, Segment};
 pub use syscalls::dispatch;
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use vela_abi as abi;
 use vela_sys::{GuestRegs, Host, HostDir, HostError, HostFile, HostProt};
@@ -52,7 +52,8 @@ pub struct EpollWatch {
 
 #[derive(Debug, Default)]
 pub struct EpollState {
-    pub watches: BTreeMap<i32, EpollWatch>,
+    pub watches: BTreeMap<(i32, u64), EpollWatch>,
+    pub cursor: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -73,12 +74,14 @@ pub struct SignalState {
 /// A software signal frame saved at a trap safe point.  The host trap layer
 /// owns the live register reference; the runtime keeps the previous snapshot
 /// so `rt_sigreturn` can hand it back without depending on a Windows CONTEXT.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct SignalFrame {
     pub regs: GuestRegs,
     pub e_flags: u64,
     pub blocked: u64,
     pub rsp: u64,
+    pub fp_state: Vec<u8>,
+    pub alt_stack: Option<(u64, u64, i32)>,
 }
 
 impl Default for SignalState {
@@ -92,13 +95,17 @@ impl Default for SignalState {
 }
 
 impl SignalState {
+    pub fn ignored(&self, sig: usize) -> bool {
+        let handler = self.dispositions[sig - 1].handler;
+        handler == abi::SIG_IGN || handler == abi::SIG_DFL && matches!(sig, 17 | 18 | 23 | 28)
+    }
+
     pub fn reset_for_exec(&mut self) {
         for disposition in &mut self.dispositions {
             if disposition.handler != abi::SIG_IGN {
                 *disposition = SignalDisposition::default();
             }
         }
-        self.pending = 0;
     }
 }
 
@@ -108,6 +115,8 @@ pub struct FdTable {
     /// 每 fd 的标志记账（fcntl）：bit0 = FD_CLOEXEC，bits 8..24 = status flags
     /// （O_APPEND/O_NONBLOCK/O_ACCMODE），其余保留。
     flags: BTreeMap<i32, u32>,
+    identities: BTreeMap<i32, u64>,
+    next_identity: u64,
 }
 
 impl FdTable {
@@ -125,9 +134,12 @@ impl FdTable {
         let mut f = FdTable {
             table: t,
             flags: BTreeMap::new(),
+            ..FdTable::default()
         };
         for fd in 0..3 {
             f.flags.insert(fd, (abi::O_RDWR as u32) << 8);
+            f.next_identity += 1;
+            f.identities.insert(fd, f.next_identity);
         }
         f
     }
@@ -143,6 +155,7 @@ impl FdTable {
 
     pub fn remove(&mut self, fd: i32) -> Option<GuestFd> {
         self.flags.remove(&fd);
+        self.identities.remove(&fd);
         self.table.remove(&fd)
     }
 
@@ -153,6 +166,8 @@ impl FdTable {
             fd += 1;
         }
         self.table.insert(fd, entry);
+        self.next_identity += 1;
+        self.identities.insert(fd, self.next_identity);
         fd
     }
 
@@ -160,15 +175,36 @@ impl FdTable {
     pub fn insert_at(&mut self, fd: i32, entry: GuestFd) {
         self.flags.remove(&fd);
         self.table.insert(fd, entry);
+        self.next_identity += 1;
+        self.identities.insert(fd, self.next_identity);
+    }
+
+    pub fn identity(&self, fd: i32) -> Option<u64> {
+        self.identities.get(&fd).copied()
+    }
+    pub fn source_for_identity(&self, identity: u64) -> Option<&GuestFd> {
+        self.identities
+            .iter()
+            .find(|(_, value)| **value == identity)
+            .and_then(|(fd, _)| self.get(*fd))
+    }
+    pub fn link_dup(&mut self, source: i32, target: i32) {
+        if let Some(identity) = self.identity(source) {
+            self.identities.insert(target, identity);
+        }
     }
 
     /// Close an fd and invalidate epoll watches that refer to its number.
     pub fn remove_with_watch_cleanup(&mut self, fd: i32) -> Option<GuestFd> {
+        let identity = self.identity(fd);
         let removed = self.remove(fd);
+        if identity.is_some_and(|id| self.identities.values().any(|value| *value == id)) {
+            return removed;
+        }
         for entry in self.table.values() {
             if let GuestFd::Epoll(state) = entry {
                 if let Ok(mut state) = state.lock() {
-                    state.watches.remove(&fd);
+                    state.watches.retain(|(_, id), _| Some(*id) != identity);
                 }
             }
         }
@@ -190,8 +226,23 @@ impl FdTable {
 
     /// 更新 flags（F_SETFL/F_SETFD）；未记账的 fd 以 0 起始。
     pub fn update_flags(&mut self, fd: i32, f: impl FnOnce(u32) -> u32) {
-        let v = self.flags.entry(fd).or_insert(0);
-        *v = f(*v);
+        let old = self.flags.get(&fd).copied().unwrap_or(0);
+        let value = f(old);
+        self.flags.insert(fd, value);
+        if old >> 8 != value >> 8 {
+            if let Some(identity) = self.identity(fd) {
+                let aliases = self
+                    .identities
+                    .iter()
+                    .filter(|(_, id)| **id == identity)
+                    .map(|(fd, _)| *fd)
+                    .collect::<Vec<_>>();
+                for alias in aliases {
+                    let flags = self.flags.entry(alias).or_default();
+                    *flags = (*flags & 0xff) | (value & !0xff);
+                }
+            }
+        }
     }
 
     /// execve（PLAN-0.0.4 T3.1/T3.2）：关闭所有带 FD_CLOEXEC 的 fd，
@@ -207,7 +258,7 @@ impl FdTable {
             .collect();
         let mut n = 0;
         for fd in clo {
-            if let Some(gf) = self.remove(fd) {
+            if let Some(gf) = self.remove_with_watch_cleanup(fd) {
                 n += 1;
                 match gf {
                     GuestFd::Host(h) | GuestFd::PipeRead(h) | GuestFd::PipeWrite(h) => {
@@ -221,55 +272,17 @@ impl FdTable {
     }
 }
 
-/// State shared by all guest threads in one process.  The legacy
-/// `GuestProcess` adapter below remains available for the single-thread trap
-/// path; new thread-aware code should pass this object through `GuestContext`.
-pub struct ProcessShared {
-    pub pid: u32,
-    pub ppid: u32,
-    pub uid: AtomicU32,
-    pub gid: AtomicU32,
-    pub load: RwLock<LoadedImage>,
-    pub mem: RwLock<MemRegistry>,
-    pub fds: Mutex<FdTable>,
-    pub cwd: RwLock<String>,
-    pub fs: RwLock<vela_fs::FsMap>,
-    pub children: Mutex<BTreeMap<u32, isize>>,
-}
+/// Shared trap state, including the host adapter supplied by the embedding
+/// CLI. One guard owns address-space, descriptor and child-table mutations.
+/// Dispatch may only make bounded attempts while this guard is held.
+pub struct ProcessShared<S>(Mutex<S>);
 
-impl ProcessShared {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        pid: u32,
-        ppid: u32,
-        uid: u32,
-        gid: u32,
-        load: LoadedImage,
-        mem: MemRegistry,
-        fds: FdTable,
-        cwd: String,
-        fs: vela_fs::FsMap,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            pid,
-            ppid,
-            uid: AtomicU32::new(uid),
-            gid: AtomicU32::new(gid),
-            load: RwLock::new(load),
-            mem: RwLock::new(mem),
-            fds: Mutex::new(fds),
-            cwd: RwLock::new(cwd),
-            fs: RwLock::new(fs),
-            children: Mutex::new(BTreeMap::new()),
-        })
+impl<S> ProcessShared<S> {
+    pub fn new(state: S) -> Self {
+        Self(Mutex::new(state))
     }
-
-    pub fn uid(&self) -> u32 {
-        self.uid.load(Ordering::Acquire)
-    }
-
-    pub fn gid(&self) -> u32 {
-        self.gid.load(Ordering::Acquire)
+    pub fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, S>> {
+        self.0.lock()
     }
 }
 
@@ -284,6 +297,7 @@ pub struct GuestThread {
     pub stack: Option<MemRange>,
     pub exited: AtomicBool,
     pub exit_code: Mutex<Option<i32>>,
+    pub signals: Mutex<ThreadSignalState>,
 }
 
 impl GuestThread {
@@ -298,6 +312,7 @@ impl GuestThread {
             stack,
             exited: AtomicBool::new(false),
             exit_code: Mutex::new(None),
+            signals: Mutex::new(ThreadSignalState::default()),
         })
     }
 
@@ -309,16 +324,52 @@ impl GuestThread {
     }
 }
 
-/// Syscall-facing combination of process and current-thread state.
-#[derive(Clone)]
-pub struct GuestContext {
-    pub shared: Arc<ProcessShared>,
-    pub thread: Arc<GuestThread>,
+#[derive(Default)]
+pub struct ThreadSignalState {
+    pub blocked: u64,
+    pub frames: Vec<SignalFrame>,
+    pub restore: Option<SignalFrame>,
+    pub alt_stack: Option<(u64, u64, i32)>,
 }
 
+/// Current thread binding for a bounded dispatch under ProcessShared's guard.
+/// The legacy syscall adapter is hydrated from the registered GuestThread;
+/// no thread-private signal or TLS state is shared across guard handoffs.
+pub struct GuestContext;
 impl GuestContext {
-    pub fn new(shared: Arc<ProcessShared>, thread: Arc<GuestThread>) -> Self {
-        Self { shared, thread }
+    pub fn enter(proc: &mut GuestProcess, tid: u32) {
+        if proc.tid == tid && proc.threads.contains_key(&tid) {
+            return;
+        }
+        if let Some(old) = proc.threads.get(&proc.tid) {
+            old.fs_base.store(proc.fs_base, Ordering::Release);
+            old.gs_base.store(proc.gs_base, Ordering::Release);
+            old.clear_tid
+                .store(proc.clear_tid.unwrap_or(0), Ordering::Release);
+            let mut state = old.signals.lock().unwrap_or_else(|p| p.into_inner());
+            state.blocked = proc.signals.blocked;
+            state.frames = std::mem::take(&mut proc.signal_frames);
+            state.restore = proc.signal_restore.take();
+            state.alt_stack = proc.alt_stack.take();
+        }
+        let current = proc
+            .threads
+            .entry(tid)
+            .or_insert_with(|| GuestThread::new(tid, None, 0))
+            .clone();
+        proc.tid = tid;
+        proc.fs_base = current.fs_base.load(Ordering::Acquire);
+        proc.gs_base = current.gs_base.load(Ordering::Acquire);
+        proc.clear_tid = match current.clear_tid.load(Ordering::Acquire) {
+            0 => None,
+            addr => Some(addr),
+        };
+        proc.fs_apply_pending = None;
+        let mut state = current.signals.lock().unwrap_or_else(|p| p.into_inner());
+        proc.signals.blocked = state.blocked;
+        proc.signal_frames = std::mem::take(&mut state.frames);
+        proc.signal_restore = state.restore.take();
+        proc.alt_stack = state.alt_stack.take();
     }
 }
 
@@ -367,9 +418,74 @@ pub struct GuestProcess {
     pub signal_frames: Vec<SignalFrame>,
     pub signal_restore: Option<SignalFrame>,
     pub alt_stack: Option<(u64, u64, i32)>,
+    pub threads: BTreeMap<u32, Arc<GuestThread>>,
+    pub thread_pending: BTreeMap<u32, u64>,
+    pub notified_children: std::collections::BTreeSet<u32>,
+    /// Dispatch performs a bounded attempt; the CLI releases its state guard
+    /// before retrying a would-block result.
+    pub nonblocking_step: bool,
 }
 
 impl GuestProcess {
+    /// Check the effective permission at every page, including the latest
+    /// mmap/mprotect override. Called only while the process guard is held.
+    pub fn can_access(&self, addr: u64, len: usize, required: u8) -> bool {
+        if len == 0 {
+            return true;
+        }
+        if len > isize::MAX as usize || !self.mem.contains(addr, len as u64) {
+            return false;
+        }
+        let end = addr + len as u64;
+        let mut page = addr;
+        while page < end {
+            let mut prot = if self.load.interp.as_ref().is_some_and(|i| {
+                i.exec_ranges
+                    .iter()
+                    .any(|(start, stop)| page >= *start && page < *stop)
+            }) {
+                5
+            } else {
+                3
+            };
+            if !self.load.segments.is_empty()
+                && page >= self.load.span.start
+                && page < self.load.span.start + self.load.span.len
+            {
+                prot = 0;
+            }
+            if self.load.interp.as_ref().is_some_and(|image| {
+                page >= image.span.start && page < image.span.start + image.span.len
+            }) {
+                prot = 0;
+            }
+            if let Some(segment) = self
+                .load
+                .segments
+                .iter()
+                .chain(self.load.interp.iter().flat_map(|i| i.segments.iter()))
+                .find(|s| {
+                    page >= (s.vaddr & !4095) && page < (s.vaddr + s.mem_size).div_ceil(4096) * 4096
+                })
+            {
+                prot = segment.prot;
+            }
+            if let Some(override_) = self
+                .prot_ledger
+                .iter()
+                .rev()
+                .find(|p| page >= p.start && page < p.start.saturating_add(p.len))
+            {
+                prot = override_.prot;
+            }
+            if prot & required != required {
+                return false;
+            }
+            page = ((page & !4095) + 4096).min(end);
+        }
+        true
+    }
+
     pub fn new(pid: u32, load: LoadedImage) -> Self {
         let mut memreg = MemRegistry::default();
         memreg.add(load.span);
@@ -400,6 +516,20 @@ impl GuestProcess {
             signal_frames: Vec::new(),
             signal_restore: None,
             alt_stack: None,
+            threads: BTreeMap::new(),
+            thread_pending: BTreeMap::new(),
+            notified_children: Default::default(),
+            nonblocking_step: false,
+        }
+    }
+
+    pub fn discard_ignored_signals(&mut self) {
+        let ignored = (1..=64)
+            .filter(|sig| self.signals.ignored(*sig))
+            .fold(0u64, |bits, sig| bits | (1 << (sig - 1)));
+        self.signals.pending &= !ignored;
+        for bits in self.thread_pending.values_mut() {
+            *bits &= !ignored;
         }
     }
 
@@ -434,34 +564,38 @@ impl GuestProcess {
 // ---------------------------------------------------------------- 客户内存访问
 
 /// 读客户内存：同进程实现 + 映射登记校验（规格 5.4）。
-pub fn read_guest<'a>(proc: &GuestProcess, addr: u64, len: usize) -> Result<&'a [u8], i32> {
-    if len == 0 {
-        return Ok(&[]);
+pub fn read_guest(proc: &GuestProcess, addr: u64, len: usize) -> Result<Vec<u8>, i32> {
+    if len > 16 * 1024 * 1024 {
+        return Err(abi::EINVAL);
     }
-    if !proc.mem.contains(addr, len as u64) {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if !proc.can_access(addr, len, 1) {
         return Err(abi::EFAULT);
     }
     // SAFETY: 同进程地址空间；区间已确认登记在客户映射内
-    Ok(unsafe { std::slice::from_raw_parts(addr as *const u8, len) })
+    let mut bytes = vec![0; len];
+    unsafe {
+        std::ptr::copy_nonoverlapping(addr as *const u8, bytes.as_mut_ptr(), len);
+    }
+    Ok(bytes)
 }
 
-/// 可变版本。v0 单线程且客户内存归 runtime 独占管理，无并发别名。
-pub fn read_guest_mut<'a>(proc: &GuestProcess, addr: u64, len: usize) -> Result<&'a mut [u8], i32> {
-    if len == 0 {
-        return Ok(&mut []);
+/// Validate an output range without borrowing guest memory.
+pub fn validate_guest_write(proc: &GuestProcess, addr: u64, len: usize) -> Result<(), i32> {
+    if proc.can_access(addr, len, 2) {
+        Ok(())
+    } else {
+        Err(abi::EFAULT)
     }
-    if !proc.mem.contains(addr, len as u64) {
-        return Err(abi::EFAULT);
-    }
-    // SAFETY: 同上；v0 无并发访问者
-    Ok(unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, len) })
 }
 
 pub fn write_guest(proc: &GuestProcess, addr: u64, data: &[u8]) -> Result<(), i32> {
     if data.is_empty() {
         return Ok(());
     }
-    if !proc.mem.contains(addr, data.len() as u64) {
+    if !proc.can_access(addr, data.len(), 2) {
         return Err(abi::EFAULT);
     }
     // SAFETY: 同上
@@ -485,7 +619,7 @@ pub fn read_cstr(proc: &GuestProcess, addr: u64) -> Result<String, i32> {
         let want = (page_end - cur).min((4096 - out.len()) as u64);
         // 在请求长度内找最大合法前缀（正常情况 want 即合法；跨界时退化）
         let mut n = want;
-        while n > 0 && !proc.mem.contains(cur, n) {
+        while n > 0 && !proc.can_access(cur, n as usize, 1) {
             n -= 1;
         }
         if n == 0 {
@@ -538,7 +672,7 @@ mod tests {
         let watched = fds.alloc_fd(GuestFd::Null);
         let state = std::sync::Arc::new(std::sync::Mutex::new(EpollState::default()));
         state.lock().unwrap().watches.insert(
-            watched,
+            (watched, fds.identity(watched).unwrap()),
             EpollWatch {
                 events: abi::EPOLLIN,
                 data: 7,
@@ -558,6 +692,37 @@ mod tests {
         state.reset_for_exec();
         assert_eq!(state.dispositions[0].handler, abi::SIG_IGN);
         assert_eq!(state.dispositions[1].handler, abi::SIG_DFL);
-        assert_eq!(state.pending, 0);
+        assert_eq!(state.pending, 1 << 1);
+    }
+
+    #[test]
+    fn aliases_share_status_but_keep_cloexec_and_watch_identity() {
+        let mut fds = FdTable::empty();
+        let source = fds.alloc_fd(GuestFd::Null);
+        let alias = fds.alloc_fd(GuestFd::Null);
+        fds.link_dup(source, alias);
+        fds.update_flags(source, |flags| flags | 1 | ((abi::O_NONBLOCK as u32) << 8));
+        assert_eq!(fds.get_flags(alias).unwrap() & 1, 0);
+        assert_ne!(
+            fds.get_flags(alias).unwrap() >> 8 & abi::O_NONBLOCK as u32,
+            0
+        );
+        let identity = fds.identity(source).unwrap();
+        let state = Arc::new(Mutex::new(EpollState::default()));
+        state.lock().unwrap().watches.insert(
+            (source, identity),
+            EpollWatch {
+                events: abi::EPOLLIN,
+                data: 1,
+            },
+        );
+        fds.alloc_fd(GuestFd::Epoll(state.clone()));
+        fds.remove_with_watch_cleanup(source);
+        assert_eq!(state.lock().unwrap().watches.len(), 1);
+        let reused = fds.alloc_fd(GuestFd::Null);
+        assert_eq!(reused, source);
+        assert_ne!(fds.identity(reused), Some(identity));
+        fds.remove_with_watch_cleanup(alias);
+        assert!(state.lock().unwrap().watches.is_empty());
     }
 }

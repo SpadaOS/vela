@@ -7,7 +7,7 @@ use std::ffi::c_void;
 use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::file_ops;
 use crate::{
@@ -883,9 +883,49 @@ extern "C" {
 }
 
 #[derive(Debug)]
+struct NativeGuestThread {
+    handle: isize,
+    scratch: Arc<AtomicU64>,
+}
+struct NativeThreadStart {
+    context: GuestThreadContext,
+    scratch: Arc<AtomicU64>,
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateThread(
+        attributes: *const c_void,
+        stack: usize,
+        start: unsafe extern "system" fn(*mut c_void) -> u32,
+        parameter: *mut c_void,
+        flags: u32,
+        tid: *mut u32,
+    ) -> *mut c_void;
+    fn TlsFree(index: u32) -> i32;
+}
+
+unsafe extern "system" fn native_guest_entry(parameter: *mut c_void) -> u32 {
+    let NativeThreadStart { context, scratch } =
+        *unsafe { Box::from_raw(parameter.cast::<NativeThreadStart>()) };
+    island::prepare_veh_scratch();
+    scratch.store(island::current_scratch() as u64, Ordering::Release);
+    drop(scratch);
+    CURRENT_GUEST_TID.with(|slot| slot.set(context.tid.0 as u32));
+    set_soft_tls_base(context.tls);
+    if fs_base_supported() && context.tls != 0 {
+        let _ = set_thread_fs_base_now(context.tls);
+        commit_fs_base_after_preset();
+    }
+    CURRENT_CLEAR_TID.with(|slot| slot.set(context.clear_tid));
+    let regs = context.regs;
+    unsafe { vela_enter_guest_context(&regs) }
+}
+
+#[derive(Debug, Clone)]
 pub struct WindowsHost {
     start: Instant,
-    guest_threads: Arc<Mutex<HashMap<u64, std::thread::JoinHandle<i32>>>>,
+    guest_threads: Arc<Mutex<HashMap<u64, NativeGuestThread>>>,
     active_threads: Arc<AtomicU32>,
 }
 
@@ -1062,7 +1102,63 @@ impl HostMem for WindowsHost {
     }
 }
 
+/// Translate Linux readiness flags explicitly; Winsock uses different bits.
+pub(crate) fn poll_socket(socket: &socket2::Socket, events: u16) -> u16 {
+    use std::os::windows::io::AsRawSocket;
+    #[repr(C)]
+    struct PollFd {
+        socket: usize,
+        events: i16,
+        revents: i16,
+    }
+    #[link(name = "Ws2_32")]
+    unsafe extern "system" {
+        fn WSAPoll(fds: *mut PollFd, count: u32, timeout: i32) -> i32;
+    }
+    let mut item = PollFd {
+        socket: socket.as_raw_socket() as usize,
+        events: 0,
+        revents: 0,
+    };
+    if events & (crate::POLLIN | crate::POLLRDHUP) != 0 {
+        item.events |= 0x300;
+    }
+    if events & crate::POLLOUT != 0 {
+        item.events |= 0x10;
+    }
+    // SAFETY: a single live Winsock socket and a correctly sized WSAPOLLFD.
+    if unsafe { WSAPoll(&mut item, 1, 0) } < 0 {
+        return crate::POLLERR;
+    }
+    let mut result = 0;
+    if item.revents & 0x300 != 0 {
+        result |= events & crate::POLLIN;
+    }
+    if item.revents & 0x10 != 0 {
+        result |= events & crate::POLLOUT;
+    }
+    if item.revents & 0x1 != 0 {
+        result |= crate::POLLERR;
+    }
+    if item.revents & 0x2 != 0 {
+        result |= crate::POLLHUP;
+    }
+    if item.revents & 0x4 != 0 {
+        result |= crate::POLLNVAL;
+    }
+    result
+}
+
 impl HostFileOps for WindowsHost {
+    fn is_terminal(&self, file: &HostFile) -> bool {
+        use std::io::IsTerminal;
+        match &file.0 {
+            HostFileKind::StdIn => std::io::stdin().is_terminal(),
+            HostFileKind::StdOut => std::io::stdout().is_terminal(),
+            HostFileKind::StdErr => std::io::stderr().is_terminal(),
+            _ => false,
+        }
+    }
     fn open(&self, path: &HostPath, opt: HostOpen) -> Result<HostFile, HostError> {
         file_ops::open(path, opt)
     }
@@ -1125,19 +1221,29 @@ impl HostFileOps for WindowsHost {
     fn create_pipe(&self) -> Result<(HostFile, HostFile), HostError> {
         file_ops::create_pipe()
     }
-    fn socket(&self, domain: u16, kind: u32, _protocol: u32) -> Result<HostSocket, HostError> {
-        Ok(HostSocket::new(
+    fn socket(&self, domain: u16, kind: u32, protocol: u32) -> Result<HostSocket, HostError> {
+        let base = kind & crate::SOCK_TYPE_MASK;
+        if protocol != 0
+            && !((base == crate::SOCK_STREAM && protocol == 6)
+                || (base == crate::SOCK_DGRAM && protocol == 17))
+        {
+            return Err(HostError::Invalid);
+        }
+        HostSocket::new(
             domain,
             kind & crate::SOCK_TYPE_MASK,
             kind & crate::SOCK_NONBLOCK != 0,
-        ))
+        )
     }
     fn socketpair(
         &self,
         domain: u16,
         kind: u32,
-        _protocol: u32,
+        protocol: u32,
     ) -> Result<(HostSocket, HostSocket), HostError> {
+        if protocol != 0 {
+            return Err(HostError::Other(crate::EPROTONOSUPPORT));
+        }
         if domain != crate::AF_UNIX || kind & crate::SOCK_TYPE_MASK != crate::SOCK_STREAM {
             return Err(HostError::Unimplemented);
         }
@@ -1330,6 +1436,36 @@ impl Host for WindowsHost {
 // ---------------------------------------------------------------- HostTrap / HostProc（0.1.0 T1.1/T1.2）
 
 impl HostTrap for WindowsHost {
+    fn save_signal_fp(&self, frame: &TrapFrame) -> Vec<u8> {
+        let bytes = frame.opaque_bytes();
+        let offset = if bytes.len() == 0x4d0 {
+            0x100
+        } else {
+            island::OFF_FP
+        };
+        bytes.get(offset..offset + 512).unwrap_or(&[]).to_vec()
+    }
+    fn restore_signal_fp(&self, frame: &mut TrapFrame, state: &[u8]) {
+        if state.len() != 512 {
+            return;
+        }
+        let offset = if frame.opaque_len == 0x4d0 {
+            0x100
+        } else {
+            island::OFF_FP
+        };
+        if offset + 512 <= frame.opaque_len {
+            // SAFETY: this frame wraps writable host exception/scratch state;
+            // the extended register region is disjoint from GuestRegs.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    state.as_ptr(),
+                    frame.opaque.cast_mut().add(offset),
+                    512,
+                );
+            }
+        }
+    }
     fn install_trap(&self, f: TrapFn) -> Result<(), HostError> {
         install_trap_impl(f)
     }
@@ -1384,6 +1520,9 @@ impl HostTrap for WindowsHost {
 }
 
 impl HostProc for WindowsHost {
+    fn set_guest_tid(&self, tid: u32) {
+        CURRENT_GUEST_TID.with(|slot| slot.set(tid));
+    }
     fn active_guest_threads(&self) -> u32 {
         self.active_threads.load(Ordering::Acquire)
     }
@@ -1430,44 +1569,62 @@ impl HostProc for WindowsHost {
 
     fn spawn_guest_thread(&self, mut context: GuestThreadContext) -> Result<HostTid, HostError> {
         let tid = context.tid;
+        context.entry = island::resume_pc(context.entry);
         context.regs.rip = context.entry;
         context.regs.rsp = context.stack;
         context.regs.rax = 0;
-        // Publish the new guest thread before starting the native thread. A
-        // very short-lived guest can reach SYS_EXIT before `spawn` returns;
-        // counting it afterwards would let that exit observe the wrong
-        // process-wide last-thread state.
+        let scratch = Arc::new(AtomicU64::new(0));
+        let payload = Box::into_raw(Box::new(NativeThreadStart {
+            context,
+            scratch: scratch.clone(),
+        }));
         self.guest_thread_started();
-        let handle = std::thread::Builder::new()
-            .name(format!("vela-guest-{}", tid.0))
-            .spawn(move || {
-                island::prepare_veh_scratch();
-                CURRENT_GUEST_TID.with(|slot| slot.set(tid.0 as u32));
-                set_soft_tls_base(context.tls);
-                if fs_base_supported() && context.tls != 0 {
-                    let _ = set_thread_fs_base_now(context.tls);
-                    commit_fs_base_after_preset();
-                }
-                CURRENT_CLEAR_TID.with(|slot| slot.set(context.clear_tid));
-                let regs = Box::new(context.regs);
-                // SAFETY: the caller supplied a mapped guest stack and an
-                // executable entry; the context remains allocated until the
-                // non-returning guest jump consumes it.
-                unsafe { vela_enter_guest_context(regs.as_ref() as *const GuestRegs) }
-            })
-            .map_err(|_| {
-                self.guest_thread_exited();
-                HostError::NoMemory
-            })?;
-        match self.guest_threads.lock() {
-            Ok(mut g) => {
-                g.insert(tid.0, handle);
+        let handle = unsafe {
+            CreateThread(
+                std::ptr::null(),
+                0,
+                native_guest_entry,
+                payload.cast(),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle.is_null() {
+            unsafe {
+                drop(Box::from_raw(payload));
             }
-            Err(p) => {
-                p.into_inner().insert(tid.0, handle);
-            }
+            self.guest_thread_exited();
+            return Err(HostError::NoMemory);
         }
+        self.guest_threads
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(
+                tid.0,
+                NativeGuestThread {
+                    handle: handle as isize,
+                    scratch,
+                },
+            );
         Ok(tid)
+    }
+
+    fn reap_guest_threads(&self) {
+        let mut threads = self.guest_threads.lock().unwrap_or_else(|p| p.into_inner());
+        threads.retain(|_, thread| {
+            if matches!(wait_child(thread.handle, 0), Ok(Some(_))) {
+                let scratch = thread.scratch.load(Ordering::Acquire);
+                if scratch != 0 {
+                    unsafe {
+                        VirtualFree(scratch as *mut c_void, 0, MEM_RELEASE);
+                    }
+                }
+                close_handle(thread.handle);
+                false
+            } else {
+                true
+            }
+        });
     }
 
     fn join_guest_thread(
@@ -1475,36 +1632,15 @@ impl HostProc for WindowsHost {
         tid: HostTid,
         timeout: Option<std::time::Duration>,
     ) -> Result<Option<i32>, HostError> {
-        let start = Instant::now();
-        loop {
-            let finished = match self.guest_threads.lock() {
-                Ok(g) => g
-                    .get(&tid.0)
-                    .is_some_and(std::thread::JoinHandle::is_finished),
-                Err(p) => p
-                    .into_inner()
-                    .get(&tid.0)
-                    .is_some_and(std::thread::JoinHandle::is_finished),
-            };
-            if finished {
-                let handle = match self.guest_threads.lock() {
-                    Ok(mut g) => g.remove(&tid.0),
-                    Err(p) => p.into_inner().remove(&tid.0),
-                };
-                return Ok(handle.and_then(|h| h.join().ok()));
-            }
-            if let Some(limit) = timeout {
-                if start.elapsed() >= limit {
-                    return Ok(None);
-                }
-                std::thread::sleep(std::cmp::min(
-                    Duration::from_millis(1),
-                    limit.saturating_sub(start.elapsed()),
-                ));
-            } else {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
+        let threads = self.guest_threads.lock().unwrap_or_else(|p| p.into_inner());
+        let thread = threads.get(&tid.0).ok_or(HostError::NotFound)?;
+        wait_child(
+            thread.handle,
+            timeout.map_or(u32::MAX, |d| {
+                d.as_millis().min((u32::MAX - 1) as u128) as u32
+            }),
+        )
+        .map(|code| code.map(|c| c as i32))
     }
 
     fn shared_section(&self, size: u64) -> Result<isize, HostError> {
@@ -1553,7 +1689,7 @@ impl HostProc for WindowsHost {
         pipe_from_raw_handle(h, is_read)
     }
     fn fork_child_context(&self, frame: &TrapFrame) -> Vec<u8> {
-        if island::is_island_mode() {
+        if frame.opaque_bytes().len() == island::SAVE_SIZE {
             return island::fork_child_context(frame);
         }
         // VEH 路径：父 CONTEXT 全量快照（含 XSAVE：子进程必须继承浮点/向量现场）
@@ -1638,45 +1774,25 @@ mod island {
         pub ret: u64,         // 0x88 = site+2
         pub cell: u64,        // 0x90 = 迁移指令副本地址
         pub segs: [u16; 2],   // 0x98 = cs, ss（fork 子 CONTEXT_CONTROL 所需）
+        pub flags: u64,
+        pub fp: FpSave,
     }
+    #[repr(C, align(16))]
+    pub struct FpSave(pub [u8; 512]);
+    const OFF_FLAGS: usize = std::mem::offset_of!(IslandSave, flags);
+    pub(super) const OFF_FP: usize = std::mem::offset_of!(IslandSave, fp);
     const OFF_RET: usize = 0x88;
     const OFF_CELL: usize = 0x90;
     const OFF_SEGS: usize = 0x98;
     pub const SAVE_SIZE: usize = std::mem::size_of::<IslandSave>(); // 0xA0
 
     // static mut：岛内桩经保存区写入/读回寄存器（地址在生成期嵌入 imm64）
-    static mut VELA_ISLAND_SAVE: IslandSave = IslandSave {
-        guest: GuestRegs {
-            rax: 0,
-            rcx: 0,
-            rdx: 0,
-            rbx: 0,
-            rsp: 0,
-            rbp: 0,
-            rsi: 0,
-            rdi: 0,
-            r8: 0,
-            r9: 0,
-            r10: 0,
-            r11: 0,
-            r12: 0,
-            r13: 0,
-            r14: 0,
-            r15: 0,
-            rip: 0,
-        },
-        ret: 0,
-        cell: 0,
-        segs: [0; 2],
-    };
 
     /// 岛页 dispatch 的宿主栈（4 MiB；dispatch/fork/日志全在宿主栈上执行，
     /// 客户栈零写入）。static mut 确保落 .bss（可写）而非常量节；
     /// no_mangle 供 global_asm/桩机器码 RIP 相对取址。
     #[repr(C, align(16))]
     struct AlignedStack([u8; 4 * 1024 * 1024]);
-    #[no_mangle]
-    static mut VELA_ISLAND_STACK: AlignedStack = AlignedStack([0; 4 * 1024 * 1024]);
 
     /// VEH 处理体宿主栈（T2.4）：Rust 处理（dispatch/fork/日志）不再压客户栈。
     #[repr(C, align(16))]
@@ -1684,6 +1800,7 @@ mod island {
         rsp: u64,
         _pad: u64,
         stack: AlignedStack,
+        island: IslandSave,
     }
 
     static VEH_TLS_INDEX: AtomicU32 = AtomicU32::new(u32::MAX);
@@ -1704,7 +1821,12 @@ mod island {
                 Ordering::Acquire,
             ) {
                 Ok(_) => index = allocated,
-                Err(existing) => index = existing,
+                Err(existing) => {
+                    unsafe {
+                        TlsFree(allocated);
+                    }
+                    index = existing;
+                }
             }
         }
         if unsafe { TlsGetValue(index) }.is_null() {
@@ -1723,6 +1845,10 @@ mod island {
                 "VEH TLS registration failed"
             );
         }
+    }
+
+    pub fn current_scratch() -> usize {
+        unsafe { vela_veh_scratch() as usize }
     }
 
     #[no_mangle]
@@ -1806,13 +1932,14 @@ mod island {
         let sa_ptr = sa as *const IslandSave as *const u8;
         let mut frame = TrapFrame::new(
             &mut sa.guest,
-            0x202, // IF|保留位：岛路径无法捕获真实 RFLAGS（pushfq 会写客户栈）；
+            sa.flags,
             // syscall 契约下客户不得依赖 R11=RFLAGS，见 SYSCALLS 诚实边界
             sa_ptr,
             SAVE_SIZE,
         );
         // SAFETY: 回调由 CLI 注册，仅操作客户状态
         unsafe { tf(nr, &args, &mut frame) };
+        sa.flags = frame.e_flags;
         // 返回地址改指迁移指令副本（cell 地址由桩在保存期写入）
         let ret = sa.ret;
         let cell = sa.cell;
@@ -1838,8 +1965,17 @@ mod island {
     struct PatchSite {
         site: u64,
         stub: u64,
+        cell: u64,
     }
     static LEDGER: Mutex<Vec<PatchSite>> = Mutex::new(Vec::new());
+    pub fn resume_pc(pc: u64) -> u64 {
+        LEDGER
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|patch| patch.site + 2 == pc)
+            .map_or(pc, |patch| patch.cell)
+    }
 
     pub fn is_island_mode() -> bool {
         TRAP_MODE.load(Ordering::Relaxed) == 1
@@ -1860,20 +1996,12 @@ mod island {
 
     // ---- stub 机器码生成 ----
 
-    fn movabs_rcx_imm64(out: &mut Vec<u8>, imm: u64) {
-        out.extend_from_slice(&[0x48, 0xB9]);
-        out.extend_from_slice(&imm.to_le_bytes());
-    }
     fn movabs_r11_imm64(out: &mut Vec<u8>, imm: u64) {
-        out.extend_from_slice(&[0x49, 0xBC]);
+        out.extend_from_slice(&[0x49, 0xBB]);
         out.extend_from_slice(&imm.to_le_bytes());
     }
     fn movabs_rax_imm64(out: &mut Vec<u8>, imm: u64) {
         out.extend_from_slice(&[0x48, 0xB8]);
-        out.extend_from_slice(&imm.to_le_bytes());
-    }
-    fn movabs_rsp_imm64(out: &mut Vec<u8>, imm: u64) {
-        out.extend_from_slice(&[0x48, 0xBC]);
         out.extend_from_slice(&imm.to_le_bytes());
     }
     /// mov [rcx+disp32], r64（reg: 0..15）
@@ -1897,9 +2025,17 @@ mod island {
     /// 生成单 site 的 cell（迁移指令副本 + jmp 续接）与桩。布局：
     /// [cell: disp(L) + E9 rel32 → site+2+L][stub ~120 字节]。
     /// E9 patch 目标 = 桩首；cell 绝对地址由参数传入（分配后已知）。
+    fn load_island_scratch(out: &mut Vec<u8>) {
+        // Windows x64 TEB.TlsSlots (64 inline slots). Larger TLS indices
+        // select VEH before any island is installed.
+        let slot = 0x1480 + VEH_TLS_INDEX.load(Ordering::Acquire) * 8;
+        out.extend_from_slice(&[0x65, 0x48, 0x8b, 0x0c, 0x25]);
+        out.extend_from_slice(&slot.to_le_bytes());
+        out.extend_from_slice(&[0x48, 0x8d, 0x89]);
+        out.extend_from_slice(&(std::mem::offset_of!(VehScratch, island) as u32).to_le_bytes());
+    }
+
     fn gen_stub(site: u64, cell_bytes: &[u8], resume: u64, cell: u64) -> Vec<u8> {
-        let save = std::ptr::addr_of_mut!(VELA_ISLAND_SAVE) as u64;
-        let stack_top = std::ptr::addr_of_mut!(VELA_ISLAND_STACK) as u64 + 4 * 1024 * 1024;
         let dispatch =
             vela_island_dispatch as unsafe extern "C" fn(*mut IslandSave) as usize as u64;
         let mut b: Vec<u8> = Vec::with_capacity(cell_bytes.len() + 5 + 0x88);
@@ -1909,7 +2045,7 @@ mod island {
         let rel = resume as i64 - (cell as i64 + cell_bytes.len() as i64 + 5);
         b.extend_from_slice(&(rel as i32).to_le_bytes());
         // ---- stub ----
-        movabs_rcx_imm64(&mut b, save); // rcx = 保存区
+        load_island_scratch(&mut b);
         movabs_r11_imm64(&mut b, site + 2); // r11 = 返回地址（syscall 契约下即死值）
         store_rcx_disp32(&mut b, 11, OFF_RET);
         // 保存全部活寄存器（rcx/r11 之外；rsp 必须保存以便恢复）
@@ -1940,12 +2076,22 @@ mod island {
         b.extend_from_slice(&[0x8C, 0xD0]); // mov ax, ss
         store_rcx_disp32_ax(&mut b, OFF_SEGS + 2);
         // 切宿主栈 → call dispatch（写回结果/返回地址由 dispatch 完成）
-        movabs_rsp_imm64(&mut b, stack_top);
-        b.extend_from_slice(&[0x48, 0x83, 0xEC, 0x30]); // sub rsp, 0x30
+        // Switch to the native stack without touching the guest red zone.
+        b.extend_from_slice(&[0x48, 0x8d, 0x61, 0xd0]); // lea rsp, [rcx-0x30]
+        b.extend_from_slice(&[0x9c, 0x58]); // pushfq; pop rax
+        store_rcx_disp32(&mut b, 0, OFF_FLAGS);
+        store_rcx_disp32(&mut b, 0, 0x58);
+        b.extend_from_slice(&[0x48, 0x0f, 0xae, 0x81]); // fxsave64
+        b.extend_from_slice(&(OFF_FP as u32).to_le_bytes());
         movabs_rax_imm64(&mut b, dispatch);
         b.extend_from_slice(&[0xFF, 0xD0]); // call rax
-        movabs_rcx_imm64(&mut b, save); // rcx 被 call 破坏（Win64 易失）
-                                        // 恢复（rip 最后跳；rcx 次之；r11 = 跳转目标）
+        load_island_scratch(&mut b);
+        b.extend_from_slice(&[0x48, 0x0f, 0xae, 0x89]); // fxrstor64
+        b.extend_from_slice(&(OFF_FP as u32).to_le_bytes());
+        b.extend_from_slice(&[0xff, 0xb1]); // push qword [rcx+flags]
+        b.extend_from_slice(&(OFF_FLAGS as u32).to_le_bytes());
+        b.push(0x9d); // popfq
+                      // 恢复（rip 最后跳；rcx 次之；r11 = 跳转目标）
         for (reg, off) in [
             (2usize, 0x10),
             (3, 0x18),
@@ -1963,10 +2109,10 @@ mod island {
             load_rcx_disp32(&mut b, reg, off);
         }
         load_rcx_disp32(&mut b, 4, 0x20); // rsp = 客户栈
-        load_rcx_disp32(&mut b, 11, 0x80); // r11 = regs.rip（cell 或 fs trampoline）
+        load_rcx_disp32(&mut b, 11, 0x58);
         load_rcx_disp32(&mut b, 0, 0x00); // rax = 返回值
-        load_rcx_disp32(&mut b, 1, 0x08); // rcx = regs.rcx（syscall 语义）
-        b.extend_from_slice(&[0x41, 0xFF, 0xE3]); // jmp r11
+        load_rcx_disp32(&mut b, 1, 0x80);
+        b.extend_from_slice(&[0xff, 0xe1]); // jmp rcx
         b
     }
 
@@ -2275,6 +2421,10 @@ mod island {
         sites: &[u64],
         exec_segs: &[(u64, u64)],
     ) -> Result<crate::IslandPlan, HostError> {
+        prepare_veh_scratch();
+        if VEH_TLS_INDEX.load(Ordering::Acquire) >= 64 {
+            return all_veh(sites.len());
+        }
         *LEDGER.lock().unwrap_or_else(|p| p.into_inner()) = Vec::new();
         ISLAND_SITES.store(0, Ordering::Relaxed);
         VEH_SITES.store(0, Ordering::Relaxed);
@@ -2378,7 +2528,7 @@ mod island {
             // c. 取岛页空间（页满换新页；64K 步进贴映像扫描）。
             //    桩实际上界 ~240B（14 次寄存器保存 + 3 次 disp32 存储 + 段寄存器
             //    + 切栈 + call + 恢复）——上界必须真实，否则复制溢出岛页。
-            const STUB_MAX: usize = 320;
+            const STUB_MAX: usize = 512;
             let stub_len = cell_bytes.len() + 5 + STUB_MAX;
             let (page, off_island) = unsafe {
                 if CUR_PAGE == 0 || CUR_OFF + stub_len > 4096 {
@@ -2390,6 +2540,7 @@ mod island {
             };
             let cell = (page + off_island) as u64;
             let stub = gen_stub(site, cell_bytes, resume, cell);
+            assert!(stub.len() <= stub_len, "island stub size bound");
             // d. 写桩 + 刷指令缓存（岛页当前 RW，收尾统一转 RX）
             // SAFETY: page..page+4096 为本进程独占岛页，off+stub_len ≤ 4096
             unsafe {
@@ -2429,7 +2580,11 @@ mod island {
             LEDGER
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .push(PatchSite { site, stub: target });
+                .push(PatchSite {
+                    site,
+                    stub: target,
+                    cell,
+                });
             island_n += 1;
             // 记录岛页区间（fork 快照传递 + MemRegistry 登记）
             let span = (page as u64, page as u64 + 4096);
@@ -2483,7 +2638,10 @@ mod island {
         b[0x38..0x3A].copy_from_slice(&sa[OFF_SEGS..OFF_SEGS + 2]); // cs
         b[0x42..0x44].copy_from_slice(&sa[OFF_SEGS + 2..OFF_SEGS + 4]); // ss
                                                                         // context_flags = CONTEXT_AMD64 | CONTROL | INTEGER
-        b[0x30..0x34].copy_from_slice(&0x0010_0003u32.to_le_bytes());
+        b[0x30..0x34].copy_from_slice(&0x0010_000Bu32.to_le_bytes());
+        b[0x44..0x48].copy_from_slice(&(frame.e_flags as u32).to_le_bytes());
+        b[0x100..0x300].copy_from_slice(&sa[OFF_FP..OFF_FP + 512]);
+        b[0x34..0x38].copy_from_slice(&sa[OFF_FP + 24..OFF_FP + 28]);
         // syscall 返回形态（岛路径）：Rax=0、Rip/Rcx=cell（patch 区不可落）、
         // R11=RFLAGS
         let cell = u64::from_le_bytes(sa[OFF_CELL..OFF_CELL + 8].try_into().unwrap());

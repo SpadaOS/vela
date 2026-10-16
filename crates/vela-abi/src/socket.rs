@@ -23,6 +23,9 @@ pub const IPPROTO_TCP: u32 = 6;
 pub const TCP_NODELAY: u32 = 1;
 
 pub const MSG_DONTWAIT: u32 = 0x40;
+pub const MSG_PEEK: u32 = 0x2;
+pub const MSG_TRUNC: u32 = 0x20;
+pub const MSG_NOSIGNAL: u32 = 0x4000;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]

@@ -16,6 +16,7 @@ BB_MARKER="$BB_SRC/.vela-source-sha256"
 command -v make >/dev/null || { echo "make not in PATH"; exit 1; }
 command -v gcc >/dev/null || { echo "gcc not in PATH (HOSTCC)"; exit 1; }
 command -v zig >/dev/null || { echo "zig not in PATH"; exit 1; }
+test "$(zig version)" = "0.13.0" || { echo "Zig 0.13.0 required" >&2; exit 1; }
 
 # zig 命令行全是相对路径，排除 msys2 参数/环境变量转换的干扰面
 export MSYS2_ARG_CONV_EXCL="*"
@@ -43,13 +44,13 @@ make -s allnoconfig HOSTCC=gcc </dev/null >/dev/null 2>&1
 for f in ECHO LS CAT TRUE FALSE NPROC ENV PRINTF \
          ASH CP MV RM MKDIR RMDIR LN HEAD TAIL WC GREP SLEEP SEQ \
          XARGS TEST EXPR SORT UNIQ DATE DF DU BASENAME DIRNAME WHOAMI \
-         FIND TAR GZIP WGET NC; do
+         FIND TAR GZIP GUNZIP WGET NC; do
   sed -i "s/^# CONFIG_${f} is not set/CONFIG_${f}=y/" .config
 done
 # TAR's implementation keeps the extraction callback in a feature-gated
 # libarchive object. Enable the small feature set needed by `tar -cf` and by
 # the long-option parser so the selected applet links consistently.
-for f in LONG_OPTS FEATURE_TAR_LONG_OPTIONS FEATURE_TAR_CREATE FEATURE_TAR_TO_COMMAND; do
+for f in LONG_OPTS FEATURE_TAR_LONG_OPTIONS FEATURE_TAR_CREATE FEATURE_TAR_TO_COMMAND FEATURE_GZIP_DECOMPRESS; do
   sed -i "s/^# CONFIG_${f} is not set/CONFIG_${f}=y/" .config
 done
 sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
@@ -85,6 +86,14 @@ sed -i 's|scripts/basic/fixdep|: fixdep-disabled|' scripts/Makefile.build script
 # 修复：jq == NULL 时无指针可重定位，跳过 relocation 块。
 sed -i 's/^\tif (offset) {/\tif (offset \&\& jq != NULL) {/' shell/ash.c
 grep -q 'if (offset && jq != NULL) {' shell/ash.c || { echo "FATAL: growjobtab NULL guard patch failed"; exit 1; }
+# BusyBox deliberately stores an unaligned ushort on x86. Use the equivalent
+# byte copy so Zig's alignment sanitizer does not abort real gzip workloads.
+sed -i 's/ush \*dst16 = (void\*) dst;/\/\* byte copy permits an unaligned destination \*\//; s/\*dst16 = w; \/\* unaligned LSB 16-bit store \*\//memcpy(dst, \&w, sizeof(w));/' archival/gzip.c
+grep -q 'memcpy(dst, &w, sizeof(w));' archival/gzip.c || { echo "FATAL: gzip alignment patch failed"; exit 1; }
+# Use BusyBox's portable memcpy helpers for decompression and other unaligned
+# loads too; keep the sanitizer enabled so unrelated undefined behavior fails.
+sed -i 's/^#if defined(i386) || defined(__x86_64__) || defined(__powerpc__)$/#if 0 \/\* Vela: portable unaligned access \*\//' include/platform.h
+grep -q 'Vela: portable unaligned access' include/platform.h || { echo "FATAL: portable unaligned access patch failed"; exit 1; }
 # zig 用 lld：GNU ld 专属链接参数（--sort-section/--sort-common/--warn-common/
 # --verbose）不被支持，trylink 的 check_cc 探测在纯编译阶段无法发现，直接在
 # 源头中和；CI 无 binutils，跳过 strip（未 strip 静态二进制对 vela 无影响）

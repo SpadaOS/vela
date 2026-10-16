@@ -22,6 +22,12 @@ pub const SIG_SETMASK: u32 = 2;
 pub const SIG_DFL: u64 = 0;
 pub const SIG_IGN: u64 = 1;
 pub const NSIG: u32 = 65;
+pub const SA_SIGINFO: u64 = 4;
+pub const SA_RESTORER: u64 = 0x0400_0000;
+pub const SA_ONSTACK: u64 = 0x0800_0000;
+pub const SA_RESTART: u64 = 0x1000_0000;
+pub const SA_NODEFER: u64 = 0x4000_0000;
+pub const SA_RESETHAND: u64 = 0x8000_0000;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]

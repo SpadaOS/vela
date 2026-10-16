@@ -41,6 +41,7 @@ pub struct LoadedImage {
 /// 解释器映像（ld-musl）的装载摘要。
 #[derive(Clone, Debug)]
 pub struct InterpImage {
+    pub segments: Vec<Segment>,
     pub bias: u64,
     /// 已加 bias 的解释器入口（_dlstart）。
     pub entry: u64,

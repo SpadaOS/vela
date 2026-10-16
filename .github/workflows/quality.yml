@@ -1,0 +1,54 @@
+name: Quality
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        type: string
+        default: ""
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      CARGO_TERM_COLOR: always
+      VELA_RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: rustfmt, clippy
+      - uses: mlugg/setup-zig@53fc45b17fe98b52f92ee5ea08ff48a85a3e7eb7 # v1
+        with:
+          version: 0.13.0
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
+        with:
+          update: false
+          path-type: inherit
+          install: make gcc bzip2 diffutils curl
+      - name: Shared quality and extracted-package acceptance
+        shell: msys2 {0}
+        run: pwsh.exe -NoProfile -File scripts/quality.ps1 -BuildBusybox -Package
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: vela-quality-evidence
+          path: |
+            release/validation
+            release/package-validation
+            release/package.json
+            release/quality.log
+      - name: Upload validated package
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: vela-release-package
+          path: |
+            release/vela-*-windows-x64.zip
+            release/vela-*-windows-x64.zip.sha256
+          if-no-files-found: error
