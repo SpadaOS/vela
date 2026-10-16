@@ -20,6 +20,7 @@ pub fn dispatch(proc: &mut GuestProcess, host: &dyn Host, nr: u64, a: [u64; 6]) 
         abi::SYS_SELECT => file::sys_select(proc, host, a),
         abi::SYS_PSELECT6 => file::sys_pselect6(proc, host, a),
         abi::SYS_WRITEV => file::sys_writev(proc, host, a[0], a[1], a[2]),
+        abi::SYS_READV => file::sys_readv(proc, host, a[0], a[1], a[2]),
         abi::SYS_OPEN => file::sys_open(proc, host, a[0], a[1]),
         abi::SYS_OPENAT => file::sys_openat(proc, host, a),
         abi::SYS_CLOSE => file::sys_close(proc, host, a[0]),
@@ -36,8 +37,8 @@ pub fn dispatch(proc: &mut GuestProcess, host: &dyn Host, nr: u64, a: [u64; 6]) 
         abi::SYS_PIPE => file::sys_pipe2(proc, host, a[0], 0),
         abi::SYS_WAIT4 => proc::sys_wait4(a[0], a[1], a[2]),
         abi::SYS_KILL => signal::sys_kill(proc, a[0], a[1]),
-        abi::SYS_TKILL => signal::sys_kill(proc, proc.pid as u64, a[1]),
-        abi::SYS_TGKILL => signal::sys_tgkill(proc, a[0], a[1], a[2], host),
+        abi::SYS_TKILL => signal::sys_tgkill(proc, proc.pid as u64, a[0], a[1]),
+        abi::SYS_TGKILL => signal::sys_tgkill(proc, a[0], a[1], a[2]),
         abi::SYS_GETPPID => proc::sys_getppid(proc),
         abi::SYS_GETPGRP | abi::SYS_GETPGID => proc.pid as i64,
         abi::SYS_SETPGID | abi::SYS_SETSID | abi::SYS_GETSID => proc.pid as i64,
@@ -56,6 +57,10 @@ pub fn dispatch(proc: &mut GuestProcess, host: &dyn Host, nr: u64, a: [u64; 6]) 
         abi::SYS_ARCH_PRCTL => proc::sys_arch_prctl(proc, host, a[0], a[1]),
         abi::SYS_GETRANDOM => proc::sys_getrandom(proc, host, a[0], a[1]),
         abi::SYS_GETPID => proc.pid as i64,
+        abi::SYS_SCHED_YIELD => {
+            std::thread::yield_now();
+            0
+        }
         abi::SYS_GETTID => host.current_tid() as i64,
         abi::SYS_GETUID | abi::SYS_GETEUID => proc.uid as i64,
         abi::SYS_GETGID | abi::SYS_GETEGID => proc.gid as i64,
@@ -114,8 +119,8 @@ pub fn dispatch(proc: &mut GuestProcess, host: &dyn Host, nr: u64, a: [u64; 6]) 
         abi::SYS_BIND => socket::sys_bind(proc, host, a[0], a[1], a[2]),
         abi::SYS_CONNECT => socket::sys_connect(proc, host, a[0], a[1], a[2]),
         abi::SYS_LISTEN => socket::sys_listen(proc, host, a[0], a[1]),
-        abi::SYS_ACCEPT => socket::sys_accept(proc, host, a[0], 0),
-        abi::SYS_ACCEPT4 => socket::sys_accept(proc, host, a[0], a[3]),
+        abi::SYS_ACCEPT => socket::sys_accept(proc, host, a[0], a[1], a[2], 0),
+        abi::SYS_ACCEPT4 => socket::sys_accept(proc, host, a[0], a[1], a[2], a[3]),
         abi::SYS_SHUTDOWN => socket::sys_shutdown(proc, host, a[0], a[1]),
         abi::SYS_SENDTO => socket::sys_sendto(proc, host, a),
         abi::SYS_RECVFROM => socket::sys_recvfrom(proc, host, a),

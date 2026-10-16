@@ -1,78 +1,39 @@
-0.1.3 Windows 使用标准库 Winsock-backed socket contract 提供 TCP/UDP、AF_UNIX socketpair 和 socket-aware poll/epoll；同时保留 0.1.2 的 pthread、soft-TLS 与 WaitOnAddress futex。LinuxDev 和 SpadaOS 对 socket/epoll 继续返回 Unimplemented，guest-side crate 不依赖 Windows API。阻塞等待不持有进程共享状态锁；多线程 fork/exec 的边界见 docs/NONGOALS.md。
+# Host 契约（0.1.4）
 
-# HOST 契约（五组 + Trap/Proc，SpadaOS 就绪）
+`vela-sys::Host` 是 runtime 与宿主之间的边界，由 HostMem、HostFileOps、HostTime、HostTls、HostTrap 和 HostProc 组成。Windows x86_64 是唯一可运行宿主；LinuxDev 用于逻辑测试，SpadaOS 保持 Unimplemented。runtime、loader、fs 不访问 Windows API。
 
-`vela-sys` 是 runtime 与宿主之间的唯一边界（规格 2.4）。0.0.3 起 `Host`
-按 SpadaOS 内核能力拆为 **五组 supertrait**（PLAN-0.0.3 T3.1）；0.1.0
-新增 **HostTrap / HostProc** 两组（PLAN-0.1.0 T1.1/T1.2），把 Windows
-专属的陷阱与进程机制从 cli/runtime 收进契约：
+## 状态与等待
 
-```
-Host = HostMem + HostFileOps + HostTime + HostTls
-- Windows 0.1.3 保留 pthread 形态 clone、基础 futex，并增加 socket/epoll Host contract；阻塞调用不持有进程共享状态锁。多线程 fork/exec、robust futex 和完整异步信号仍不在范围内。
-     + HostTrap + HostProc（0.1.0；默认 Unimplemented）
-```
+`ProcessShared<GuestState>` 的一个 mutex guard 串行化地址空间、fd、信号 disposition 和子进程表变更。`GuestContext::enter` 在 guard 内绑定注册的 GuestThread，保存/恢复其 TLS、mask、signal frame 与 altstack。
 
-runtime 及以上禁止 `#[cfg(target_os)]` 与任何宿主类型；路径在进入 Host
-之前已由 vela-fs 翻译成宿主原生路径；客户虚拟地址空间由 runtime/loader
-管理，Host 只按请求 map/protect/unmap。
+HostSocket 创建时立即拥有原生 socket，始终使用 OS 非阻塞模式；逻辑 O_NONBLOCK、连接状态和超时由独立短锁保护。一次 syscall 只做有界尝试，CLI 在释放进程 guard 后等待再尝试。Linux flags 不临时修改共享的 OS blocking 模式。管道也使用非阻塞原生尝试；fork 元数据通道单独保持阻塞协议。
 
-## 五组契约
+发送前复制有界 guest 数据；接收进入 owned buffer，再验证权限并写回。guest 切片不跨越锁释放或等待。映射和保护位变更由同一 guard 串行化；read/write 检查映射、溢出、ELF 段及最新 mmap/mprotect 权限。
 
-| 组 | trait | 方法 | SpadaOS 内核能力对应 |
-|---|---|---|---|
-| map | `HostMem` | `map` / `protect` / `unmap`；0.0.4 起 `map_file` / `unmap_view` / `decommit` | 地址空间：匿名映射、W^X 收敛、整块释放；文件映射（Windows 走 `CreateFileMappingW` COW，写不回宿主文件） |
-| file | `HostFileOps` | `open` `open_dir` `mkdir` `remove` `rename` `sync_file` `dup_file` `read` `write` `seek` `stat_path` `stat_file` `close` `stdio` | VFS：文件/目录 CRUD、元数据、句柄复制 |
-| time | `HostTime` | `monotonic_ns` / `realtime` / `random` | 时钟：单调钟/实时钟；熵源 |
-| thread | `HostTls` + `HostProc` | `set_fs_base` / `spawn_guest_thread` / `thread_exit` | Windows 原生线程、每线程 soft-TLS、clear-tid |
-| futex | `Host::futex_*` | `futex_wait` / `futex_wake` | Windows WaitOnAddress/WakeByAddress；LinuxDev/SpadaOS 保持桩 |
+## 契约组
 
-## Trap / Proc 契约（0.1.0 T1.1/T1.2）
+| 组 | 责任 |
+| --- | --- |
+| HostMem | map/protect/unmap、私有文件视图、decommit；Windows reserve 仅整块释放 |
+| HostFileOps | 文件/目录/stdio/pipe、终端探测、poll、socket 及 options |
+| HostTime | 单调/实时时钟、随机字节 |
+| HostTls/HostProc | guest tid、原生线程、clear-tid、futex、进程句柄和子进程生命周期 |
+| HostTrap | 进入 guest、安装 trap、代码范围、TLS 模拟、FP 保存恢复、fork 上下文 |
 
-| 组 | trait | 方法 | 说明 |
-|---|---|---|---|
-| trap | `HostTrap` | `install_trap` / `replace_exec_ranges` / `enter_guest` / `resume_child` | syscall 陷阱机制（UD2 异常 / 岛页跳板，`--trap=auto\|veh\|island`）与客户执行进入/恢复 |
-| trap | `HostTrap`（TLS） | `fs_base_supported` / `preset_fs_base` / `commit_fs_base` / `read_fs_base` / `fs_trampoline_addr` / `enable_soft_tls` / `set_soft_tls_base` / `soft_tls_stub_hit` | FSGSBASE 能力探测与 soft-tls 软件模拟 |
-| trap | `HostTrap`（岛） | `build_islands` / `trap_backend_name` / `island_veh_counts` | 岛页计划构建与后端计数（doctor 报告） |
-| trap | `HostTrap`（fork） | `fork_child_context` | 从父陷阱帧合成子进程 CONTEXT（子返回 0 形态） |
-| proc | `HostProc` | `shared_section` / `map_section_anywhere` / `map_section_at` / `unmap_section_view` / `set_inherit` | 跨进程共享 section（fork 快照通道）与句柄继承 |
-| proc | `HostProc` | `spawn_self` / `wait` / `kill` / `open_process` / `close_handle` / `current_pid` | 子进程生命周期（fork/wait4/kill）与 pid 探测 |
-| proc | `HostProc`（管道） | `create_inherit_pipe` / `pipe_write_all` / `pipe_read_exact` / `pipe_end_from_raw` | fork 元数据通道与管道 fd 继承 |
+## Windows 后端
 
-两组默认全部 `Unimplemented`/空实现——**目前唯一完整实现：windows**
-（VEH/UD2 陷阱 + 岛页跳板、`CreateProcessW` 自我 spawn、页文件
-section）。其它宿主按表逐方法填实即为接入完成；不要为尚未存在的
-内核写假实现。
+- socket2 封装 Winsock socket，WSAPoll 使用显式 Linux/Winsock 位转换；连接失败补充 SO_ERROR 查询，WSA 错误转换为 Linux errno。
+- socketpair 是 64 KiB 有界队列，两端分别维护 read/write shutdown；最后一个 Arc 引用关闭资源。dup 共享 open-file-description flags，CLOEXEC 独立。
+- epoll 是 runtime 的 level-triggered watch 表，记录注册 fd 和稳定资源身份，最后别名关闭后清理 watch，轮转 maxevents。
+- futex WAIT/WAKE 注册等待者并有界重试，支持定向信号中断，退出 clear-tid 唤醒；注册在返回时删除。Host 的 WaitOnAddress 接口仍保留。
+- Native guest thread 使用 CreateThread/ExitThread；安全点轮询已结束线程句柄后释放每线程 trap scratch 与句柄。
+- island/异常路径各线程独立保存寄存器、flags、512-byte FXSAVE 状态和宿主栈；clone 续接迁移 cell，fork 合成完整需要的控制/整数/浮点现场。
+- SIGCHLD 在安全点轮询原生 child handle 时置 pending；handler 在 guest 安全点执行，wait4 回收句柄。Ctrl+C callback 只发布原子事件。
 
-## 关键约定
+## 边界
 
-- `map` 返回的匿名内存必须零填充；Windows 实现初始 RW，随后由 runtime
-  显式 `protect` 收敛（W^X）。
-- `unmap` 在 Windows 上只能整块释放 reserve 基址；runtime 的 munmap 账本
-  已按此假设设计（只移除完全覆盖的登记项）。
-- `stat_*` 返回的 `ino/dev` 只需「同进程内稳定 + stat/getdents 一致」
-  （musl 不要求真实 inode；Windows 实现用路径哈希）。
-- `map_file` 的可写视图必须 COW（Windows 用 `PAGE_WRITECOPY`），客户写入
-  **永不**回写宿主文件；对文件视图 `protect` 加 WRITE 会关闭 COW——
-  runtime 已按此约束实现（0.0.4）。
-- `set_fs_base` 需要 CPU+OS 的 FSGSBASE；不支持时 runtime 降级（仅记录），
-  TLS 依赖程序无法运行——见 docs/DESIGN.md「TLS/FS」。
-- pread64/pwrite64 的宿主层用 seek→io→seek-back 组合实现，依赖
-  `HostFile` 单所有权（v0.x 单线程契约）。
+普通磁盘文件和重载/快照工作仍在状态 guard 内执行；网络、pipe、poll/select/epoll、futex、wait4 等可等待路径采用有界尝试。标准输入的阻塞和控制台交互不提供完整 Linux tty/job-control 语义。
 
-## 实现清单
+单线程 fork 支持既有文件/pipe 快照；包含任何 socket/socketpair/epoll fd 时，创建子进程前返回 ENOSYS。多线程 fork 返回 EAGAIN；exec 必须为唯一存活 guest 线程且由主线程发起。
 
-| 宿主 | 状态 | 说明 |
-|---|---|---|
-| windows | **唯一可运行宿主**（0.1.0） | VirtualAlloc/Protect/Free、std 文件与控制台、RtlGenRandom、UD2/岛页陷阱、CreateProcessW 自我 spawn、页文件 section；在非 Windows 上运行客户不在 0.1.0 目标内（NONGOALS） |
-| linux_dev | 逻辑测试壳 | 分配器模拟 map，仅供 loader/runtime 单元逻辑（Trap/Proc 走默认桩） |
-| spadaos | 骨架 | 每组 `Unimplemented`；按上表逐组填满即为 SpadaOS 接入完成 |
-
-## 未来扩展
-
-- `Host` 增加 `unix_bind` / `anon_shm` 以接外部 X server（第一代 GUI =
-  外部 Windows X server + Vela 只提供通路；不要把网络设计死成只能 TCP）
-- Windows 0.1.2 实现 pthread 形态 clone 和基础 futex；阻塞调用不持有进程共享状态锁。多线程 fork/exec、robust futex 和线程信号仍不在范围内。
-  `CLONE_VM|CLONE_FILES|CLONE_SETTLS` 当线程用）
-
-\r\n
+发布包运行无需 Rust、Zig 或额外网络运行时；源码构建仍需要 Cargo 依赖。doctor 的实时计数只属于 doctor 自己，运行中的 guest 数据通过 `run -v` 观测；guest 资产先从可执行文件邻近目录查找，再查当前工作目录。

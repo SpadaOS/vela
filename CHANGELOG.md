@@ -2,6 +2,16 @@
 
 本项目的所有显著变更记录于此（Keep a Changelog 格式）。
 
+## [0.1.4] - Unreleased
+
+- Replaced weak exit-code smoke checks with bounded, byte-checked gzip/tar, real loopback wget/nc, and extracted-package acceptance with binary hashes.
+- Serialized shared trap state, registered per-thread signal/TLS context, owned guest IO buffers and permission checks; network/pipe/futex/poll/epoll/wait4 retry outside the shared guard.
+- Reworked native nonblocking socket state, Linux options/timeouts/address/message ABI, WSA errno translation, IPv6, bounded socketpair and shutdown semantics.
+- Stabilized epoll watches across dup/close/fd reuse and added rotating fairness and concurrent pipe registration checks.
+- Added directed thread signals, alternate-stack/FP/flags restoration, temporary-mask waits, selected SA_RESTART, SIGCHLD safe-point observation and fork/exec signal state rules.
+- Replaced global island scratch with per-thread storage, restored FP/flags across island fork, and corrected clone continuation into relocated cells.
+- Unified branch/PR/main/manual/release quality gates, pinned Zig 0.13.0 guest builds, package validation, doctor asset lookup, and documented unsupported semantics. No 0.1.4 tag or public release has been created.
+
 ## [0.1.3] - 2026-10-11
 
 - Added Windows Winsock-backed TCP/UDP sockets, local socketpair, socket-aware poll/select, and level-triggered epoll with a 1024 descriptor cap.

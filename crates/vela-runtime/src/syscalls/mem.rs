@@ -95,6 +95,11 @@ pub(super) fn sys_mmap(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6]) ->
         });
     }
     proc.mem.add(crate::mem::MemRange::reserve(got, len_up));
+    proc.prot_ledger.push(crate::ProtOverride {
+        start: got,
+        len: len_up,
+        prot: linux_prot as u8,
+    });
     got as i64
 }
 
@@ -151,6 +156,11 @@ pub(super) fn sys_mmap_file(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6
                 Ok(base) if !fixed || base == addr as usize => {
                     proc.mem
                         .add(crate::mem::MemRange::view(base as u64, len_up));
+                    proc.prot_ledger.push(crate::ProtOverride {
+                        start: base as u64,
+                        len: len_up,
+                        prot: linux_prot as u8,
+                    });
                     return base as i64;
                 }
                 Ok(base) => {
@@ -173,12 +183,22 @@ pub(super) fn sys_mmap_file(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6
     if carve {
         // 预留区可能处于 PROT_NONE：先放开为 RW，写入后收敛到请求保护位
         let _ = unsafe { host.protect(addr as usize, len_usize, HostProt::READ | HostProt::WRITE) };
+        proc.prot_ledger.push(crate::ProtOverride {
+            start: addr,
+            len: len_up,
+            prot: 3,
+        });
         if let Err(e) = write_guest(proc, addr, &data) {
             return -(e as i64);
         }
         if prot.bits() != (HostProt::READ | HostProt::WRITE).bits() {
             let _ = unsafe { host.protect(addr as usize, len_up as usize, prot) };
         }
+        proc.prot_ledger.push(crate::ProtOverride {
+            start: addr,
+            len: len_up,
+            prot: linux_prot as u8,
+        });
         return addr as i64;
     }
     let hint = if fixed { addr as usize } else { 0 };
@@ -204,6 +224,11 @@ pub(super) fn sys_mmap_file(proc: &mut GuestProcess, host: &dyn Host, a: [u64; 6
     if prot.bits() != (HostProt::READ | HostProt::WRITE).bits() {
         let _ = unsafe { host.protect(got as usize, len_usize, prot) };
     }
+    proc.prot_ledger.push(crate::ProtOverride {
+        start: got,
+        len: len_up,
+        prot: linux_prot as u8,
+    });
     got as i64
 }
 
@@ -238,6 +263,12 @@ pub(super) fn sys_mprotect(
     len: u64,
     linux_prot: u64,
 ) -> i64 {
+    if !addr.is_multiple_of(PAGE) || linux_prot & !7 != 0 {
+        return -(abi::EINVAL as i64);
+    }
+    let Some(len) = page_align(len) else {
+        return -(abi::EINVAL as i64);
+    };
     if len == 0 {
         return 0;
     }

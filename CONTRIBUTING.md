@@ -29,7 +29,7 @@ type 取值：
 - 所有公开错误用手写 enum 或 `thiserror`，library 路径禁止 `unwrap`（CLI 可 `exit`）
 - 每个 `unsafe` 块写一行 SAFETY 注释，说明不变量
 - 客户地址用 `GuestAddr` 语义对待，不与宿主指针混用
-- 零第三方依赖是 v0 的硬约束；新增依赖需先开 issue 讨论
+- 依赖保持最小并由 Cargo.lock 固定；socket 后端已使用 socket2。新增依赖说明用途和运行时要求。
 - v0 全同步，禁止 tokio/async
 
 ## PR 流程
@@ -38,3 +38,5 @@ type 取值：
 2. 确保 `cargo build` 与 `cargo test --workspace` 通过
 3. 涉及 Windows 特有路径（VEH、内存保护）必须在 Windows 上验证
 4. 无 Windows 环境也能贡献：vela-abi、ELF 解析器、单元测试
+
+完整 Windows 门禁：`./scripts/quality.ps1 -BuildBusybox -Package`（Zig 0.13.0 + MSYS2）。PR/main/manual/release 共用该入口，验收报告保存到 release 目录。

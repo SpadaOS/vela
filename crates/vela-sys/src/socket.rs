@@ -1,711 +1,526 @@
-//! Platform-neutral socket state. Windows uses the standard Winsock-backed
-//! `std::net` objects; the runtime only sees this small safe contract.
-
-use std::collections::VecDeque;
-use std::io::{Read, Write};
-use std::net::{
-    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
-};
-use std::sync::{Arc, Condvar, Mutex};
+//! Nonblocking socket operations. The runtime owns interruptible waits;
+//! no OS call below waits while holding shared metadata.
 
 use crate::HostError;
 use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::VecDeque;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr};
+use std::sync::{Arc, Mutex};
 
-#[derive(Debug)]
-pub(crate) struct PairBus {
-    a_to_b: Mutex<VecDeque<u8>>,
-    b_to_a: Mutex<VecDeque<u8>>,
-    open_a: Mutex<bool>,
-    open_b: Mutex<bool>,
-    wake: Condvar,
+const PAIR_CAPACITY: usize = 64 * 1024;
+
+#[derive(Debug, Default)]
+struct PairState {
+    queues: [VecDeque<u8>; 2],
+    read_closed: [bool; 2],
+    write_closed: [bool; 2],
 }
 
 #[derive(Debug)]
-pub(crate) enum SocketState {
-    Unbound {
-        domain: u16,
-        kind: u32,
-        nonblock: bool,
-        reuseaddr: bool,
-        nodelay: bool,
-    },
-    Listener {
-        listener: TcpListener,
-        nonblock: bool,
-        pending: VecDeque<TcpStream>,
-    },
-    Stream {
-        stream: TcpStream,
-        nonblock: bool,
-    },
-    Datagram {
-        socket: UdpSocket,
-        nonblock: bool,
-    },
+enum Backend {
+    Native(Socket),
     Pair {
-        bus: Arc<PairBus>,
-        side_a: bool,
-        nonblock: bool,
+        bus: Arc<Mutex<PairState>>,
+        side: usize,
     },
-    Closed,
+}
+
+#[derive(Debug, Default)]
+struct Metadata {
+    nonblock: bool,
+    connecting: bool,
+    connected: bool,
+    connect_failed: bool,
+    error: i32,
+    receive_timeout_us: u64,
+    send_timeout_us: u64,
+}
+
+#[derive(Debug)]
+struct SocketInner {
+    backend: Backend,
+    domain: u16,
+    kind: u32,
+    meta: Mutex<Metadata>,
+}
+
+impl Drop for SocketInner {
+    fn drop(&mut self) {
+        if let Backend::Pair { bus, side } = &self.backend {
+            let mut state = bus.lock().unwrap_or_else(|p| p.into_inner());
+            state.read_closed[*side] = true;
+            state.write_closed[*side] = true;
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
-pub struct HostSocket(pub(crate) Arc<Mutex<SocketState>>);
+pub struct HostSocket(Arc<SocketInner>);
 
 impl HostSocket {
-    pub fn new(domain: u16, kind: u32, nonblock: bool) -> Self {
-        Self(Arc::new(Mutex::new(SocketState::Unbound {
+    pub fn new(domain: u16, kind: u32, nonblock: bool) -> Result<Self, HostError> {
+        let domain_value = match domain {
+            crate::AF_INET => Domain::IPV4,
+            crate::AF_INET6 => Domain::IPV6,
+            _ => return Err(HostError::Other(crate::EAFNOSUPPORT)),
+        };
+        let (socket_type, protocol) = match kind & crate::SOCK_TYPE_MASK {
+            crate::SOCK_STREAM => (Type::STREAM, Protocol::TCP),
+            crate::SOCK_DGRAM => (Type::DGRAM, Protocol::UDP),
+            _ => return Err(HostError::Invalid),
+        };
+        let socket = Socket::new(domain_value, socket_type, Some(protocol)).map_err(map_io)?;
+        socket.set_nonblocking(true).map_err(map_io)?;
+        Ok(Self(Arc::new(SocketInner {
+            backend: Backend::Native(socket),
             domain,
             kind: kind & crate::SOCK_TYPE_MASK,
-            nonblock,
-            reuseaddr: false,
-            nodelay: false,
+            meta: Mutex::new(Metadata {
+                nonblock,
+                ..Metadata::default()
+            }),
         })))
     }
 
     pub fn pair() -> (Self, Self) {
-        let bus = Arc::new(PairBus {
-            a_to_b: Mutex::new(VecDeque::new()),
-            b_to_a: Mutex::new(VecDeque::new()),
-            open_a: Mutex::new(true),
-            open_b: Mutex::new(true),
-            wake: Condvar::new(),
-        });
-        (
-            Self(Arc::new(Mutex::new(SocketState::Pair {
-                bus: bus.clone(),
-                side_a: true,
-                nonblock: false,
-            }))),
-            Self(Arc::new(Mutex::new(SocketState::Pair {
-                bus,
-                side_a: false,
-                nonblock: false,
-            }))),
-        )
+        let bus = Arc::new(Mutex::new(PairState::default()));
+        let endpoint = |side| {
+            Self(Arc::new(SocketInner {
+                backend: Backend::Pair {
+                    bus: bus.clone(),
+                    side,
+                },
+                domain: crate::AF_UNIX,
+                kind: crate::SOCK_STREAM,
+                meta: Mutex::new(Metadata::default()),
+            }))
+        };
+        (endpoint(0), endpoint(1))
+    }
+
+    fn native(&self) -> Result<&Socket, HostError> {
+        match &self.0.backend {
+            Backend::Native(socket) => Ok(socket),
+            _ => Err(HostError::Other(crate::EOPNOTSUPP)),
+        }
+    }
+
+    pub fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+    pub fn nonblocking(&self) -> bool {
+        self.0
+            .meta
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .nonblock
+    }
+    pub fn timeout_us(&self, receive: bool) -> u64 {
+        let meta = self.0.meta.lock().unwrap_or_else(|p| p.into_inner());
+        if receive {
+            meta.receive_timeout_us
+        } else {
+            meta.send_timeout_us
+        }
+    }
+    pub fn set_timeout_us(&self, receive: bool, value: u64) {
+        let mut meta = self.0.meta.lock().unwrap_or_else(|p| p.into_inner());
+        if receive {
+            meta.receive_timeout_us = value;
+        } else {
+            meta.send_timeout_us = value;
+        }
     }
 
     pub fn bind(&self, addr: &[u8]) -> Result<(), HostError> {
-        let mut state = self.0.lock().map_err(|_| HostError::Invalid)?;
-        let (domain, kind, nonblock) = match &*state {
-            SocketState::Unbound {
-                domain,
-                kind,
-                nonblock,
-                ..
-            } => (*domain, *kind, *nonblock),
-            _ => return Err(HostError::Invalid),
-        };
-        let socket_addr = parse_sockaddr(addr, domain)?;
-        match kind {
-            crate::SOCK_STREAM => {
-                let listener = TcpListener::bind(socket_addr).map_err(map_io)?;
-                listener.set_nonblocking(nonblock).map_err(map_io)?;
-                *state = SocketState::Listener {
-                    listener,
-                    nonblock,
-                    pending: VecDeque::new(),
-                };
-            }
-            crate::SOCK_DGRAM => {
-                let socket = UdpSocket::bind(socket_addr).map_err(map_io)?;
-                socket.set_nonblocking(nonblock).map_err(map_io)?;
-                *state = SocketState::Datagram { socket, nonblock };
-            }
-            _ => return Err(HostError::Invalid),
-        }
-        Ok(())
+        self.native()?
+            .bind(&parse_sockaddr(addr, self.0.domain)?.into())
+            .map_err(map_io)
     }
-
-    pub fn listen(&self, _backlog: i32) -> Result<(), HostError> {
-        let state = self.0.lock().map_err(|_| HostError::Invalid)?;
-        matches!(*state, SocketState::Listener { .. })
-            .then_some(())
-            .ok_or(HostError::Invalid)
+    pub fn listen(&self, backlog: i32) -> Result<(), HostError> {
+        self.native()?.listen(backlog.max(0)).map_err(map_io)
     }
-
     pub fn connect(&self, addr: &[u8]) -> Result<(), HostError> {
-        let mut state = self.0.lock().map_err(|_| HostError::Invalid)?;
-        let (domain, kind, nonblock, nodelay) = match &*state {
-            SocketState::Unbound {
-                domain,
-                kind,
-                nonblock,
-                nodelay,
-                ..
-            } => (*domain, *kind, *nonblock, *nodelay),
-            _ => return Err(HostError::Invalid),
-        };
-        let socket_addr = parse_sockaddr(addr, domain)?;
-        match kind {
-            crate::SOCK_STREAM => {
-                if nonblock {
-                    let domain = if socket_addr.is_ipv4() {
-                        Domain::IPV4
-                    } else {
-                        Domain::IPV6
-                    };
-                    let socket =
-                        Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(map_io)?;
-                    socket.set_nonblocking(true).map_err(map_io)?;
-                    let result = socket.connect(&socket_addr.into());
-                    let stream: TcpStream = socket.into();
-                    stream.set_nonblocking(true).map_err(map_io)?;
-                    stream.set_nodelay(nodelay).ok();
-                    *state = SocketState::Stream { stream, nonblock };
-                    if let Err(e) = result {
-                        if e.kind() != std::io::ErrorKind::WouldBlock {
-                            return Err(map_io(e));
-                        }
-                        return Err(HostError::Other(crate::EINPROGRESS));
-                    }
-                    return Ok(());
+        let target = parse_sockaddr(addr, self.0.domain)?;
+        let mut meta = self.0.meta.lock().unwrap_or_else(|p| p.into_inner());
+        if meta.connecting {
+            return Err(HostError::Other(crate::EALREADY));
+        }
+        if meta.connected && self.0.kind == crate::SOCK_STREAM {
+            return Err(HostError::Other(crate::EISCONN));
+        }
+        meta.connect_failed = false;
+        meta.error = 0;
+        match self.native()?.connect(&target.into()) {
+            Ok(()) => {
+                meta.connected = true;
+                Ok(())
+            }
+            Err(error) => {
+                let mapped = map_io(error);
+                if mapped == HostError::Other(crate::EAGAIN)
+                    || mapped == HostError::Other(crate::EINPROGRESS)
+                {
+                    meta.connecting = true;
+                    Err(HostError::Other(crate::EINPROGRESS))
+                } else {
+                    Err(mapped)
                 }
-                let stream = TcpStream::connect(socket_addr).map_err(map_io)?;
-                stream.set_nodelay(nodelay).ok();
-                *state = SocketState::Stream { stream, nonblock };
             }
-            crate::SOCK_DGRAM => {
-                let bind_addr: SocketAddr = if socket_addr.is_ipv4() {
-                    "0.0.0.0:0".parse().unwrap()
-                } else {
-                    "[::]:0".parse().unwrap()
-                };
-                let socket = UdpSocket::bind(bind_addr).map_err(map_io)?;
-                socket.connect(socket_addr).map_err(map_io)?;
-                socket.set_nonblocking(nonblock).map_err(map_io)?;
-                *state = SocketState::Datagram { socket, nonblock };
-            }
-            _ => return Err(HostError::Invalid),
         }
-        Ok(())
     }
-
     pub fn accept(&self) -> Result<Self, HostError> {
-        let mut state = self.0.lock().map_err(|_| HostError::Invalid)?;
-        let SocketState::Listener {
-            listener,
-            nonblock,
-            pending,
-        } = &mut *state
-        else {
-            return Err(HostError::Invalid);
-        };
-        let stream = if let Some(stream) = pending.pop_front() {
-            stream
-        } else {
-            let (stream, _) = listener.accept().map_err(map_io)?;
-            stream
-        };
-        stream.set_nonblocking(*nonblock).map_err(map_io)?;
-        Ok(Self(Arc::new(Mutex::new(SocketState::Stream {
-            stream,
-            nonblock: *nonblock,
-        }))))
+        let (socket, _) = self.native()?.accept().map_err(map_io)?;
+        socket.set_nonblocking(true).map_err(map_io)?;
+        Ok(Self(Arc::new(SocketInner {
+            backend: Backend::Native(socket),
+            domain: self.0.domain,
+            kind: self.0.kind,
+            meta: Mutex::new(Metadata {
+                connected: true,
+                ..Metadata::default()
+            }),
+        })))
     }
-
     pub fn send(&self, data: &[u8], flags: u32) -> Result<usize, HostError> {
-        let mut state = self.0.lock().map_err(|_| HostError::Invalid)?;
-        match &mut *state {
-            SocketState::Stream { stream, nonblock } => {
-                write_stream(stream, *nonblock || flags & crate::MSG_DONTWAIT != 0, data)
+        self.check_flags(flags, false)?;
+        match &self.0.backend {
+            Backend::Native(socket) => socket.send(data).map_err(map_io),
+            Backend::Pair { bus, side } => {
+                if data.is_empty() {
+                    return Ok(0);
+                }
+                let mut state = bus.lock().unwrap_or_else(|p| p.into_inner());
+                if state.write_closed[*side] || state.read_closed[1 - side] {
+                    return Err(HostError::Other(crate::EPIPE));
+                }
+                let queue = &mut state.queues[1 - side];
+                let count = data.len().min(PAIR_CAPACITY - queue.len());
+                if count == 0 {
+                    return Err(HostError::Other(crate::EAGAIN));
+                }
+                queue.extend(&data[..count]);
+                Ok(count)
             }
-            SocketState::Datagram { socket, nonblock } => {
-                send_datagram(socket, *nonblock || flags & crate::MSG_DONTWAIT != 0, data)
-            }
-            SocketState::Pair {
-                bus,
-                side_a,
-                nonblock,
-            } => pair_send(
-                bus,
-                *side_a,
-                *nonblock || flags & crate::MSG_DONTWAIT != 0,
-                data,
-            ),
-            _ => Err(HostError::Other(crate::ENOTCONN)),
         }
     }
-
     pub fn send_to(&self, data: &[u8], addr: &[u8], flags: u32) -> Result<usize, HostError> {
-        let mut state = self.0.lock().map_err(|_| HostError::Invalid)?;
-        match &mut *state {
-            SocketState::Datagram { socket, .. } => socket
-                .send_to(data, parse_sockaddr_from_bytes(addr)?)
-                .map_err(map_io),
-            SocketState::Unbound {
-                domain,
-                kind: crate::SOCK_DGRAM,
-                nonblock,
-                ..
-            } => {
-                let destination = parse_sockaddr(addr, *domain)?;
-                let bind_addr: SocketAddr = if destination.is_ipv4() {
-                    "0.0.0.0:0".parse().unwrap()
+        self.check_flags(flags, false)?;
+        self.native()?
+            .send_to(data, &parse_sockaddr(addr, self.0.domain)?.into())
+            .map_err(map_io)
+    }
+    pub fn recv(&self, data: &mut [u8], flags: u32) -> Result<usize, HostError> {
+        self.recv_from(data, flags).map(|(n, _)| n)
+    }
+    pub fn recv_from(&self, data: &mut [u8], flags: u32) -> Result<(usize, Vec<u8>), HostError> {
+        self.check_flags(flags, true)?;
+        match &self.0.backend {
+            Backend::Pair { bus, side } => {
+                if data.is_empty() {
+                    return Ok((0, Vec::new()));
+                }
+                let mut state = bus.lock().unwrap_or_else(|p| p.into_inner());
+                if state.read_closed[*side] {
+                    return Ok((0, Vec::new()));
+                }
+                let eof = state.write_closed[1 - side];
+                let queue = &mut state.queues[*side];
+                if queue.is_empty() && !eof {
+                    return Err(HostError::Other(crate::EAGAIN));
+                }
+                let count = data.len().min(queue.len());
+                for (out, byte) in data[..count].iter_mut().zip(queue.iter()) {
+                    *out = *byte;
+                }
+                if flags & crate::MSG_PEEK == 0 {
+                    queue.drain(..count);
+                }
+                Ok((count, Vec::new()))
+            }
+            Backend::Native(socket) => {
+                // Receive into an owned datagram buffer so Windows truncation
+                // cannot discard bytes before MSG_TRUNC reports the full size.
+                let mut payload = vec![
+                    std::mem::MaybeUninit::uninit();
+                    if self.0.kind == crate::SOCK_DGRAM {
+                        65536
+                    } else {
+                        data.len()
+                    }
+                ];
+                let host_flags = if flags & crate::MSG_PEEK != 0 { 2 } else { 0 };
+                let (received, addr) = socket
+                    .recv_from_with_flags(&mut payload, host_flags)
+                    .map_err(map_io)?;
+                let copied = data.len().min(received);
+                // SAFETY: recv initialized exactly the first `received` bytes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        payload.as_ptr().cast::<u8>(),
+                        data.as_mut_ptr(),
+                        copied,
+                    );
+                }
+                let count = if flags & crate::MSG_TRUNC != 0 && self.0.kind == crate::SOCK_DGRAM {
+                    received
                 } else {
-                    "[::]:0".parse().unwrap()
+                    copied
                 };
-                let is_nonblock = *nonblock;
-                let socket = UdpSocket::bind(bind_addr).map_err(map_io)?;
-                socket.set_nonblocking(is_nonblock).map_err(map_io)?;
-                let sent = if is_nonblock || flags & crate::MSG_DONTWAIT != 0 {
-                    let probe = socket.try_clone().map_err(map_io)?;
-                    probe.set_nonblocking(true).map_err(map_io)?;
-                    probe.send_to(data, destination).map_err(map_io)?
-                } else {
-                    socket.send_to(data, destination).map_err(map_io)?
-                };
-                *state = SocketState::Datagram {
-                    socket,
-                    nonblock: is_nonblock,
-                };
-                Ok(sent)
+                Ok((
+                    count,
+                    addr.as_socket().map(sockaddr_bytes).unwrap_or_default(),
+                ))
             }
-            SocketState::Pair {
-                bus,
-                side_a,
-                nonblock,
-            } => pair_send(
-                bus,
-                *side_a,
-                *nonblock || flags & crate::MSG_DONTWAIT != 0,
-                data,
-            ),
-            _ => Err(HostError::Other(crate::ENOTCONN)),
         }
     }
-
-    pub fn recv(&self, buf: &mut [u8], flags: u32) -> Result<usize, HostError> {
-        let mut state = self.0.lock().map_err(|_| HostError::Invalid)?;
-        match &mut *state {
-            SocketState::Stream { stream, nonblock } => {
-                read_stream(stream, *nonblock || flags & crate::MSG_DONTWAIT != 0, buf)
-            }
-            SocketState::Datagram { socket, nonblock } => {
-                recv_datagram(socket, *nonblock || flags & crate::MSG_DONTWAIT != 0, buf)
-            }
-            SocketState::Pair {
-                bus,
-                side_a,
-                nonblock,
-            } => pair_recv(
-                bus,
-                *side_a,
-                *nonblock || flags & crate::MSG_DONTWAIT != 0,
-                buf,
-            ),
-            _ => Err(HostError::Other(crate::ENOTCONN)),
-        }
-    }
-
-    pub fn recv_from(&self, buf: &mut [u8], flags: u32) -> Result<(usize, Vec<u8>), HostError> {
-        let mut state = self.0.lock().map_err(|_| HostError::Invalid)?;
-        match &mut *state {
-            SocketState::Stream { stream, nonblock } => {
-                read_stream(stream, *nonblock || flags & crate::MSG_DONTWAIT != 0, buf)
-                    .map(|n| (n, Vec::new()))
-            }
-            SocketState::Datagram { socket, nonblock } => {
-                let (n, addr) =
-                    recv_datagram_from(socket, *nonblock || flags & crate::MSG_DONTWAIT != 0, buf)?;
-                Ok((n, sockaddr_bytes(addr)))
-            }
-            SocketState::Pair {
-                bus,
-                side_a,
-                nonblock,
-            } => pair_recv(
-                bus,
-                *side_a,
-                *nonblock || flags & crate::MSG_DONTWAIT != 0,
-                buf,
-            )
-            .map(|n| (n, Vec::new())),
-            _ => Err(HostError::Other(crate::ENOTCONN)),
-        }
-    }
-
-    pub fn shutdown(&self, how: u32) -> Result<(), HostError> {
-        let state = self.0.lock().map_err(|_| HostError::Invalid)?;
-        if let SocketState::Stream { stream, .. } = &*state {
-            stream
-                .shutdown(match how {
-                    0 => Shutdown::Read,
-                    1 => Shutdown::Write,
-                    2 => Shutdown::Both,
-                    _ => return Err(HostError::Invalid),
-                })
-                .map_err(map_io)
+    fn check_flags(&self, flags: u32, receive: bool) -> Result<(), HostError> {
+        let supported = crate::MSG_DONTWAIT
+            | if receive {
+                crate::MSG_PEEK | crate::MSG_TRUNC
+            } else {
+                crate::MSG_NOSIGNAL
+            };
+        if flags & !supported != 0 {
+            Err(HostError::Other(crate::EOPNOTSUPP))
         } else {
             Ok(())
         }
     }
-
-    pub fn set_nonblocking(&self, enabled: bool) -> Result<(), HostError> {
-        let mut state = self.0.lock().map_err(|_| HostError::Invalid)?;
-        match &mut *state {
-            SocketState::Unbound { nonblock, .. }
-            | SocketState::Listener { nonblock, .. }
-            | SocketState::Stream { nonblock, .. }
-            | SocketState::Datagram { nonblock, .. }
-            | SocketState::Pair { nonblock, .. } => *nonblock = enabled,
-            SocketState::Closed => return Err(HostError::Invalid),
-        }
-        match &mut *state {
-            SocketState::Listener { listener, .. } => {
-                listener.set_nonblocking(enabled).map_err(map_io)
-            }
-            SocketState::Stream { stream, .. } => stream.set_nonblocking(enabled).map_err(map_io),
-            SocketState::Datagram { socket, .. } => socket.set_nonblocking(enabled).map_err(map_io),
-            _ => Ok(()),
-        }
-    }
-
-    pub fn poll_ready(&self, events: u16) -> u16 {
-        let mut state = match self.0.lock() {
-            Ok(s) => s,
-            Err(_) => return crate::POLLERR,
-        };
-        let mut out = 0;
-        match &mut *state {
-            SocketState::Listener {
-                listener,
-                nonblock,
-                pending,
-            } => {
-                if events & crate::POLLIN != 0 {
-                    if !pending.is_empty() {
-                        out |= crate::POLLIN;
-                    } else if let Ok(probe) = listener.try_clone() {
-                        let _ = probe.set_nonblocking(true);
-                        match probe.accept() {
-                            Ok((stream, _)) => {
-                                let _ = stream.set_nonblocking(*nonblock);
-                                pending.push_back(stream);
-                                out |= crate::POLLIN;
-                            }
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                            Err(_) => out |= crate::POLLERR,
-                        }
-                        let _ = listener.set_nonblocking(*nonblock);
-                    }
-                }
-            }
-            SocketState::Stream { stream, .. } => {
-                if events & crate::POLLIN != 0 {
-                    match peek_stream(stream) {
-                        Ok(_) => out |= crate::POLLIN,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(_) => out |= crate::POLLHUP,
-                    }
-                }
-                if events & crate::POLLOUT != 0 {
-                    out |= crate::POLLOUT;
-                }
-            }
-            SocketState::Datagram { socket, .. } => {
-                if events & crate::POLLIN != 0 {
-                    match peek_datagram(socket) {
-                        Ok(_) => out |= crate::POLLIN,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(_) => out |= crate::POLLERR,
-                    }
-                }
-                if events & crate::POLLOUT != 0 {
-                    out |= crate::POLLOUT;
-                }
-            }
-            SocketState::Pair { bus, side_a, .. } => {
-                let q = if *side_a { &bus.b_to_a } else { &bus.a_to_b };
-                if events & crate::POLLIN != 0 && !q.lock().map(|q| q.is_empty()).unwrap_or(true) {
-                    out |= crate::POLLIN;
-                }
-                if events & crate::POLLOUT != 0 {
-                    out |= crate::POLLOUT;
-                }
-                if !bus_open(bus, !*side_a) {
-                    out |= crate::POLLHUP;
-                }
-            }
-            _ => out |= crate::POLLERR,
-        }
-        out
-    }
-
-    pub fn name(&self, peer: bool) -> Result<Vec<u8>, HostError> {
-        let state = self.0.lock().map_err(|_| HostError::Invalid)?;
-        let addr = match &*state {
-            SocketState::Listener { listener, .. } => listener.local_addr().map_err(map_io)?,
-            SocketState::Stream { stream, .. } => {
-                if peer {
-                    stream.peer_addr().map_err(map_io)?
-                } else {
-                    stream.local_addr().map_err(map_io)?
-                }
-            }
-            SocketState::Datagram { socket, .. } => {
-                if peer {
-                    socket.peer_addr().map_err(map_io)?
-                } else {
-                    socket.local_addr().map_err(map_io)?
-                }
-            }
+    pub fn shutdown(&self, how: u32) -> Result<(), HostError> {
+        let direction = match how {
+            0 => Shutdown::Read,
+            1 => Shutdown::Write,
+            2 => Shutdown::Both,
             _ => return Err(HostError::Invalid),
         };
-        Ok(sockaddr_bytes(addr))
-    }
-
-    pub fn set_option(&self, level: u32, opt: u32, value: i32) -> Result<(), HostError> {
-        let mut state = self.0.lock().map_err(|_| HostError::Invalid)?;
-        match (&mut *state, level, opt) {
-            (SocketState::Unbound { reuseaddr, .. }, crate::SOL_SOCKET, crate::SO_REUSEADDR) => {
-                *reuseaddr = value != 0;
-                Ok(())
-            }
-            (SocketState::Unbound { nodelay, .. }, crate::IPPROTO_TCP, crate::TCP_NODELAY) => {
-                *nodelay = value != 0;
-                Ok(())
-            }
-            (SocketState::Stream { stream, .. }, crate::IPPROTO_TCP, crate::TCP_NODELAY) => {
-                stream.set_nodelay(value != 0).map_err(map_io)
-            }
-            (SocketState::Unbound { .. }, crate::SOL_SOCKET, crate::SO_RCVTIMEO)
-            | (SocketState::Unbound { .. }, crate::SOL_SOCKET, crate::SO_SNDTIMEO)
-            | (SocketState::Stream { .. }, crate::SOL_SOCKET, crate::SO_RCVTIMEO)
-            | (SocketState::Stream { .. }, crate::SOL_SOCKET, crate::SO_SNDTIMEO)
-            | (SocketState::Datagram { .. }, crate::SOL_SOCKET, crate::SO_RCVTIMEO)
-            | (SocketState::Datagram { .. }, crate::SOL_SOCKET, crate::SO_SNDTIMEO)
-            | (SocketState::Unbound { .. }, crate::SOL_SOCKET, crate::SO_ERROR)
-            | (SocketState::Stream { .. }, crate::SOL_SOCKET, crate::SO_ERROR)
-            | (SocketState::Datagram { .. }, crate::SOL_SOCKET, crate::SO_ERROR) => Ok(()),
-            _ => Err(HostError::Other(crate::ENOPROTOOPT)),
-        }
-    }
-
-    pub fn get_option(&self, level: u32, opt: u32) -> Result<i32, HostError> {
-        let state = self.0.lock().map_err(|_| HostError::Invalid)?;
-        match (level, opt) {
-            (crate::SOL_SOCKET, crate::SO_ERROR)
-            | (crate::SOL_SOCKET, crate::SO_RCVTIMEO)
-            | (crate::SOL_SOCKET, crate::SO_SNDTIMEO) => Ok(0),
-            (crate::SOL_SOCKET, crate::SO_REUSEADDR) => Ok(match &*state {
-                SocketState::Unbound { reuseaddr, .. } => i32::from(*reuseaddr),
-                _ => 0,
-            }),
-            (crate::IPPROTO_TCP, crate::TCP_NODELAY) => Ok(match &*state {
-                SocketState::Unbound { nodelay, .. } => i32::from(*nodelay),
-                _ => 0,
-            }),
-            _ => Err(HostError::Other(crate::ENOPROTOOPT)),
-        }
-    }
-
-    pub fn close(&self) {
-        if Arc::strong_count(&self.0) > 1 {
-            return;
-        }
-        if let Ok(mut state) = self.0.lock() {
-            if let SocketState::Pair { bus, side_a, .. } = &*state {
-                let slot = if *side_a { &bus.open_a } else { &bus.open_b };
-                if let Ok(mut open) = slot.lock() {
-                    *open = false;
+        match &self.0.backend {
+            Backend::Native(socket) => socket.shutdown(direction).map_err(map_io),
+            Backend::Pair { bus, side } => {
+                let mut state = bus.lock().unwrap_or_else(|p| p.into_inner());
+                if how != 1 {
+                    state.read_closed[*side] = true;
+                    state.queues[*side].clear();
                 }
-                bus.wake.notify_all();
+                if how != 0 {
+                    state.write_closed[*side] = true;
+                }
+                Ok(())
             }
-            *state = SocketState::Closed;
         }
     }
-}
-
-fn bus_open(bus: &PairBus, side_a: bool) -> bool {
-    let slot = if side_a { &bus.open_a } else { &bus.open_b };
-    slot.lock().map(|open| *open).unwrap_or(false)
-}
-
-fn write_stream(stream: &mut TcpStream, nonblock: bool, data: &[u8]) -> Result<usize, HostError> {
-    if nonblock {
-        let probe = stream.try_clone().map_err(map_io)?;
-        probe.set_nonblocking(true).map_err(map_io)?;
-        (&probe).write(data).map_err(map_io)
-    } else {
-        stream.write(data).map_err(map_io)
+    pub fn set_nonblocking(&self, enabled: bool) -> Result<(), HostError> {
+        self.0
+            .meta
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .nonblock = enabled;
+        Ok(())
     }
-}
-
-fn read_stream(
-    stream: &mut TcpStream,
-    nonblock: bool,
-    data: &mut [u8],
-) -> Result<usize, HostError> {
-    if nonblock {
-        let probe = stream.try_clone().map_err(map_io)?;
-        probe.set_nonblocking(true).map_err(map_io)?;
-        (&probe).read(data).map_err(map_io)
-    } else {
-        stream.read(data).map_err(map_io)
-    }
-}
-
-fn send_datagram(socket: &mut UdpSocket, nonblock: bool, data: &[u8]) -> Result<usize, HostError> {
-    if nonblock {
-        let probe = socket.try_clone().map_err(map_io)?;
-        probe.set_nonblocking(true).map_err(map_io)?;
-        probe.send(data).map_err(map_io)
-    } else {
-        socket.send(data).map_err(map_io)
-    }
-}
-
-fn recv_datagram(
-    socket: &mut UdpSocket,
-    nonblock: bool,
-    data: &mut [u8],
-) -> Result<usize, HostError> {
-    if nonblock {
-        let probe = socket.try_clone().map_err(map_io)?;
-        probe.set_nonblocking(true).map_err(map_io)?;
-        probe.recv(data).map_err(map_io)
-    } else {
-        socket.recv(data).map_err(map_io)
-    }
-}
-
-fn recv_datagram_from(
-    socket: &mut UdpSocket,
-    nonblock: bool,
-    data: &mut [u8],
-) -> Result<(usize, SocketAddr), HostError> {
-    if nonblock {
-        let probe = socket.try_clone().map_err(map_io)?;
-        probe.set_nonblocking(true).map_err(map_io)?;
-        probe.recv_from(data).map_err(map_io)
-    } else {
-        socket.recv_from(data).map_err(map_io)
-    }
-}
-
-fn peek_stream(stream: &TcpStream) -> std::io::Result<usize> {
-    let probe = stream.try_clone()?;
-    probe.set_nonblocking(true)?;
-    let mut b = [0u8; 1];
-    probe.peek(&mut b)
-}
-
-fn peek_datagram(socket: &UdpSocket) -> std::io::Result<(usize, SocketAddr)> {
-    let probe = socket.try_clone()?;
-    probe.set_nonblocking(true)?;
-    let mut b = [0u8; 1];
-    probe.peek_from(&mut b)
-}
-
-fn pair_send(bus: &PairBus, side_a: bool, nonblock: bool, data: &[u8]) -> Result<usize, HostError> {
-    let open = if side_a { &bus.open_b } else { &bus.open_a };
-    if !*open.lock().map_err(|_| HostError::Invalid)? {
-        return Err(HostError::Other(crate::EPIPE));
-    }
-    let q = if side_a { &bus.a_to_b } else { &bus.b_to_a };
-    let _ = nonblock;
-    q.lock()
-        .map_err(|_| HostError::Invalid)?
-        .extend(data.iter().copied());
-    bus.wake.notify_all();
-    Ok(data.len())
-}
-
-fn pair_recv(
-    bus: &PairBus,
-    side_a: bool,
-    nonblock: bool,
-    out: &mut [u8],
-) -> Result<usize, HostError> {
-    let q = if side_a { &bus.b_to_a } else { &bus.a_to_b };
-    let mut q = q.lock().map_err(|_| HostError::Invalid)?;
-    if q.is_empty() && !bus_open(bus, !side_a) {
-        return Ok(0);
-    }
-    if q.is_empty() && !nonblock {
-        q = bus.wake.wait(q).map_err(|_| HostError::Invalid)?;
-    }
-    if q.is_empty() {
-        if !bus_open(bus, !side_a) {
-            return Ok(0);
+    pub fn poll_ready(&self, events: u16) -> u16 {
+        match &self.0.backend {
+            Backend::Pair { bus, side } => {
+                let state = bus.lock().unwrap_or_else(|p| p.into_inner());
+                let mut ready = 0;
+                if !state.queues[*side].is_empty()
+                    || state.write_closed[1 - side]
+                    || state.read_closed[*side]
+                {
+                    ready |= events & crate::POLLIN;
+                }
+                if !state.write_closed[*side]
+                    && !state.read_closed[1 - side]
+                    && state.queues[1 - side].len() < PAIR_CAPACITY
+                {
+                    ready |= events & crate::POLLOUT;
+                }
+                if state.write_closed[1 - side] {
+                    ready |= crate::POLLRDHUP & events;
+                }
+                if state.read_closed[1 - side] && state.write_closed[1 - side] {
+                    ready |= crate::POLLHUP;
+                }
+                ready
+            }
+            Backend::Native(socket) => {
+                #[cfg(windows)]
+                let mut ready = crate::windows::poll_socket(socket, events);
+                #[cfg(not(windows))]
+                let mut ready = {
+                    let _ = socket;
+                    crate::POLLERR
+                };
+                let mut meta = self.0.meta.lock().unwrap_or_else(|p| p.into_inner());
+                if meta.connected
+                    && self.0.kind == crate::SOCK_STREAM
+                    && events & crate::POLLRDHUP != 0
+                    && ready & (crate::POLLIN | crate::POLLHUP) != 0
+                {
+                    let mut byte = [std::mem::MaybeUninit::uninit(); 1];
+                    if matches!(socket.peek(&mut byte), Ok(0)) {
+                        ready |= crate::POLLRDHUP;
+                    }
+                }
+                if meta.connecting {
+                    match socket.take_error() {
+                        Ok(Some(error)) => {
+                            meta.error = errno_io(error);
+                            meta.connect_failed = true;
+                            ready |= crate::POLLERR | (events & crate::POLLOUT);
+                        }
+                        Ok(None)
+                            if ready & crate::POLLOUT != 0
+                                && ready & (crate::POLLERR | crate::POLLHUP) == 0 =>
+                        {
+                            meta.connected = true;
+                        }
+                        _ => {}
+                    }
+                    if meta.error != 0 || meta.connected {
+                        meta.connecting = false;
+                    }
+                }
+                if meta.error != 0 {
+                    ready |= crate::POLLERR;
+                }
+                if meta.connect_failed {
+                    ready |= crate::POLLHUP | (events & crate::POLLOUT);
+                }
+                ready
+            }
         }
-        return Err(HostError::Other(crate::EAGAIN));
     }
-    let n = out.len().min(q.len());
-    for dst in &mut out[..n] {
-        *dst = q.pop_front().unwrap();
+    pub fn name(&self, peer: bool) -> Result<Vec<u8>, HostError> {
+        match &self.0.backend {
+            Backend::Pair { .. } => Ok(crate::AF_UNIX.to_le_bytes().to_vec()),
+            Backend::Native(socket) => {
+                let addr = if peer {
+                    socket.peer_addr()
+                } else {
+                    socket.local_addr()
+                }
+                .map_err(map_io)?;
+                addr.as_socket()
+                    .map(sockaddr_bytes)
+                    .ok_or(HostError::Invalid)
+            }
+        }
     }
-    Ok(n)
+    pub fn set_option(&self, level: u32, opt: u32, value: i32) -> Result<(), HostError> {
+        match (level, opt) {
+            (crate::SOL_SOCKET, crate::SO_REUSEADDR) => {
+                self.native()?.set_reuse_address(value != 0).map_err(map_io)
+            }
+            (crate::IPPROTO_TCP, crate::TCP_NODELAY) => {
+                self.native()?.set_nodelay(value != 0).map_err(map_io)
+            }
+            _ => Err(HostError::Other(crate::ENOPROTOOPT)),
+        }
+    }
+    pub fn get_option(&self, level: u32, opt: u32) -> Result<i32, HostError> {
+        match (level, opt) {
+            (crate::SOL_SOCKET, crate::SO_ERROR) => {
+                self.poll_ready(crate::POLLOUT);
+                let mut meta = self.0.meta.lock().unwrap_or_else(|p| p.into_inner());
+                if meta.connect_failed {
+                    return Ok(std::mem::take(&mut meta.error));
+                }
+                if meta.error != 0 {
+                    return Ok(std::mem::take(&mut meta.error));
+                }
+                match &self.0.backend {
+                    Backend::Native(socket) => socket
+                        .take_error()
+                        .map(|e| e.map(errno_io).unwrap_or(0))
+                        .map_err(map_io),
+                    _ => Ok(0),
+                }
+            }
+            (crate::SOL_SOCKET, crate::SO_REUSEADDR) => self
+                .native()?
+                .reuse_address()
+                .map(i32::from)
+                .map_err(map_io),
+            (crate::IPPROTO_TCP, crate::TCP_NODELAY) => {
+                self.native()?.nodelay().map(i32::from).map_err(map_io)
+            }
+            _ => Err(HostError::Other(crate::ENOPROTOOPT)),
+        }
+    }
+    /// The descriptor owns an Arc; dropping the last reference releases it.
+    pub fn close(&self) {}
 }
 
 fn parse_sockaddr(bytes: &[u8], domain: u16) -> Result<SocketAddr, HostError> {
     if bytes.len() < 2 {
         return Err(HostError::Invalid);
     }
-    let family = u16::from_ne_bytes([bytes[0], bytes[1]]);
-    if family != domain && !(domain == crate::AF_INET && family == 0) {
-        return Err(HostError::Invalid);
+    let family = u16::from_le_bytes(bytes[..2].try_into().unwrap());
+    if family != domain {
+        return Err(HostError::Other(crate::EAFNOSUPPORT));
     }
     match family {
-        crate::AF_INET => {
-            if bytes.len() < 8 {
-                return Err(HostError::Invalid);
-            }
-            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
-            let ip = Ipv4Addr::from(u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]));
-            Ok(SocketAddr::new(IpAddr::V4(ip), port))
-        }
-        crate::AF_INET6 => {
-            if bytes.len() < 28 {
-                return Err(HostError::Invalid);
-            }
-            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
-            let mut ip = [0u8; 16];
-            ip.copy_from_slice(&bytes[8..24]);
-            Ok(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip)), port))
-        }
-        _ => Err(HostError::Unimplemented),
+        crate::AF_INET if bytes.len() >= 16 => Ok(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7])),
+            u16::from_be_bytes(bytes[2..4].try_into().unwrap()),
+        )),
+        crate::AF_INET6 if bytes.len() >= 28 => Ok(SocketAddr::V6(std::net::SocketAddrV6::new(
+            Ipv6Addr::from(<[u8; 16]>::try_from(&bytes[8..24]).unwrap()),
+            u16::from_be_bytes(bytes[2..4].try_into().unwrap()),
+            u32::from_be_bytes(bytes[4..8].try_into().unwrap()),
+            u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+        ))),
+        _ => Err(HostError::Invalid),
     }
 }
-
-fn parse_sockaddr_from_bytes(bytes: &[u8]) -> Result<SocketAddr, HostError> {
-    if bytes.len() < 2 {
-        return Err(HostError::Invalid);
-    }
-    let family = u16::from_ne_bytes([bytes[0], bytes[1]]);
-    parse_sockaddr(bytes, family)
-}
-
 fn sockaddr_bytes(addr: SocketAddr) -> Vec<u8> {
     match addr {
-        SocketAddr::V4(a) => {
-            let mut b = vec![0u8; 16];
-            b[0..2].copy_from_slice(&crate::AF_INET.to_ne_bytes());
-            b[2..4].copy_from_slice(&a.port().to_be_bytes());
-            b[4..8].copy_from_slice(&u32::from(*a.ip()).to_be_bytes());
+        SocketAddr::V4(addr) => {
+            let mut b = vec![0; 16];
+            b[..2].copy_from_slice(&crate::AF_INET.to_le_bytes());
+            b[2..4].copy_from_slice(&addr.port().to_be_bytes());
+            b[4..8].copy_from_slice(&addr.ip().octets());
             b
         }
-        SocketAddr::V6(a) => {
-            let mut b = vec![0u8; 28];
-            b[0..2].copy_from_slice(&crate::AF_INET6.to_ne_bytes());
-            b[2..4].copy_from_slice(&a.port().to_be_bytes());
-            b[8..24].copy_from_slice(&a.ip().octets());
+        SocketAddr::V6(addr) => {
+            let mut b = vec![0; 28];
+            b[..2].copy_from_slice(&crate::AF_INET6.to_le_bytes());
+            b[2..4].copy_from_slice(&addr.port().to_be_bytes());
+            b[4..8].copy_from_slice(&addr.flowinfo().to_be_bytes());
+            b[8..24].copy_from_slice(&addr.ip().octets());
+            b[24..28].copy_from_slice(&addr.scope_id().to_le_bytes());
             b
         }
     }
 }
-
-fn map_io(e: std::io::Error) -> HostError {
-    match e.kind() {
-        std::io::ErrorKind::WouldBlock => HostError::Other(crate::EAGAIN),
-        std::io::ErrorKind::ConnectionRefused => HostError::Other(crate::ECONNREFUSED),
-        std::io::ErrorKind::ConnectionReset => HostError::Other(crate::ECONNRESET),
-        std::io::ErrorKind::AddrInUse => HostError::Other(crate::EADDRINUSE),
-        std::io::ErrorKind::NotConnected => HostError::Other(crate::ENOTCONN),
-        std::io::ErrorKind::BrokenPipe => HostError::Other(crate::EPIPE),
-        std::io::ErrorKind::InvalidInput => HostError::Invalid,
-        _ => HostError::Other(e.raw_os_error().unwrap_or(crate::EINVAL)),
+fn errno_io(error: std::io::Error) -> i32 {
+    use std::io::ErrorKind as K;
+    match error.kind() {
+        K::WouldBlock => crate::EAGAIN,
+        K::Interrupted => crate::EINTR,
+        K::ConnectionRefused => crate::ECONNREFUSED,
+        K::ConnectionReset => crate::ECONNRESET,
+        K::AddrInUse => crate::EADDRINUSE,
+        K::NotConnected => crate::ENOTCONN,
+        K::BrokenPipe => crate::EPIPE,
+        K::TimedOut => crate::ETIMEDOUT,
+        K::InvalidInput => crate::EINVAL,
+        K::PermissionDenied => crate::EACCES,
+        _ => match error.raw_os_error() {
+            Some(10035) => crate::EAGAIN,
+            Some(10036) => crate::EINPROGRESS,
+            Some(10037) => crate::EALREADY,
+            Some(10056) => crate::EISCONN,
+            Some(10040) => crate::EMSGSIZE,
+            Some(10047) => crate::EAFNOSUPPORT,
+            Some(10049) => crate::EADDRNOTAVAIL,
+            Some(10051) => crate::ENETUNREACH,
+            Some(10053) => crate::ECONNABORTED,
+            Some(10058) => crate::EPIPE,
+            _ => crate::EIO,
+        },
     }
+}
+fn map_io(error: std::io::Error) -> HostError {
+    HostError::Other(errno_io(error))
 }

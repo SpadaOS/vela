@@ -34,6 +34,14 @@ pub const EALREADY: i32 = 114;
 pub const EINPROGRESS: i32 = 115;
 pub const EISCONN: i32 = 106;
 pub const ENOSPC: i32 = 28;
+pub const EPERM: i32 = 1;
+pub const EOPNOTSUPP: i32 = 95;
+pub const EAFNOSUPPORT: i32 = 97;
+pub const EPROTONOSUPPORT: i32 = 93;
+pub const EADDRNOTAVAIL: i32 = 99;
+pub const ENETUNREACH: i32 = 101;
+pub const ECONNABORTED: i32 = 103;
+pub const EMSGSIZE: i32 = 90;
 pub const ENOENT_LINUX: i32 = 2;
 
 pub fn errno_result(e: i32) -> i64 {

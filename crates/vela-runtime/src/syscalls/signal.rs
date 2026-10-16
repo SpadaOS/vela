@@ -3,7 +3,10 @@
 
 use crate::{read_guest, write_guest, GuestProcess};
 use vela_abi as abi;
-use vela_sys::Host;
+
+fn unsupported_signal(sig: u64) -> bool {
+    (32..65).contains(&sig) || matches!(sig, 18..=22)
+}
 
 fn valid_signal(sig: u64) -> bool {
     (1..abi::NSIG as u64).contains(&sig)
@@ -22,6 +25,9 @@ pub(super) fn sys_rt_sigaction(
     if size != 8 || !valid_signal(sig) || sig == abi::SIGKILL as u64 || sig == abi::SIGSTOP as u64 {
         return -(abi::EINVAL as i64);
     }
+    if unsupported_signal(sig) {
+        return -(abi::ENOSYS as i64);
+    }
     let idx = sig as usize - 1;
     if old != 0 {
         let d = proc.signals.dispositions[idx];
@@ -39,12 +45,21 @@ pub(super) fn sys_rt_sigaction(
             Ok(b) => b,
             Err(e) => return -(e as i64),
         };
-        proc.signals.dispositions[idx] = crate::SignalDisposition {
+        let disposition = crate::SignalDisposition {
             handler: u64::from_le_bytes(b[0..8].try_into().unwrap()),
             flags: u64::from_le_bytes(b[8..16].try_into().unwrap()),
             restorer: u64::from_le_bytes(b[16..24].try_into().unwrap()),
             mask: u64::from_le_bytes(b[24..32].try_into().unwrap()),
         };
+        let supported = abi::SA_RESTORER
+            | abi::SA_ONSTACK
+            | abi::SA_RESTART
+            | abi::SA_NODEFER
+            | abi::SA_RESETHAND;
+        if disposition.flags & !supported != 0 {
+            return -(abi::EINVAL as i64);
+        }
+        proc.signals.dispositions[idx] = disposition;
     }
     0
 }
@@ -76,6 +91,7 @@ pub(super) fn sys_rt_sigprocmask(
             x if x == abi::SIG_SETMASK as u64 => proc.signals.blocked = bits,
             _ => return -(abi::EINVAL as i64),
         }
+        proc.signals.blocked &= !((1u64 << (abi::SIGKILL - 1)) | (1u64 << (abi::SIGSTOP - 1)));
     }
     0
 }
@@ -84,6 +100,7 @@ pub(super) fn sys_sigreturn(proc: &mut GuestProcess) -> i64 {
     match proc.signal_frames.pop() {
         Some(frame) => {
             proc.signals.blocked = frame.blocked;
+            proc.alt_stack = frame.alt_stack;
             proc.signal_restore = Some(frame);
             0
         }
@@ -104,6 +121,9 @@ pub(super) fn sys_sigaltstack(proc: &mut GuestProcess, new_ptr: u64, old_ptr: u6
         }
     }
     if new_ptr != 0 {
+        if proc.alt_stack.is_some_and(|(_, _, flags)| flags & 1 != 0) {
+            return -(abi::EPERM as i64);
+        }
         let raw = match read_guest(proc, new_ptr, 24) {
             Ok(raw) => raw,
             Err(e) => return -(e as i64),
@@ -130,21 +150,27 @@ pub(super) fn sys_kill(proc: &mut GuestProcess, pid: u64, sig: u64) -> i64 {
     if sig >= abi::NSIG as u64 {
         return -(abi::EINVAL as i64);
     }
+    if unsupported_signal(sig) {
+        return -(abi::ENOSYS as i64);
+    }
     if sig != 0 {
         proc.signals.pending |= 1u64 << (sig - 1);
     }
     0
 }
 
-pub(super) fn sys_tgkill(
-    proc: &mut GuestProcess,
-    tgid: u64,
-    tid: u64,
-    sig: u64,
-    host: &dyn Host,
-) -> i64 {
-    if tgid as u32 != proc.pid || tid as u32 != host.current_tid() {
+pub(super) fn sys_tgkill(proc: &mut GuestProcess, tgid: u64, tid: u64, sig: u64) -> i64 {
+    if tgid as u32 != proc.pid || !proc.threads.contains_key(&(tid as u32)) {
         return -(abi::ESRCH as i64);
     }
-    sys_kill(proc, tgid, sig)
+    if sig >= abi::NSIG as u64 {
+        return -(abi::EINVAL as i64);
+    }
+    if unsupported_signal(sig) {
+        return -(abi::ENOSYS as i64);
+    }
+    if sig != 0 {
+        *proc.thread_pending.entry(tid as u32).or_default() |= 1u64 << (sig - 1);
+    }
+    0
 }
