@@ -218,7 +218,8 @@ Vela 当沙箱用。杀毒软件可能对"进程内改可执行内存再执行"�
 ## 路线
 
 - **[v0.1.3（已发布，2026-10-11）](https://github.com/SpadaOS/vela/releases/tag/v0.1.3)**：Windows 运行时加入 TCP/UDP/socketpair/epoll 与 trap 安全点 signal handler、mask/pending 和 sigreturn，保留 pthread、futex、fork/exec、poll/select 和 BusyBox grep/find/tar/gzip 验收；完整异步信号、MAP_SHARED、glibc、SCM_RIGHTS 和非 Windows host 仍不在范围内。版本还保留宿主栈切换、fork 不可变段共享与 mprotect 账本、BusyBox `sh -c` 闭环、utimensat、SIGCHLD 记账、Host Trap/Proc 契约、doctor 2.0、Ctrl+C 进程树和 SECURITY.md。唯一可运行宿主：Windows。
-- 下一步候选：fork 脏页跟踪、MAP_SHARED 匿名共享、完整异步信号语义
+- **[v0.1.4（规划中）](docs/plans/PLAN-0.1.4.md)**：网络 CLI 与信号等待加固；优先修正验收假阳性、socket ABI、并发阻塞、readiness/epoll 和线程信号，加入 BusyBox `wget`/`nc` 的 loopback 端到端验收。
+- 后续候选：fork 脏页跟踪、MAP_SHARED 匿名共享、完整异步信号语义
 - v1：SpadaOS `Host` 填满（等 SpadaOS 内核具备用户态 map/file 能力后）、
   外部 X server 通路
 
