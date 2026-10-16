@@ -1,6 +1,6 @@
 # Vela 0.1.4：网络 CLI 与信号等待加固
 
-状态：**实现已落地；本地完整质量门禁及源码目录外 ZIP 验收通过，等待 PR CI**。开发分支为 `codex/0.1.4`，workspace 版本为 `0.1.4`。0.1.4 尚未创建标签或公开发布；原始审计基线为 `f5a8378239a6ee5d2dcf6ba01d92c8dafdad17e2`（0.1.3）。
+状态：**实现已落地；本地完整质量门禁及源码目录外 ZIP 验收通过**。远程质量与合并状态以实现 PR #4 的检查记录为准。开发分支为 `codex/0.1.4`，workspace 版本为 `0.1.4`。0.1.4 尚未创建标签或公开发布；原始审计基线为 `f5a8378239a6ee5d2dcf6ba01d92c8dafdad17e2`（0.1.3）。
 
 ## 实施验收状态（2026-10-17）
 
@@ -12,7 +12,7 @@
 | M3 | level-triggered epoll、稳定资源身份、公平性、并发 pipe ADD/DEL、非法 flags/targets 拒绝 |
 | M4 | 定向信号、独立 mask/frame/altstack、FXSAVE/SSE 与 flags、临时 mask 等待、socket restart、wait4/SIGCHLD、fork/exec；island 汇编测试确实建岛 |
 | M5 | 固定 Zig 0.13.0 重建；auto/VEH 重复 guest，wget/nc 实际 loopback 二进制传输和错误路径 |
-| M6 | 共用 quality/build/acceptance/package 脚本，PR/main/manual/release 接线；ZIP/SHA-256 与目录外同套验收；PR CI 待运行 |
+| M6 | 共用 quality/build/acceptance/package 脚本，PR/main/manual/release 接线；ZIP/SHA-256 与目录外同套验收；PR CI 结果见 #4 |
 
 本地报告见 `docs/validation/0.1.4.md`。当前实现使用一个进程状态 guard 配合线程上下文适配器；有界非阻塞尝试在 guard 内完成，等待在 guard 外完成。SIGCHLD 使用安全点轮询 child handle。信号 FP 现场覆盖 FXSAVE/x87/SSE；未验证更广泛的 XSAVE/AVX 扩展，不把该能力记为已支持。
 
